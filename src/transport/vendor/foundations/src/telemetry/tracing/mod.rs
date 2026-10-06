@@ -1,0 +1,2390 @@
+//! Distributed tracing-related functionality.
+
+#[doc(hidden)]
+pub mod internal;
+
+pub(crate) mod init;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod testing;
+
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+mod channel;
+mod live;
+mod output_jaeger_thrift_udp;
+mod rate_limit;
+
+#[cfg(feature = "telemetry-otlp-grpc")]
+mod output_otlp_grpc;
+
+#[cfg(feature = "user-tracing")]
+mod output_otlp_uds;
+
+#[cfg(feature = "user-tracing")]
+mod traceparent;
+
+use self::init::TracingHarness;
+use self::internal::{
+    MAX_PROBE_ARGS, SharedSpan, SpanProbe, create_span, current_span, shared_span, span_trace_id,
+};
+#[cfg(feature = "user-tracing")]
+use self::internal::{
+    activate_deferred_user_trace, child_user_span, current_user_span, start_user_trace,
+    user_shared_span,
+};
+use super::TelemetryContext;
+use super::scope::Scope;
+use std::borrow::Cow;
+use std::sync::Arc;
+
+#[cfg(any(test, feature = "testing"))]
+pub use self::testing::{TestSpan, TestTrace, TestTraceIterator, TestTraceOptions};
+
+pub use cf_rustracing::tag::{Tag, TagValue};
+pub use cf_rustracing_jaeger::span::{Span, SpanContextState as SerializableTraceState, TraceId};
+
+#[cfg(feature = "user-tracing")]
+pub use self::traceparent::TraceparentContext;
+
+#[cfg(feature = "user-tracing")]
+pub use cf_rustracing::span::RoutingMetadata;
+
+/// Returns active traces as a JSON dump.
+///
+/// The model for this functionality is <https://pkg.go.dev/golang.org/x/net/trace>
+/// although there is no built-in viewer here, we expect you to use Chrome's
+/// `about:tracing` or anything that supports the same JSON log format.
+///
+/// The same output is also available through the telemetry server at `/debug/traces`.
+pub fn get_active_traces() -> String {
+    TracingHarness::get().active_roots.get_active_traces()
+}
+
+/// A macro that wraps function body with a tracing span that is active as long as the function
+/// call lasts.
+///
+/// The macro works both for sync and async methods and also for the [async_trait] method
+/// implementations. `async fn`s are boxed before wrapping by default, but this can be
+/// bypassed by specifying `generic = true` in the macro invocation. To make `generic` the
+/// default, you can pass `--cfg foundations_generic_telemetry_wrapper` to rustc (e.g., via
+/// `RUSTFLAGS`).
+///
+/// # Example
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace};
+///
+/// #[tracing::span_fn("foo")]
+/// fn foo() {
+///     // Does something...
+/// }
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let _scope = ctx.scope();
+///
+/// foo();
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![
+///         test_trace! {
+///             "foo"
+///         },
+///     ]
+/// );
+/// ```
+///
+/// # Using constants for span names
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace};
+///
+/// const FOO: &str = "foo";
+///
+/// #[tracing::span_fn(FOO)]
+/// fn foo() {
+///     // Does something...
+/// }
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let _scope = ctx.scope();
+///
+/// foo();
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![
+///         test_trace! {
+///             "foo"
+///         },
+///     ]
+/// );
+/// ```
+///
+/// # Using with `async fn`'s that produce `!Send` futures.
+/// ```
+/// use foundations::telemetry::tracing;
+///
+/// #[tracing::span_fn("foo", async_local = true)]
+/// async fn foo() {
+///     // Does something that produces `!Send`` future...
+/// }
+/// ```
+///
+/// # Emitting a USDT probe at span end
+///
+/// ```
+/// use foundations::telemetry::tracing;
+///
+/// #[tracing::span_fn("foo", end_probe = true)]
+/// fn foo() {
+///     // Does something...
+/// }
+/// ```
+///
+/// With `end_probe = true`, the span additionally sets up a per-span USDT probe fired with the span
+/// duration when the span ends, with the same semantics as the `span_with_probe!` macro. The span
+/// name must be a string literal in this case. The provider defaults to the
+/// `FOUNDATIONS_USDT_PROVIDER` environment variable at compile time (settable per project via
+/// `[env]` in `.cargo/config.toml`), or `"foundations"` when unset, and can be customized per span
+/// with `usdt_provider = "..."`.
+///
+/// # Renamed or reexported crate
+///
+/// The macro will fail to compile if `foundations` crate is reexported. However, the crate path
+/// can be explicitly specified for the macro to workaround that:
+///
+/// ```
+/// mod reexport {
+///     pub use foundations::*;
+/// }
+///
+/// use reexport::telemetry::TelemetryContext;
+/// use reexport::telemetry::tracing::{self, test_trace};
+///
+/// #[tracing::span_fn("foo", crate_path = "reexport")]
+/// fn foo() {
+///     // Does something...
+/// }
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let _scope = ctx.scope();
+///
+/// foo();
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![
+///         test_trace! {
+///             "foo"
+///         },
+///     ]
+/// );
+/// ```
+///
+/// [async_trait]: https://crates.io/crates/async-trait
+pub use foundations_macros::span_fn;
+
+/// [`span()`] variant that additionally arms a per-span USDT probe
+/// (`span_end__<sanitized name>`) fired when the span ends and a tracer has
+/// attached to it.
+///
+/// See the macro documentation in `foundations-macros` for details.
+#[doc(inline)]
+pub use foundations_macros::span_with_probe;
+
+/// A handle for the scope in which tracing span is active.
+///
+/// Scope ends when the handle is dropped.
+#[must_use]
+pub struct SpanScope {
+    span: SharedSpan,
+    _inner: Scope<SharedSpan>,
+}
+
+impl SpanScope {
+    #[inline]
+    pub(crate) fn new(span: SharedSpan) -> Self {
+        Self {
+            span: span.clone(),
+            _inner: Scope::new(&TracingHarness::get().span_scope_stack, span),
+        }
+    }
+
+    /// Converts the span scope to [`TelemetryContext`] that can be a applied to a future.
+    ///
+    /// This is effectively a shorthand for calling [`TelemetryContext::current`] with the span
+    /// being in scope.
+    ///
+    /// # Examples
+    /// ```
+    /// use foundations::telemetry::TelemetryContext;
+    /// use foundations::telemetry::tracing::{self, test_trace};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     // Test context is used for demonstration purposes to show the resulting traces.
+    ///     let ctx = TelemetryContext::test();
+    ///
+    ///     {
+    ///         let _scope = ctx.scope();
+    ///         let _root = tracing::span("root");
+    ///
+    ///         let handle = tokio::spawn(
+    ///             tracing::span("future").into_context().apply(async {
+    ///                 let _child = tracing::span("child");
+    ///             })
+    ///         );
+    ///
+    ///         handle.await;
+    ///     }
+    ///
+    ///     assert_eq!(
+    ///         ctx.traces(Default::default()),
+    ///         vec![
+    ///             test_trace! {
+    ///                 "root" => {
+    ///                     "future" => {
+    ///                         "child"
+    ///                     }
+    ///                 }
+    ///             }
+    ///         ]
+    ///     );
+    /// }
+    /// ```
+    pub fn into_context(self) -> TelemetryContext {
+        let mut ctx = TelemetryContext::current();
+
+        ctx.span = Some(self.span);
+
+        ctx
+    }
+
+    /// Arms the span's USDT probe when `record_probe_start` is true (the
+    /// span's probe semaphore, a `static` in the `.probes` section bumped by
+    /// the tracer on attach, is non-zero). `end_probe` is the address of a
+    /// per-span function containing the probe's NOP placeholder; it is called
+    /// when the last clone of the span drops with `&args`, where `args[0]` is
+    /// overwritten with the span duration in nanoseconds and the rest are
+    /// caller-chosen values exposed to the tracer as the probe's remaining
+    /// arguments. Arming records the start timestamp unconditionally with
+    /// respect to sampling, so probes work even when span tracing is disabled.
+    ///
+    /// Only macro-generated code calls this; the macro emits `end_probe` and
+    /// `args` values with matching arity.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn __arm_probe(
+        &mut self,
+        end_probe: fn(&[u64; MAX_PROBE_ARGS]),
+        args: [u64; MAX_PROBE_ARGS],
+    ) {
+        self.span.probe = Some(Arc::new(SpanProbe::new(end_probe, args)));
+    }
+}
+
+/// A handle for the scope in which a user-tracing span is active.
+///
+/// Scope ends when the handle is dropped.
+#[cfg(feature = "user-tracing")]
+#[must_use]
+pub struct UserSpanScope {
+    span: SharedSpan,
+    _inner: Scope<SharedSpan>,
+}
+
+#[cfg(feature = "user-tracing")]
+impl UserSpanScope {
+    #[inline]
+    pub(crate) fn new(span: SharedSpan) -> Self {
+        Self {
+            span: span.clone(),
+            _inner: Scope::new(&TracingHarness::get_user().span_scope_stack, span),
+        }
+    }
+
+    /// Converts the user span scope to a [`TelemetryContext`] that can be applied to a future.
+    pub fn into_context(self) -> TelemetryContext {
+        let mut ctx = TelemetryContext::current();
+
+        ctx.user_span = Some(self.span);
+
+        ctx
+    }
+}
+
+/// An owned handle to a user-tracing span, detached from the scope stack.
+///
+/// Unlike [`UserSpanScope`], this is `Send` and can be stored in a struct and held across `await`
+/// points. That is what a per-request span needs in a service whose request pipeline is a state
+/// machine of separate callbacks rather than a call tree: the span outlives every individual
+/// callback, so there is no lexical scope for it to live in.
+///
+/// The span is reported when the *last* reference to it drops, which is normally this handle.
+/// [`enter`](Self::enter) clones the underlying span rather than borrowing it, so a live
+/// [`UserSpanScope`] — and any `TelemetryContext` built from one — keeps the span open on its own.
+/// That is what lets work outliving the handle carry on recording into it.
+///
+/// A handle is always usable. When no user trace is active, or the trace wasn't sampled, or no
+/// user-tracing pipeline is configured, the handle is *inactive*: tagging does nothing, children
+/// are inactive in turn, and nothing is reported. Callers never have to unwrap an [`Option`] or
+/// branch on whether tracing is switched on.
+#[cfg(feature = "user-tracing")]
+#[derive(Debug)]
+#[must_use]
+pub struct UserSpan {
+    span: SharedSpan,
+}
+
+#[cfg(feature = "user-tracing")]
+impl UserSpan {
+    #[inline]
+    pub(crate) const fn from_shared(span: SharedSpan) -> Self {
+        Self { span }
+    }
+
+    /// Creates a handle that records nothing.
+    ///
+    /// Useful as a placeholder before a trace has been started, and as the resting state for a
+    /// span slot that has been finished.
+    pub const fn inactive() -> Self {
+        Self::from_shared(SharedSpan::inactive())
+    }
+
+    /// Creates a root user span that can be activated after telemetry contexts have captured it.
+    ///
+    /// Until [`activate`](Self::activate) is called, recording is inactive and no trace is
+    /// reported. Activation updates shared state in place, so scopes and [`TelemetryContext`]
+    /// values created from this handle beforehand observe the active span without being replaced.
+    pub fn deferred() -> Self {
+        Self::from_shared(SharedSpan::deferred())
+    }
+
+    /// Activates this deferred root, continuing the inbound W3C trace from `inbound` when given.
+    ///
+    /// The first call that produces an active span wins. An unsampled inbound context is rejected
+    /// so this service does not create a fragment of a trace the caller chose not to collect.
+    ///
+    /// `routing` is attached at construction and inherited by child spans. An activation that
+    /// produces an inactive span leaves the root eligible for a later activation attempt.
+    pub fn activate(
+        &self,
+        name: impl Into<Cow<'static, str>>,
+        routing: impl RoutingMetadata + 'static,
+        inbound: Option<TraceparentContext>,
+    ) {
+        activate_deferred_user_trace(&self.span, name, routing, inbound);
+    }
+
+    /// Starts a root user span, continuing the inbound W3C trace from `inbound` when given.
+    ///
+    /// `routing` is attached at construction and inherited by child spans. The result is inactive
+    /// if the trace wasn't sampled or no user-tracing pipeline is configured, which
+    /// [`is_sampled`](Self::is_sampled) reports.
+    pub fn start_trace(
+        name: impl Into<Cow<'static, str>>,
+        routing: impl RoutingMetadata + 'static,
+        inbound: Option<TraceparentContext>,
+    ) -> Self {
+        Self::from_shared(user_shared_span(start_user_trace(
+            name,
+            Arc::new(routing),
+            inbound,
+        )))
+    }
+
+    /// Creates a child of this span, inheriting its routing metadata.
+    ///
+    /// The parent is named explicitly rather than taken from the scope stack, because spans in a
+    /// callback-driven pipeline overlap without nesting: a span can still be unfinished while
+    /// work that is not part of it is running.
+    ///
+    /// Children of an inactive span are inactive.
+    pub fn child(&self, name: impl Into<Cow<'static, str>>) -> Self {
+        Self::from_shared(child_user_span(&self.span, name))
+    }
+
+    /// Adds tags to this span, replacing any existing tag of the same name.
+    ///
+    /// `f` isn't called when the span is inactive, so it's the right place to put work that only
+    /// exists to produce tags.
+    pub fn set_tags<F, I>(&self, f: F)
+    where
+        F: FnOnce() -> I,
+        I: IntoIterator<Item = Tag>,
+    {
+        self.span.inner.with_write(|span| span.set_tags(f));
+    }
+
+    /// Whether this span is being recorded.
+    ///
+    /// Eager spans read cached state. Deferred roots inspect their shared span slot so contexts
+    /// captured before activation observe the updated state.
+    #[inline]
+    pub fn is_sampled(&self) -> bool {
+        self.span.is_sampled()
+    }
+
+    /// W3C `traceparent` for this span, for outbound propagation to the next hop.
+    ///
+    /// The parent-id is this span's own id, so spans created by the next hop become its children.
+    /// `None` when the span is inactive.
+    pub fn w3c_traceparent(&self) -> Option<String> {
+        self.span.inner.with_read(|s| {
+            let state = s.context()?.state();
+
+            Some(format!(
+                "00-{:0>16x}{:0>16x}-{:0>16x}-{:0>2x}",
+                state.trace_id().high,
+                state.trace_id().low,
+                state.span_id(),
+                state.flags()
+            ))
+        })
+    }
+
+    /// Makes this span current for the lifetime of the returned scope, so the ambient helpers in
+    /// [`user_tracing`] target it.
+    ///
+    /// The scope takes its own reference to the span, so it holds the span open even if this
+    /// handle is dropped first, and the span is reported only once both are gone.
+    ///
+    /// The returned scope is `!Send` and must not be held across an `await` point.
+    pub fn enter(&self) -> UserSpanScope {
+        UserSpanScope::new(self.span.clone())
+    }
+
+    /// Releases this handle, reporting the span unless a scope or context still holds it open.
+    ///
+    /// Identical to dropping the handle; this only names the intent at the call site.
+    pub fn finish(self) {}
+}
+
+#[cfg(feature = "user-tracing")]
+impl TelemetryContext {
+    /// Returns a copy of this context with `span` as its current user-tracing span.
+    ///
+    /// The returned context and the handle share the same underlying span, so activating a
+    /// deferred handle updates work already carrying the context. Existing logging and internal
+    /// tracing state is preserved. Use [`TelemetryContext::scope`] or [`TelemetryContext::apply`]
+    /// to make the returned context active.
+    pub fn with_user_span(&self, span: &UserSpan) -> Self {
+        let mut ctx = self.clone();
+        ctx.user_span = Some(span.span.clone());
+        ctx
+    }
+}
+
+/// A span recorded in both the internal and user traces, produced by [`dual_span`].
+///
+/// Scope ends when the handle is dropped. [`into_context`](Self::into_context) carries both the
+/// internal span and, when a user trace was active, the parallel user span.
+#[cfg(feature = "user-tracing")]
+#[must_use]
+pub struct DualSpanScope {
+    inner: SpanScope,
+    user: Option<UserSpanScope>,
+}
+
+#[cfg(feature = "user-tracing")]
+impl DualSpanScope {
+    /// Converts the span scope to a [`TelemetryContext`] that can be applied to a future.
+    ///
+    /// This is effectively a shorthand for calling [`TelemetryContext::current`] with both the
+    /// internal span and the parallel user span being in scope.
+    pub fn into_context(self) -> TelemetryContext {
+        let mut ctx = self.inner.into_context();
+
+        if let Some(user) = self.user {
+            ctx.user_span = Some(user.span);
+        }
+
+        ctx
+    }
+
+    /// Arms the internal span's USDT probe when `record_probe_start` is true.
+    /// The user span is never probed.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn __arm_probe(
+        &mut self,
+        end_probe: fn(&[u64; MAX_PROBE_ARGS]),
+        args: [u64; MAX_PROBE_ARGS],
+    ) {
+        self.inner.__arm_probe(end_probe, args);
+    }
+}
+
+/// Options for a new trace.
+#[derive(Default, Debug)]
+pub struct StartTraceOptions {
+    /// Links the new trace with the existing one whose state is provided in the serialized form.
+    ///
+    /// Usually used to stitch traces between multiple services. The serialized state can be
+    /// obtained by using [`state_for_trace_stitching`] function.
+    pub stitch_with_trace: Option<SerializableTraceState>,
+
+    /// Overrides the [sampling ratio] specified on [tracing initializaion].
+    ///
+    /// Can be used to enforce trace sampling by providing `Some(1.0)` value.
+    ///
+    /// [sampling ratio]: crate::telemetry::settings::ActiveSamplingSettings::sampling_ratio
+    /// [tracing initializaion]: crate::telemetry::init
+    pub override_sampling_ratio: Option<f64>,
+}
+
+/// Determines whether the current span is sampled or not.
+///
+/// This is useful to do a cheap check before commencing more expensive work,
+/// for example to set up span tags.
+pub fn span_is_sampled() -> bool {
+    matches!(current_span(), Some(span) if span.is_sampled())
+}
+
+/// Returns a trace ID of the current span.
+///
+/// Returns `None` if the span is not sampled and doesn't have associated trace.
+pub fn trace_id() -> Option<String> {
+    current_span()?.inner.with_read(span_trace_id)
+}
+
+/// Returns tracing state for the current span that can be serialized and passed to other services
+/// to stitch it with their traces, so traces can cover the whole service pipeline.
+///
+/// The serialized trace then can be passed to [`start_trace`] by other service to continue
+/// the trace.
+///
+/// Returns `None` if the current span is not sampled and doesn't have an associated trace.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, SerializableTraceState, StartTraceOptions};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let _scope = ctx.scope();
+///
+/// fn service1() -> String {
+///     let _span = tracing::span("service1_span");
+///
+///     tracing::state_for_trace_stitching().unwrap().to_string()
+/// }
+///
+/// fn service2(trace_state: String) {
+///     let _span = tracing::start_trace(
+///         "service2_span",
+///         StartTraceOptions {
+///             stitch_with_trace: Some(trace_state.parse().unwrap()),
+///             ..Default::default()
+///         }
+///     );
+/// }
+///
+/// let trace_state = service1();
+///
+/// service2(trace_state);
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![test_trace! {
+///         "service1_span" => {
+///             "service2_span"
+///         }
+///     }]
+/// );
+/// ```
+pub fn state_for_trace_stitching() -> Option<SerializableTraceState> {
+    current_span()?
+        .inner
+        .with_read(|s| Some(s.context()?.state().clone()))
+}
+
+/// Returns the value to be used as a W3C traceparent header.
+///
+/// See: <https://www.w3.org/TR/trace-context/#traceparent-header>
+///
+/// Returns `None` if the current span is not sampled and doesn't have an associated trace.
+pub fn w3c_traceparent() -> Option<String> {
+    state_for_trace_stitching().map(|state| {
+        format!(
+            "00-{:0>16x}{:0>16x}-{:0>16x}-{:0>2x}",
+            state.trace_id().high,
+            state.trace_id().low,
+            state.span_id(),
+            state.flags()
+        )
+    })
+}
+
+/// Creates a tracing span.
+///
+/// If span covers whole function body it's preferable to use [`span_fn`] macro.
+///
+/// Span ends when returned [`SpanScope`] is dropped. Note that [`SpanScope`] can't be used across
+/// `await` points. To span async scopes [`SpanScope::into_context`] should be used.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _root = tracing::span("root");
+///
+///     {
+///         let _span1 = tracing::span("span1");
+///     }
+///
+///     let _span2 = tracing::span("span2");
+///     let _span2_1 = tracing::span("span2_1");
+/// }
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![test_trace! {
+///         "root" => {
+///             "span1",
+///             "span2" => {
+///                 "span2_1"
+///             }
+///         }
+///     }]
+/// );
+/// ```
+pub fn span(name: impl Into<Cow<'static, str>>) -> SpanScope {
+    SpanScope::new(create_span(name))
+}
+
+/// Opens an internal span named `name`, plus a parallel user span of the same name (child of the
+/// current user span) when a user trace is active. Both share the returned scope's lifetime.
+#[cfg(feature = "user-tracing")]
+pub fn dual_span(name: impl Into<Cow<'static, str>>) -> DualSpanScope {
+    let name = name.into();
+    let inner = span(name.clone());
+
+    let user = current_user_span()
+        .is_some()
+        .then(|| user_tracing::span(name));
+
+    DualSpanScope { inner, user }
+}
+
+/// Starts a new trace. Ends the current one if it is available and links the new one with it.
+///
+/// Can also be used to stitch traces with the context received from other services, and can force
+/// enable or disable tracing of certain code parts by overriding the sampling ratio.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, StartTraceOptions};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let _scope = ctx.scope();
+///
+/// {
+///     let _root = tracing::span("root");
+///
+///     {
+///         let _span1 = tracing::span("span1");
+///     }
+///
+///     let _new_root_span = tracing::start_trace(
+///         "new root",
+///         Default::default(),
+///     );
+///
+///     let _span2 = tracing::span("span2");
+/// }
+///
+/// assert_eq!(
+///     ctx.traces(Default::default()),
+///     vec![
+///         test_trace! {
+///             "root" => {
+///                 "span1",
+///                 "[new root ref]"
+///             }
+///         },
+///         test_trace! {
+///             "new root" => {
+///                 "span2"
+///             }
+///         }
+///     ]
+/// );
+/// ```
+pub fn start_trace(
+    root_span_name: impl Into<Cow<'static, str>>,
+    options: StartTraceOptions,
+) -> SpanScope {
+    SpanScope::new(shared_span(internal::start_trace(root_span_name, options)))
+}
+
+/// User-tracing entry points and helpers.
+///
+/// The user trace runs in parallel to the internal trace, and everything here operates only on
+/// it. To record a span in both traces at once, use [`dual_span`].
+#[cfg(feature = "user-tracing")]
+pub mod user_tracing {
+    use super::internal::{create_user_span, current_user_span};
+    use super::{RoutingMetadata, TraceparentContext, UserSpanScope};
+    use std::borrow::Cow;
+
+    #[doc(inline)]
+    pub use super::UserSpan;
+
+    /// Starts a root user span (per-request activation), optionally continuing the inbound W3C
+    /// trace from `inbound`. `routing` is attached at construction and inherited by child spans.
+    ///
+    /// Without an active root, `span`, `dual_span`, and `add_span_tags!` are no-ops.
+    ///
+    /// Returns a scope-stack handle. Use [`UserSpan::start_trace`] instead when the span has to
+    /// outlive the enclosing function, such as a per-request span in a callback-driven pipeline.
+    pub fn start_trace(
+        name: impl Into<Cow<'static, str>>,
+        routing: impl RoutingMetadata + 'static,
+        inbound: Option<TraceparentContext>,
+    ) -> UserSpanScope {
+        UserSpan::start_trace(name, routing, inbound).enter()
+    }
+
+    /// Creates a user span as a child of the current user span, or inactive when no user trace is
+    /// active. Never starts a root — roots come only from [`start_trace`].
+    pub fn span(name: impl Into<Cow<'static, str>>) -> UserSpanScope {
+        UserSpanScope::new(create_user_span(name))
+    }
+
+    /// W3C `traceparent` for the current user span, for outbound propagation to the next hop.
+    /// Span-derived (parent-id is the current user span); `None` when no user trace is active.
+    pub fn w3c_traceparent() -> Option<String> {
+        UserSpan::from_shared(current_user_span()?).w3c_traceparent()
+    }
+
+    #[doc(inline)]
+    pub use crate::{
+        __add_user_span_log_fields as add_span_log_fields, __add_user_span_tags as add_span_tags,
+        __set_user_span_finish_callback as set_span_finish_callback,
+    };
+}
+
+/// Returns the current span as a raw [rustracing] crate's `Span` that is used by Foundations internally.
+///
+/// Can be used to propagate the tracing context to libraries that don't use Foundations'
+/// telemetry.
+///
+/// [rustracing]: https://crates.io/crates/rustracing
+pub fn rustracing_span() -> Option<Arc<parking_lot::RwLock<Span>>> {
+    current_span().map(|span| span.inner.into())
+}
+
+// NOTE: `#[doc(hidden)]` + `#[doc(inline)]` for `pub use` trick is used to prevent these macros
+// to show up in the crate's top level docs.
+
+/// Adds tags to the current tracing span.
+///
+/// Tags can be either provided in a form of comma-separated `"key" => value` pairs or an
+/// [iterable] over `("key", value)` tuples. The later expects that all values have the same
+/// type.
+///
+/// Tag values can be integers, floating point numbers, booleans and strings or string slices.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, TestTraceOptions};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _root = tracing::span("root");
+///
+///     tracing::add_span_tags!(
+///         "foo" => 42,
+///         "bar" => "hello",
+///         "baz" => true
+///     );
+///
+///     let _child = tracing::span("child");
+///
+///     tracing::add_span_tags!(vec![
+///         ("qux", 13.37),
+///         ("quz", 4.2)
+///     ]);
+/// }
+///
+/// let traces = ctx.traces(TestTraceOptions {
+///     include_tags: true,
+///     ..Default::default()
+/// });
+///
+/// assert_eq!(
+///     traces,
+///     vec![test_trace! {
+///         "root"; {
+///             tags: [
+///                 ("foo", 42),
+///                 ("bar", "hello"),
+///                 ("baz", true)
+///             ]
+///         } => {
+///             "child"; {
+///                 tags: [
+///                     ("qux", 13.37),
+///                     ("quz", 4.2)
+///                 ]
+///             }
+///         }
+///     }]
+/// );
+///
+/// ```
+///
+/// [iterable]: std::iter::IntoIterator
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_span_tags {
+    ( $( $name:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.set_tags(|| {
+                vec![ $($crate::reexports_for_macros::cf_rustracing::tag::Tag::new($name, $val)),+ ]
+            });
+        });
+    };
+
+    ( $tags:expr ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.set_tags(|| {
+                $tags
+                    .into_iter()
+                    .map(|(name, val)| {
+                        $crate::reexports_for_macros::cf_rustracing::tag::Tag::new(name, val)
+                    })
+            });
+        });
+    };
+}
+
+/// Adds log fields to the current span.
+///
+/// Log entries need to be provided as comma-separated `"field" => "value"` pairs there. Fields and
+/// values can be strings or string slices.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, TestTraceOptions};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _root = tracing::span("root");
+///
+///     tracing::add_span_log_fields!(
+///         "foo" => "hello",
+///         "bar" => "world"
+///     );
+///
+///     let _child = tracing::span("child");
+///
+///     tracing::add_span_log_fields!(
+///         "qux" => "beep",
+///         "quz" => "boop"
+///     );
+/// }
+///
+/// let traces = ctx.traces(TestTraceOptions {
+///     include_logs: true,
+///     ..Default::default()
+/// });
+///
+/// assert_eq!(
+///     traces,
+///     vec![test_trace! {
+///         "root"; {
+///             logs: [
+///                 ("foo", "hello"),
+///                 ("bar", "world")
+///             ]
+///         } => {
+///             "child"; {
+///                 logs: [
+///                     ("qux", "beep"),
+///                     ("quz", "boop")
+///                 ]
+///             }
+///         }
+///     }]
+/// );
+/// ```
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_span_log_fields {
+    ( $( $field:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.log(|builder| {
+                $(
+                    builder.field(($field, $val));
+                )+
+            });
+        });
+    };
+}
+
+/// Overrides the start time of the current span with the provided [`SystemTime`] value.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, TestTraceOptions};
+/// use std::time::SystemTime;
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let start_time = SystemTime::now();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _span = tracing::span("test span");
+///
+///     tracing::set_span_start_time!(start_time);
+/// }
+///
+/// let traces = ctx.traces(TestTraceOptions {
+///     include_start_time: true,
+///     ..Default::default()
+/// });
+///
+/// assert_eq!(traces[0].0.start_time, start_time);
+/// ```
+///
+/// [`SystemTime`]: std::time::SystemTime
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __set_span_start_time {
+    ( $time:expr ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.set_start_time(|| $time)
+        })
+    };
+}
+
+/// Overrides the finish time of the current span with the provided [`SystemTime`] value.
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, test_trace, TestTraceOptions};
+/// use std::time::SystemTime;
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+/// let finish_time = SystemTime::now();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _span = tracing::span("test span");
+///
+///     tracing::set_span_finish_time!(finish_time);
+/// }
+///
+/// let traces = ctx.traces(TestTraceOptions {
+///     include_finish_time: true,
+///     ..Default::default()
+/// });
+///
+/// assert_eq!(traces[0].0.finish_time, finish_time);
+/// ```
+///
+/// [`SystemTime`]: std::time::SystemTime
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __set_span_finish_time {
+    ( $time:expr ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.set_finish_time(|| $time)
+        })
+    };
+}
+
+/// Sets a new finish callback for the current span. It executes when the span is dropped.
+///
+/// Each span can only have one callback at a time. Children of a span inherit the
+/// callback that is set at the time each child is created. To remove a callback, use
+/// `set_span_finish_callback!(None)`.
+///
+/// The callback has signature `Fn(&mut Span)` and can access all functions available on
+/// [`Span`].
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::TelemetryContext;
+/// use foundations::telemetry::tracing::{self, Span, test_trace, TestTraceOptions};
+///
+/// // Test context is used for demonstration purposes to show the resulting traces.
+/// let ctx = TelemetryContext::test();
+///
+/// {
+///     let _scope = ctx.scope();
+///     let _root = tracing::span("root");
+///
+///     tracing::set_span_finish_callback!(|span: &mut Span| {
+///         use cf_rustracing::tag::Tag;
+///         span.set_tag(|| Tag::new("user-id", 92395));
+///     });
+///
+///     let child_with_cb = tracing::span("child_with_cb");
+///     drop(child_with_cb);
+///
+///     // Remove the callback from a newly-created child
+///     let _child_without_cb = tracing::span("child_without_cb");
+///     tracing::set_span_finish_callback!(None);
+/// }
+///
+/// let traces = ctx.traces(TestTraceOptions {
+///     include_tags: true,
+///     ..Default::default()
+/// });
+///
+/// assert_eq!(
+///     traces,
+///     vec![test_trace! {
+///         "root"; {
+///             tags: [ ("user-id", 92395) ]
+///         } => {
+///             "child_with_cb"; {
+///                 tags: [ ("user-id", 92395) ]
+///             },
+///             "child_without_cb"
+///         }
+///     }]
+/// );
+/// ```
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __set_span_finish_callback {
+    ( None ) => {
+        $crate::telemetry::tracing::internal::write_current_span(|span| {
+            span.take_finish_callback();
+        })
+    };
+    ( $cb:expr ) => {{
+        let cb = $cb;
+        $crate::telemetry::tracing::internal::write_current_span(move |span| {
+            span.set_finish_callback(cb);
+        })
+    }};
+}
+
+/// Adds tags to the current user span. No-op when no user trace is active.
+///
+/// Accepts the same arguments as
+/// [`add_span_tags`]; see it for the supported formats
+/// and examples.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_user_span_tags {
+    ( $( $name:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.set_tags(|| {
+                vec![ $($crate::reexports_for_macros::cf_rustracing::tag::Tag::new($name, $val)),+ ]
+            });
+        });
+    };
+
+    ( $tags:expr ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.set_tags(|| {
+                $tags
+                    .into_iter()
+                    .map(|(name, val)| {
+                        $crate::reexports_for_macros::cf_rustracing::tag::Tag::new(name, val)
+                    })
+            });
+        });
+    };
+}
+
+/// Adds log fields to the current user span. No-op when no user trace is active.
+///
+/// Accepts the same arguments as
+/// [`add_span_log_fields`]; see it for the
+/// supported formats and examples.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_user_span_log_fields {
+    ( $( $field:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.log(|builder| {
+                $(
+                    builder.field(($field, $val));
+                )+
+            });
+        });
+    };
+}
+
+/// Sets (`$cb`) or clears (`None`) the finish callback on the current user span. No-op when no
+/// user trace is active. Routing is set at construction by
+/// [`start_trace`](crate::telemetry::tracing::user_tracing::start_trace), so this is a general
+/// escape hatch — not used for routing.
+///
+/// Behaves like [`set_span_finish_callback`];
+/// see it for details and examples.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __set_user_span_finish_callback {
+    ( None ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.take_finish_callback();
+        })
+    };
+    ( $cb:expr ) => {{
+        let cb = $cb;
+        $crate::telemetry::tracing::internal::write_current_user_span(move |span| {
+            span.set_finish_callback(cb);
+        })
+    }};
+}
+
+/// A convenience macro to construct [`TestTrace`] for test assertions.
+///
+/// Note that for span timings the macro always generates default
+/// [`std::time::SystemTime::UNIX_EPOCH`] values (as with [`TestTraceOptions::include_start_time`]
+/// and [`TestTraceOptions::include_start_time`] being set to `false`).
+///
+/// # Examples
+/// ```
+/// use foundations::telemetry::tracing::{test_trace, TestSpan, TestTrace};
+/// use std::time::SystemTime;
+///
+/// let trace = test_trace! {
+///     "root" => {
+///         "child1" => {
+///             "child1_1",
+///             "child1_2"
+///         },
+///         "child2"
+///     }
+/// };
+///
+/// let expanded = TestTrace(TestSpan {
+///     name: "root".into(),
+///     logs: vec![],
+///     tags: vec![],
+///     start_time: SystemTime::UNIX_EPOCH,
+///     finish_time: SystemTime::UNIX_EPOCH,
+///     children: vec![
+///         TestSpan {
+///             name: "child1".into(),
+///             logs: vec![],
+///             tags: vec![],
+///             start_time: SystemTime::UNIX_EPOCH,
+///             finish_time: SystemTime::UNIX_EPOCH,
+///             children: vec![
+///                 TestSpan {
+///                     name: "child1_1".into(),
+///                     logs: vec![],
+///                     tags: vec![],
+///                     start_time: SystemTime::UNIX_EPOCH,
+///                     finish_time: SystemTime::UNIX_EPOCH,
+///                     children: vec![],
+///                 },
+///                 TestSpan {
+///                     name: "child1_2".into(),
+///                     logs: vec![],
+///                     tags: vec![],
+///                     start_time: SystemTime::UNIX_EPOCH,
+///                     finish_time: SystemTime::UNIX_EPOCH,
+///                     children: vec![],
+///                 },
+///             ],
+///         },
+///         TestSpan {
+///             name: "child2".into(),
+///             logs: vec![],
+///             tags: vec![],
+///             start_time: SystemTime::UNIX_EPOCH,
+///             finish_time: SystemTime::UNIX_EPOCH,
+///             children: vec![],
+///         },
+///     ],
+/// });
+///
+/// assert_eq!(trace, expanded);
+/// ```
+///
+/// Tags and log records can optionally be included in the generated [`TestSpan`] as a list of
+/// `("key", value)` pairs.
+///
+/// Note that span's log records are always lexicographically sorted by the field name, so macro
+/// sorts the provided log records this way during expansion.
+///
+/// ```
+/// use foundations::telemetry::tracing::{test_trace, TagValue, TestSpan, TestTrace};
+/// use std::time::SystemTime;
+///
+/// let trace = test_trace! {
+///     "root"; {
+///         logs: [
+///             ("hello", "world"),
+///             ("foo", "bar")
+///         ]
+///     } => {
+///         "child1"; {
+///             tags: [
+///                 ("tag1", 42),
+///                 ("tag2", "hi")
+///             ]
+///         },
+///         "child2"; {
+///             logs: [
+///                 ("answer", "42")
+///             ]
+///
+///             tags: [
+///                 ("more_tags", true)
+///             ]
+///         }
+///     }
+/// };
+///
+/// let expanded = TestTrace(TestSpan {
+///     name: "root".into(),
+///     // NOTE: log records are lexicographically sorted by the field name.
+///     logs: vec![
+///         ("foo".into(), "bar".into()),
+///         ("hello".into(), "world".into()),
+///     ],
+///     tags: vec![],
+///     start_time: SystemTime::UNIX_EPOCH,
+///     finish_time: SystemTime::UNIX_EPOCH,
+///     children: vec![
+///         TestSpan {
+///             name: "child1".into(),
+///             logs: vec![],
+///             tags: vec![
+///                 ("tag1".into(), TagValue::Integer(42)),
+///                 ("tag2".into(), TagValue::String("hi".into())),
+///             ],
+///             start_time: SystemTime::UNIX_EPOCH,
+///             finish_time: SystemTime::UNIX_EPOCH,
+///             children: vec![],
+///         },
+///         TestSpan {
+///             name: "child2".into(),
+///             logs: vec![("answer".into(), "42".into())],
+///             tags: vec![("more_tags".into(), TagValue::Boolean(true))],
+///             start_time: SystemTime::UNIX_EPOCH,
+///             finish_time: SystemTime::UNIX_EPOCH,
+///             children: vec![],
+///         },
+///     ],
+/// });
+///
+/// assert_eq!(trace, expanded);
+/// ```
+#[macro_export]
+#[doc(hidden)]
+#[cfg(feature = "testing")]
+macro_rules! __test_trace {
+    ( $name:expr $( ; $logs_tags:tt )? $( => $children:tt )? ) => {
+        $crate::telemetry::tracing::TestTrace(
+            $crate::telemetry::tracing::test_trace!(
+                @span $name $(; $logs_tags)? $( => $children )?
+            )
+        )
+    };
+
+    ( @span $name:expr $( ; {
+        $( logs: [ $( ( $log_field:expr, $log_value:expr ) ),* ] )?
+        $( tags: [ $( ( $tag_name:expr, $tag_value:expr ) ),* ] )?
+    })? $( => $children:tt )? ) => {{
+        // NOTE: resulting logs are lexicographically sorted, so we sort provided fields for
+        // conveience, so macro users won't need to bother.
+        let mut logs = vec![ $( $( $( ( $log_field.into(), $log_value.into() ) ),* )? )? ];
+
+        logs.sort_by(|(f1, _), (f2, _)| std::cmp::Ord::cmp(f1, f2));
+
+        $crate::telemetry::tracing::TestSpan {
+            name: $name.to_string(),
+            children: $crate::telemetry::tracing::test_trace!( @children $( $children )? ),
+            logs,
+            tags: vec![ $( $( $( ( $tag_name.into(), $tag_value.into() ) ),* )? )? ],
+            start_time: std::time::SystemTime::UNIX_EPOCH,
+            finish_time: std::time::SystemTime::UNIX_EPOCH,
+        }}
+    };
+
+    ( @children { $( $name:expr $( ; $logs_tags:tt )? $( => $children:tt )? ),* } ) => {
+        vec![
+            $(
+                $crate::telemetry::tracing::test_trace!(
+                    @span $name $(; $logs_tags)? $( => $children )?
+                )
+            ),*
+        ]
+    };
+
+    ( @children ) => { vec![] };
+}
+
+#[doc(inline)]
+pub use {
+    __add_span_log_fields as add_span_log_fields, __add_span_tags as add_span_tags,
+    __set_span_finish_callback as set_span_finish_callback,
+    __set_span_finish_time as set_span_finish_time, __set_span_start_time as set_span_start_time,
+};
+
+#[cfg(feature = "testing")]
+#[doc(inline)]
+pub use __test_trace as test_trace;
+
+#[cfg(all(test, feature = "user-tracing", feature = "testing"))]
+mod user_tracing_tests {
+    use super::{
+        RoutingMetadata, StartTraceOptions, TraceparentContext, UserSpan, dual_span, span,
+        start_trace, test_trace, user_tracing,
+    };
+    use crate::telemetry::TelemetryContext;
+    use crate::telemetry::tracing::{Span, TestTraceOptions};
+    use cf_rustracing::tag::{Tag, TagValue};
+    use std::cell::Cell;
+    use std::sync::{Arc, Barrier};
+
+    #[derive(Debug)]
+    struct TestRouting {
+        zone_id: u64,
+        account_id: u64,
+    }
+
+    impl RoutingMetadata for TestRouting {
+        fn group_key(&self) -> String {
+            format!("{}|{}", self.zone_id, self.account_id)
+        }
+
+        fn encode(&self) -> String {
+            format!("zone={};account={}", self.zone_id, self.account_id)
+        }
+    }
+
+    fn routing() -> TestRouting {
+        TestRouting {
+            zone_id: 1,
+            account_id: 2,
+        }
+    }
+
+    #[test]
+    fn creation_and_nesting() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _child = user_tracing::span("child");
+            let _grandchild = user_tracing::span("grandchild");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! {
+                "request" => {
+                    "child" => {
+                        "grandchild"
+                    }
+                }
+            }]
+        );
+        // User spans must not leak into the internal pipeline.
+        assert!(ctx.traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn tags_and_logs() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            user_tracing::add_span_tags!("cache.status" => "HIT");
+            user_tracing::add_span_log_fields!("event" => "lookup");
+        }
+
+        let opts = TestTraceOptions {
+            include_tags: true,
+            include_logs: true,
+            ..Default::default()
+        };
+        let traces = ctx.user_traces(opts);
+        let root = &traces[0].0;
+
+        assert!(
+            root.tags
+                .contains(&("cache.status".to_string(), TagValue::String("HIT".into())))
+        );
+        assert!(
+            root.logs
+                .contains(&("event".to_string(), "lookup".to_string()))
+        );
+    }
+
+    #[test]
+    fn dual_span_is_parallel() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _s = dual_span("op");
+        }
+
+        // Internal pipeline: just the internal span.
+        assert_eq!(ctx.traces(Default::default()), vec![test_trace! { "op" }]);
+        // User pipeline: the parallel user span nested under the user root.
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "op" } }]
+        );
+    }
+
+    // The parallel user span is named after the span even when the internal trace is dropped by
+    // sampling.
+    #[test]
+    fn dual_span_names_span_when_internal_trace_sampled_out() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _internal_root = start_trace(
+                "internal_root",
+                StartTraceOptions {
+                    override_sampling_ratio: Some(0.0),
+                    ..Default::default()
+                },
+            );
+            let _user_root = user_tracing::start_trace("request", routing(), None);
+
+            let _s = dual_span("op");
+        }
+
+        assert!(ctx.traces(Default::default()).is_empty());
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "op" } }]
+        );
+    }
+
+    // `dual_span()` carried across an `.await` via its scope's `into_context()`: the parallel user
+    // span survives the boundary and a second `dual_span()` nests under it.
+    #[tokio::test]
+    async fn dual_span_carried_across_await() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+
+            dual_span("a")
+                .into_context()
+                .apply(async {
+                    let _c = dual_span("c");
+                })
+                .await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "a" => { "c" } } }]
+        );
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "a" => { "c" } }]
+        );
+    }
+
+    // Same propagation, but `into_context()` is taken on an *internal-only* span (`b`) between two
+    // user spans. The ambient user span (`a`) rides along, so the far-side user span (`c`) nests
+    // under `a` — the user tree skips `b`, which exists only in the internal tree.
+    #[tokio::test]
+    async fn dual_span_carried_via_internal_span() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _a = dual_span("a");
+
+            span("b")
+                .into_context()
+                .apply(async {
+                    let _c = dual_span("c");
+                })
+                .await;
+        }
+
+        // User tree: c under a under the root; b is internal-only and absent here.
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "a" => { "c" } } }]
+        );
+        // Internal tree: a -> b -> c.
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "a" => { "b" => { "c" } } }]
+        );
+    }
+
+    #[test]
+    fn continues_inbound_trace() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        let inbound =
+            TraceparentContext::parse(b"00-11223344556677889900aabbccddeeff-a1b2c3d4e5f60718-01")
+                .unwrap();
+        let _root = user_tracing::start_trace("request", routing(), Some(inbound));
+
+        let out = user_tracing::w3c_traceparent().unwrap();
+        assert!(out.starts_with("00-11223344556677889900aabbccddeeff-"));
+    }
+
+    // Outbound: `w3c_traceparent()` is derived from the *current* user span — a child shares the
+    // root's 128-bit trace id but reports its own span id.
+    #[test]
+    fn outbound_traceparent_is_span_derived() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        let _root = user_tracing::start_trace("request", routing(), None);
+        let root_tp = user_tracing::w3c_traceparent().expect("root traceparent");
+
+        let _child = user_tracing::span("child");
+        let child_tp = user_tracing::w3c_traceparent().expect("child traceparent");
+
+        // Same version + trace id ("00-" + 32 hex = 35 chars); different span id.
+        assert_eq!(&root_tp[..35], &child_tp[..35]);
+        assert_ne!(root_tp, child_tp);
+    }
+
+    #[test]
+    fn no_op_without_activation() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            // No `user_tracing::start_trace`, so user tracing isn't active for this scope.
+            let _child = user_tracing::span("child");
+            user_tracing::add_span_tags!("k" => "v");
+        }
+
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn finish_callback_runs() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            user_tracing::set_span_finish_callback!(|span: &mut Span| {
+                span.set_tag(|| Tag::new("finished", true));
+            });
+        }
+
+        let opts = TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        };
+        let traces = ctx.user_traces(opts);
+        assert!(traces[0].0.tags.iter().any(|(k, _)| k == "finished"));
+    }
+
+    #[tokio::test]
+    async fn propagates_across_await() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root_ctx = user_tracing::start_trace("request", routing(), None).into_context();
+            root_ctx
+                .apply(async {
+                    let _child = user_tracing::span("child");
+                })
+                .await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" } }]
+        );
+    }
+
+    // The user span rides along on the ambient `TelemetryContext` even when propagation goes
+    // through an *internal* span's `into_context()` — no explicit user-span threading needed.
+    #[tokio::test]
+    async fn user_span_carried_by_internal_context() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+
+            // Propagate via an internal span's context; never touch the user scope.
+            span("internal")
+                .into_context()
+                .apply(async {
+                    let _user_child = user_tracing::span("user_child");
+                })
+                .await;
+        }
+
+        // User pipeline: the user child nested under the user root (the user span was carried).
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "user_child" } }]
+        );
+        // Internal pipeline: just the internal span.
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "internal" }]
+        );
+    }
+
+    // An internal span's `into_context()` carries the *currently active* user span — not just the
+    // root — so a user span created after propagation nests under it. This guards the fact that a
+    // plain `SpanScope` relies on `TelemetryContext::current()` (not a stored field) to carry the
+    // ambient user span.
+    #[tokio::test]
+    async fn internal_context_carries_the_current_user_span() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _child = user_tracing::span("child");
+
+            span("internal")
+                .into_context()
+                .apply(async {
+                    let _grandchild = user_tracing::span("grandchild");
+                })
+                .await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" => { "grandchild" } } }]
+        );
+    }
+
+    // A real task boundary (`tokio::spawn`): the held context carries the user span into a
+    // separate task, where a child nests under the root.
+    #[tokio::test]
+    async fn user_span_carried_across_spawn() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root_ctx = user_tracing::start_trace("request", routing(), None).into_context();
+            tokio::spawn(root_ctx.apply(async {
+                let _child = user_tracing::span("child");
+            }))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" } }]
+        );
+    }
+
+    // Forking the *internal* trace must preserve the active user span.
+    #[test]
+    fn user_span_survives_forked_trace() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _forked = TelemetryContext::current()
+                .with_forked_trace("fork")
+                .scope();
+            let _child = user_tracing::span("child");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" } }]
+        );
+    }
+
+    // Forking the log must likewise preserve the active user span.
+    #[cfg(feature = "logging")]
+    #[test]
+    fn user_span_survives_forked_log() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            let _forked = TelemetryContext::current().with_forked_log().scope();
+            let _child = user_tracing::span("child");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" } }]
+        );
+    }
+
+    // Same property via the `#[span_fn]` macro path (a plain internal-traced async fn).
+    #[crate::telemetry::tracing::span_fn("internal_fn", crate_path = "crate")]
+    async fn internal_fn() {
+        let _user_child = user_tracing::span("user_child");
+    }
+
+    #[tokio::test]
+    async fn user_span_carried_by_span_fn() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            internal_fn().await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "user_child" } }]
+        );
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "internal_fn" }]
+        );
+    }
+
+    // `dual_span()` is a no-op for the user pipeline when no user trace is active: the internal
+    // span is still created, but no parallel user span is produced.
+    #[test]
+    fn dual_span_no_op_when_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            // No `user_tracing::start_trace` => user tracing not active for this scope.
+            let _s = dual_span("op");
+        }
+
+        assert_eq!(ctx.traces(Default::default()), vec![test_trace! { "op" }]);
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[crate::telemetry::tracing::span_fn("user_fn", user = true, crate_path = "crate")]
+    async fn user_fn() {}
+
+    // `#[span_fn(user = true)]` is likewise a no-op for the user pipeline when inactive.
+    #[tokio::test]
+    async fn span_fn_user_no_op_when_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        user_fn().await;
+
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "user_fn" }]
+        );
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    // `#[span_fn(user = true)]` opens a parallel user span when a user trace is active: the
+    // function appears in both the internal and user pipelines.
+    #[tokio::test]
+    async fn span_fn_user_creates_parallel_span() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = user_tracing::start_trace("request", routing(), None);
+            user_fn().await;
+        }
+
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "user_fn" }]
+        );
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "user_fn" } }]
+        );
+    }
+
+    // --- Owned `UserSpan` handles ---
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    // The property the whole type exists for: `UserSpanScope` is deliberately `!Send`, so it
+    // can't be stored in a struct or held across an await point. This can.
+    #[test]
+    fn handle_is_send_and_sync() {
+        assert_send_sync::<UserSpan>();
+    }
+
+    #[test]
+    fn deferred_handle_activates_context_captured_before_activation() {
+        let ctx = TelemetryContext::test();
+        let unrelated_ctx = TelemetryContext::test();
+        let root = UserSpan::deferred();
+        let request_ctx = {
+            let _scope = unrelated_ctx.scope();
+            ctx.with_user_span(&root)
+        };
+        let tag_factory_called = Cell::new(false);
+
+        root.set_tags(|| {
+            tag_factory_called.set(true);
+            vec![Tag::new("before", true)]
+        });
+        assert!(!tag_factory_called.get());
+        assert!(!root.is_sampled());
+        assert!(root.w3c_traceparent().is_none());
+
+        {
+            let _request = request_ctx.scope();
+            root.activate("request", routing(), None);
+            assert!(root.is_sampled());
+            user_tracing::add_span_tags!("after" => true);
+            let _child = user_tracing::span("child");
+        }
+
+        drop(request_ctx);
+        drop(root);
+
+        let traces = ctx.user_traces(TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        });
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].0.children[0].name, "child");
+        assert!(
+            traces[0]
+                .0
+                .tags
+                .contains(&("after".to_string(), TagValue::Boolean(true)))
+        );
+        assert!(!traces[0].0.tags.iter().any(|(name, _)| name == "before"));
+        assert!(unrelated_ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn pre_activation_child_and_its_subtree_stay_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+        let request_ctx = root.enter().into_context();
+
+        {
+            let _request = request_ctx.scope();
+            let before = user_tracing::span("before");
+
+            root.activate("request", routing(), None);
+            let ignored = user_tracing::span("ignored");
+
+            drop(ignored);
+            drop(before);
+            let _after = user_tracing::span("after");
+        }
+
+        drop(request_ctx);
+        drop(root);
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "after" } }]
+        );
+    }
+
+    #[test]
+    fn context_from_pre_activation_child_remains_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+        let request_ctx = root.enter().into_context();
+        let before_ctx = {
+            let _request = request_ctx.scope();
+            user_tracing::span("before").into_context()
+        };
+
+        root.activate("request", routing(), None);
+        {
+            let _before = before_ctx.scope();
+            let _after = user_tracing::span("after");
+        }
+
+        drop(before_ctx);
+        drop(request_ctx);
+        drop(root);
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    #[test]
+    fn ordinary_inactive_scope_still_masks_active_root() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+            let _root = root.enter();
+            let inactive = UserSpan::inactive();
+            let _inactive = inactive.enter();
+            let _suppressed = user_tracing::span("suppressed");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    #[test]
+    fn deferred_handle_activates_only_once() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+
+        root.activate("first", routing(), None);
+        root.activate("second", routing(), None);
+        drop(root);
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "first" }]
+        );
+    }
+
+    #[test]
+    fn deferred_handle_retries_an_inactive_activation() {
+        let ctx = TelemetryContext::test();
+        let root = UserSpan::deferred();
+
+        root.activate("ignored", routing(), None);
+        assert!(!root.is_sampled());
+
+        {
+            let _scope = ctx.scope();
+            root.activate("request", routing(), None);
+            assert!(root.is_sampled());
+        }
+
+        drop(root);
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    #[test]
+    fn deferred_handle_activates_only_once_concurrently() {
+        let ctx = TelemetryContext::test();
+        let root = Arc::new(UserSpan::deferred());
+        let request_ctx = {
+            let _scope = ctx.scope();
+            root.enter().into_context()
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+
+        for name in ["first", "second"] {
+            let root = Arc::clone(&root);
+            let request_ctx = request_ctx.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let _scope = request_ctx.scope();
+                barrier.wait();
+                root.activate(name, routing(), None);
+                assert!(root.is_sampled());
+                let _child = user_tracing::span(format!("{name} child"));
+            }));
+        }
+
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        drop(request_ctx);
+        drop(root);
+
+        let traces = ctx.user_traces(Default::default());
+        assert_eq!(traces.len(), 1);
+        assert!(matches!(traces[0].0.name.as_str(), "first" | "second"));
+        let mut child_names: Vec<_> = traces[0]
+            .0
+            .children
+            .iter()
+            .map(|span| span.name.as_str())
+            .collect();
+        child_names.sort_unstable();
+        assert_eq!(child_names, ["first child", "second child"]);
+    }
+
+    #[test]
+    fn deferred_root_exports_after_its_last_context() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+        let request_ctx = root.enter().into_context();
+
+        root.activate("request", routing(), None);
+        root.finish();
+        assert!(ctx.user_traces(Default::default()).is_empty());
+
+        drop(request_ctx);
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    #[test]
+    fn unsampled_inbound_does_not_claim_deferred_root() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+        let inbound =
+            TraceparentContext::parse(b"00-11223344556677889900aabbccddeeff-a1b2c3d4e5f60718-00")
+                .unwrap();
+
+        root.activate("ignored", routing(), Some(inbound));
+        assert!(!root.is_sampled());
+
+        root.activate("request", routing(), None);
+        drop(root);
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    #[test]
+    fn deferred_root_continues_sampled_inbound_trace() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+        let root = UserSpan::deferred();
+        let inbound =
+            TraceparentContext::parse(b"00-11223344556677889900aabbccddeeff-a1b2c3d4e5f60718-01")
+                .unwrap();
+
+        root.activate("request", routing(), Some(inbound));
+        let root_traceparent = root.w3c_traceparent().expect("root traceparent");
+        let child_traceparent = root
+            .child("child")
+            .w3c_traceparent()
+            .expect("child traceparent");
+
+        assert!(root_traceparent.starts_with("00-11223344556677889900aabbccddeeff-"));
+        assert_eq!(&root_traceparent[..35], &child_traceparent[..35]);
+        assert_ne!(root_traceparent, child_traceparent);
+    }
+
+    #[test]
+    fn handle_creation_and_nesting() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+            let child = root.child("child");
+            let _grandchild = child.child("grandchild");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" => { "grandchild" } } }]
+        );
+        // User spans must not leak into the internal pipeline.
+        assert!(ctx.traces(Default::default()).is_empty());
+    }
+
+    // `enter` clones the underlying span rather than borrowing the handle, so a live scope keeps
+    // the span open. Reporting is driven by the last reference, not by the owned handle.
+    #[test]
+    fn live_scope_outlives_the_handle() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        let root = UserSpan::start_trace("request", routing(), None);
+        let entered = root.enter();
+
+        root.finish();
+        assert!(
+            ctx.user_traces(Default::default()).is_empty(),
+            "the live scope should still hold the span open"
+        );
+
+        drop(entered);
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" }]
+        );
+    }
+
+    // Parents are named rather than inferred, so two children of the same span are siblings even
+    // though the first is still unfinished when the second starts. A scope stack would nest them.
+    #[test]
+    fn siblings_from_explicit_parent() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+            let first = root.child("first");
+            let second = root.child("second");
+
+            drop(first);
+            drop(second);
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "first", "second" } }]
+        );
+    }
+
+    #[test]
+    fn inactive_handle_is_inert() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let span = UserSpan::inactive();
+
+            assert!(!span.is_sampled());
+            assert!(span.w3c_traceparent().is_none());
+            span.set_tags(|| vec![Tag::new("k", "v")]);
+
+            // Children of an inactive span are inactive in turn.
+            let child = span.child("child");
+
+            assert!(!child.is_sampled());
+            assert!(child.w3c_traceparent().is_none());
+            child.set_tags(|| vec![Tag::new("k", "v")]);
+        }
+
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn handle_set_tags() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+
+            assert!(root.is_sampled());
+            root.set_tags(|| vec![Tag::new("cache.status", "HIT")]);
+        }
+
+        let traces = ctx.user_traces(TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        });
+
+        assert!(
+            traces[0]
+                .0
+                .tags
+                .contains(&("cache.status".to_string(), TagValue::String("HIT".into())))
+        );
+    }
+
+    // `enter()` is the bridge back to the ambient API, for callers that prefer it within a single
+    // function.
+    #[test]
+    fn handle_enter_feeds_ambient_helpers() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+            {
+                let _entered = root.enter();
+
+                user_tracing::add_span_tags!("entered" => true);
+                let _ambient_child = user_tracing::span("ambient_child");
+            }
+        }
+
+        let traces = ctx.user_traces(TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        });
+
+        assert_eq!(traces[0].0.children[0].name, "ambient_child");
+        assert!(
+            traces[0]
+                .0
+                .tags
+                .contains(&("entered".to_string(), TagValue::Boolean(true)))
+        );
+    }
+
+    #[test]
+    fn handle_continues_inbound_trace() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        let inbound =
+            TraceparentContext::parse(b"00-11223344556677889900aabbccddeeff-a1b2c3d4e5f60718-01")
+                .unwrap();
+        let root = UserSpan::start_trace("request", routing(), Some(inbound));
+
+        let root_tp = root.w3c_traceparent().expect("root traceparent");
+        assert!(root_tp.starts_with("00-11223344556677889900aabbccddeeff-"));
+
+        // A child keeps the 128-bit trace id but reports its own span id, so the next hop parents
+        // under whichever span injected the header.
+        let child_tp = root.child("child").w3c_traceparent().expect("child");
+
+        assert_eq!(&root_tp[..35], &child_tp[..35]);
+        assert_ne!(root_tp, child_tp);
+    }
+
+    // Routing is set once at the root and has to reach every descendant: the OTLP exporter groups
+    // by it and silently drops spans that arrive without it. `Span::child` inherits routing while
+    // `SpanHandle::child` deliberately doesn't, so this pins which of the two `child` uses.
+    //
+    // Driven through a raw tracer because routing lives on `FinishedSpan`, which the test harness
+    // doesn't surface.
+    #[tokio::test]
+    async fn child_inherits_routing() {
+        use super::channel::{PipelineType, unbounded_channel};
+        use super::internal::{child_user_span, user_shared_span};
+        use cf_rustracing::Tracer;
+        use cf_rustracing::sampler::AllSampler;
+        use std::sync::Arc;
+
+        let (sender, span_rx) = unbounded_channel(PipelineType::User);
+
+        {
+            let tracer = Tracer::with_consumer(AllSampler, sender);
+            let root =
+                user_shared_span(tracer.span("request").routing(Arc::new(routing())).start());
+
+            let _child = child_user_span(&root, "child");
+        }
+
+        let mut finished = Vec::new();
+        span_rx.recv_many(&mut finished, 8).await;
+
+        assert_eq!(finished.len(), 2, "expected the root and its child");
+        for span in &finished {
+            assert_eq!(
+                span.routing().map(|r| r.encode()).as_deref(),
+                Some("zone=1;account=2"),
+                "a span reached the exporter without routing and would be dropped"
+            );
+        }
+    }
+
+    // The motivating case: a handle created in one callback, moved onto another task, mutated
+    // after an await point, and finished there.
+    #[tokio::test]
+    async fn handle_survives_await_and_thread_move() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root = UserSpan::start_trace("request", routing(), None);
+            let child = root.child("child");
+
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+
+                child.set_tags(|| vec![Tag::new("moved", true)]);
+                child.finish();
+            })
+            .await
+            .unwrap();
+        }
+
+        let traces = ctx.user_traces(TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        });
+
+        assert_eq!(traces[0].0.children[0].name, "child");
+        assert!(
+            traces[0].0.children[0]
+                .tags
+                .contains(&("moved".to_string(), TagValue::Boolean(true)))
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::{MAX_PROBE_ARGS, span};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    #[test]
+    fn end_probe_fires_once_when_last_clone_drops() {
+        static FIRES: AtomicUsize = AtomicUsize::new(0);
+        static LAST_TAG: AtomicU64 = AtomicU64::new(0);
+
+        fn counting_probe(args: &[u64; MAX_PROBE_ARGS]) {
+            LAST_TAG.store(args[1], Ordering::Relaxed);
+            FIRES.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut scope = span("test::probe");
+        scope.__arm_probe(counting_probe, [0, 42, 0, 0]);
+        let clone = scope.span.clone();
+
+        drop(scope);
+        assert_eq!(FIRES.load(Ordering::Relaxed), 0);
+
+        drop(clone);
+        assert_eq!(FIRES.load(Ordering::Relaxed), 1);
+        assert_eq!(LAST_TAG.load(Ordering::Relaxed), 42);
+    }
+
+    #[cfg(feature = "user-tracing")]
+    #[test]
+    fn dual_scope_probe_arms_internal_span_only() {
+        fn noop_probe(_args: &[u64; MAX_PROBE_ARGS]) {}
+
+        let mut scope = super::dual_span("test::probe");
+        assert!(scope.inner.span.probe.is_none());
+        // No user trace is active, so no user span is created.
+        assert!(scope.user.is_none());
+
+        scope.__arm_probe(noop_probe, [0; 4]);
+        assert!(scope.inner.span.probe.is_some());
+    }
+}

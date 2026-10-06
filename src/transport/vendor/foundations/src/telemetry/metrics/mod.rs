@@ -1,0 +1,769 @@
+//! Metrics-related functionality.
+//!
+//! Foundations provides simple and ergonomic interface to [Prometheus] metrics:
+//! - Use [`metrics`] macro to define regular metrics.
+//! - Use [`report_info`] function to register service information metrics (metrics, whose value is
+//!   persistent during the service lifetime, e.g. software version).
+#![cfg_attr(
+    feature = "foundations-metrics-backend",
+    doc = "- Use [`collect_format`] method to obtain metrics report programmatically."
+)]
+#![cfg_attr(
+    not(feature = "foundations-metrics-backend"),
+    doc = "- Use [`collect`] method to obtain metrics report programmatically."
+)]
+//! - Use [telemetry server] to expose a metrics endpoint.
+//!
+//! [Prometheus]: https://prometheus.io/
+
+use super::settings::MetricsSettings;
+use crate::Result;
+use std::fmt::Display;
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+use prometheus::{Encoder, TextEncoder};
+#[cfg(not(feature = "foundations-metrics-backend"))]
+use serde::Serialize;
+#[cfg(not(feature = "foundations-metrics-backend"))]
+use std::any::TypeId;
+
+// Aliased so it does not shadow the glob-re-exported `backend::ServiceNameFormat`.
+#[cfg(feature = "foundations-metrics-backend")]
+use super::settings::ServiceNameFormat as SettingsServiceNameFormat;
+#[cfg(feature = "foundations-metrics-backend")]
+use std::sync::OnceLock;
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+mod gauge;
+mod negotiation;
+#[cfg(all(feature = "foundations-metrics-backend", target_os = "linux"))]
+mod process;
+#[cfg(not(feature = "foundations-metrics-backend"))]
+mod rewind;
+
+pub(super) mod init;
+
+#[doc(hidden)]
+#[cfg(not(feature = "foundations-metrics-backend"))]
+pub mod internal;
+
+#[doc(hidden)]
+#[cfg(feature = "foundations-metrics-backend")]
+#[path = "internal_backend.rs"]
+pub mod internal;
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+use internal::{ErasedInfoMetric, Registries};
+
+#[cfg(feature = "foundations-metrics-backend")]
+mod backend {
+    pub use foundations_metrics::{
+        Counter, Family, Gauge, GaugeGuard, Histogram, HistogramBuilder, HistogramTimer,
+        InfoMetric, MetricConstructor, NativeHistogram, NativeHistogramBuilder,
+        NativeTimeHistogram, RangeGauge, TimeHistogram, WithExemplar,
+    };
+
+    // Everything needed to define, register, and label a custom metric. The
+    // protobuf data model is re-exported as `proto` so that implementors do not
+    // need a direct dependency on `foundations-metrics-registry`.
+    pub use foundations_metrics::{
+        EncodeMetric, EncodeMetricValue, IntoMetrics, LabelError, MetricFamily, NamedMetric,
+        RegistrationMetadata, proto, register, to_label_pairs,
+    };
+}
+#[cfg(not(feature = "foundations-metrics-backend"))]
+mod backend {
+    pub use super::gauge::{GaugeGuard, RangeGauge};
+    pub use prometheus_client::metrics::exemplar::{CounterWithExemplar, HistogramWithExemplars};
+    pub use prometheus_client::metrics::family::MetricConstructor;
+    pub use prometheus_client::metrics::gauge::Gauge;
+    pub use prometheus_client::metrics::histogram::Histogram;
+    pub use prometools::histogram::{HistogramTimer, TimeHistogram};
+    pub use prometools::nonstandard::NonstandardUnsuffixedCounter as Counter;
+    pub use prometools::serde::Family;
+}
+
+pub use backend::*;
+
+pub use negotiation::{ScrapeFormat, negotiate, negotiate_or_fallback};
+
+/// Translates telemetry settings into collection options.
+///
+/// The service name is only known once telemetry is initialized, so it is
+/// applied at collection time rather than at registration time.
+#[cfg(feature = "foundations-metrics-backend")]
+fn collection_options(settings: &MetricsSettings) -> foundations_metrics::CollectionOptions<'_> {
+    let service_name_format = match &settings.service_name_format {
+        SettingsServiceNameFormat::MetricPrefix => {
+            foundations_metrics::ServiceNameFormat::MetricPrefix
+        }
+        SettingsServiceNameFormat::LabelWithName(label_name) => {
+            foundations_metrics::ServiceNameFormat::LabelWithName(label_name)
+        }
+    };
+
+    foundations_metrics::CollectionOptions {
+        include_optional: settings.report_optional,
+        service_name: Some(init::service_name()),
+        service_name_format,
+    }
+}
+
+#[cfg(feature = "foundations-metrics-backend")]
+fn collect_registered_metrics(
+    settings: &MetricsSettings,
+) -> Vec<foundations_metrics::MetricFamily> {
+    #[cfg(target_os = "linux")]
+    process::register();
+
+    foundations_metrics::collect(collection_options(settings))
+}
+
+/// Collects all metrics in [Prometheus text format].
+///
+/// [Prometheus text format]: https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
+#[cfg_attr(
+    feature = "foundations-metrics-backend",
+    deprecated = "Only ever produces text. Use `collect_format` instead, serving the body it returns with the matching `ScrapeFormat::content_type`."
+)]
+pub fn collect(settings: &MetricsSettings) -> Result<String> {
+    collect_text(settings)
+}
+
+/// Collects all metrics encoded as `format`.
+///
+/// Content negotiation is a separate concern: pass the format chosen by
+/// [`negotiate`], and serve the returned body with that format's
+/// [`ScrapeFormat::content_type`] so a response cannot advertise something it
+/// did not encode.
+///
+/// # Errors
+///
+/// Fails when `format` cannot represent everything this process exposes.
+/// [`ScrapeFormat::Protobuf`] cannot carry the output of a registered extra
+/// producer, which is opaque text; [`allow_protobuf`] reports whether it may be
+/// asked for. [`ScrapeFormat::fallback`] never fails for this reason.
+#[cfg(feature = "foundations-metrics-backend")]
+pub fn collect_format(format: ScrapeFormat, settings: &MetricsSettings) -> Result<Vec<u8>> {
+    collect_encoded(format, settings)
+}
+
+/// Encodes a scrape as `format`, backing both `collect_format` and the
+/// telemetry server's `/metrics` route.
+///
+/// The server negotiates formats whichever backend is active, so encoding stays
+/// available internally even where `collect_format` is not exposed.
+#[cfg(any(feature = "foundations-metrics-backend", feature = "telemetry-server"))]
+pub(crate) fn collect_encoded(format: ScrapeFormat, settings: &MetricsSettings) -> Result<Vec<u8>> {
+    match format {
+        #[cfg(feature = "foundations-metrics-backend")]
+        ScrapeFormat::Protobuf => collect_protobuf(settings),
+
+        // Unreachable through negotiation, which is never told protobuf is
+        // available here, but reported rather than mis-encoded regardless.
+        #[cfg(not(feature = "foundations-metrics-backend"))]
+        ScrapeFormat::Protobuf => Err(
+            "metrics can only be encoded as protobuf with the `foundations-metrics-backend` feature enabled"
+                .into(),
+        ),
+
+        ScrapeFormat::Text { .. } => Ok(collect_text(settings)?.into_bytes()),
+    }
+}
+
+/// Collects all metrics as protobuf, which only the new backend can encode.
+#[cfg(feature = "foundations-metrics-backend")]
+fn collect_protobuf(settings: &MetricsSettings) -> Result<Vec<u8>> {
+    if !protobuf_available() {
+        return Err(
+            "metrics cannot be encoded as protobuf while an extra producer is registered".into(),
+        );
+    }
+
+    let families = collect_registered_metrics(settings);
+
+    Ok(foundations_metrics::encode_to_protobuf(&families))
+}
+
+/// Collects all metrics as OpenMetrics text, which every backend can encode.
+fn collect_text(settings: &MetricsSettings) -> Result<String> {
+    let mut buffer: Vec<u8> = Vec::with_capacity(128);
+
+    #[cfg(not(feature = "foundations-metrics-backend"))]
+    {
+        Registries::collect(&mut buffer, settings.report_optional)?;
+        TextEncoder::new().encode(&prometheus::gather(), &mut buffer)?;
+    }
+
+    #[cfg(feature = "foundations-metrics-backend")]
+    {
+        let families = collect_registered_metrics(settings);
+
+        buffer.extend_from_slice(foundations_metrics::encode_to_text(&families).as_bytes());
+
+        // Extra producers append their own terminated output, so the terminator
+        // is dropped here and re-added once everything has been produced.
+        truncate_eof(&mut buffer);
+
+        #[allow(deprecated)]
+        if let Some(producers) = EXTRA_PRODUCERS.get() {
+            for producer in producers.read().iter() {
+                producer.produce(&mut buffer);
+                truncate_eof(&mut buffer);
+            }
+        }
+    }
+
+    buffer.extend_from_slice(b"# EOF\n");
+
+    let metrics_str = String::from_utf8(buffer).unwrap_or_else(|err| {
+        report_nonfatal_collect_error(&format_args!("converting raw metrics to string: {err}"));
+        String::from_utf8_lossy(err.as_bytes()).into_owned()
+    });
+    Ok(metrics_str)
+}
+
+/// Reports whether protobuf can represent everything this process exposes.
+///
+/// Pass the result to [`negotiate`] as `allow_protobuf`. It is `false` while any
+/// extra producer is registered: those hand over opaque text, which cannot be
+/// transcoded into the protobuf data model, so serving protobuf would silently
+/// drop every series they emit.
+///
+/// Evaluate it per scrape, because producers may be registered at any point.
+#[cfg(feature = "foundations-metrics-backend")]
+#[deprecated = "Only reports whether an extra producer is registered, so it becomes redundant once `ExtraProducer` is removed. Until then, pass it to `negotiate`."]
+// TODO: remove alongside `ExtraProducer`
+pub fn allow_protobuf() -> bool {
+    protobuf_available()
+}
+
+/// Whether protobuf can carry everything this process exposes.
+///
+/// Backs `allow_protobuf` and the telemetry server's negotiation, so the server
+/// keeps withholding protobuf without depending on a deprecated function.
+#[cfg(feature = "foundations-metrics-backend")]
+#[allow(deprecated)]
+pub(crate) fn protobuf_available() -> bool {
+    EXTRA_PRODUCERS
+        .get()
+        .is_none_or(|producers| producers.read().is_empty())
+}
+
+/// Whether protobuf can carry everything this process exposes.
+///
+/// Always `false` here: encoding protobuf needs the
+/// `foundations-metrics-backend` feature.
+#[cfg(all(
+    not(feature = "foundations-metrics-backend"),
+    feature = "telemetry-server"
+))]
+pub(crate) fn protobuf_available() -> bool {
+    false
+}
+
+/// Removes the trailing OpenMetrics terminator, if present.
+#[cfg(feature = "foundations-metrics-backend")]
+fn truncate_eof(buffer: &mut Vec<u8>) {
+    const EOF_MARKER: &[u8] = b"# EOF\n";
+
+    if buffer.ends_with(EOF_MARKER) {
+        buffer.truncate(buffer.len() - EOF_MARKER.len());
+    }
+}
+
+#[inline]
+#[track_caller]
+fn report_nonfatal_collect_error(err: &dyn Display) {
+    #[cfg(feature = "logging")]
+    crate::telemetry::log::warn!("non-fatal error while collecting metrics"; "error" => %err);
+
+    #[cfg(not(feature = "logging"))]
+    eprintln!("non-fatal error while collecting metrics: {err}");
+}
+
+/// A macro that allows to define Prometheus metrics.
+///
+/// The macro is a proc macro attribute that should be put on a module containing
+/// bodyless functions. Each bodyless function corresponds to a single metric, whose
+/// name becomes `<global prefix>_<module name>_<bodyless function name>`and function's
+/// Rust doc comment is reported as metric description to Prometheus.
+///
+/// The `<global_prefix>` can be disabled by passing the `unprefixed` flag to the macro
+/// invocation, like `#[metrics(unprefixed)]`. The module name is a mandatory prefix.
+///
+/// # Labels
+/// Arguments of the bodyless functions become labels for that metric.
+///
+/// Supported metric types are reexported from this module for convenience:
+///
+/// * [`Counter`]
+/// * [`Gauge`]
+/// * [`Histogram`]
+/// * [`TimeHistogram`]
+///
+#[cfg_attr(
+    feature = "foundations-metrics-backend",
+    doc = "To attach exemplars, wrap any of the above in [`WithExemplar<T, S>`], which derefs to the metric it wraps."
+)]
+#[cfg_attr(
+    not(feature = "foundations-metrics-backend"),
+    doc = "To attach exemplars, we provide [`CounterWithExemplar`] and [`HistogramWithExemplars`]."
+)]
+///
+/// ```ignore
+/// let requests: WithExemplar<Counter, TraceLabels> = WithExemplar::default();
+/// requests.inc_by_with_exemplar(TraceLabels { trace_id: "abc123" }, 1);
+/// ```
+///
+/// The metrics associated with the functions are automatically registered in a global
+/// registry, from which this module's collection functions report them.
+///
+/// # Metric attributes
+///
+/// Example below shows how to use all the attributes listed here.
+///
+/// ## `#[ctor]`
+///
+/// `#[ctor]` allows specifying how the metric should be built (e.g. [`HistogramBuilder`]).
+/// The constructor should implement [`MetricConstructor`] for the metric type.
+///
+/// ## `#[optional]`
+///
+/// Metrics marked with `#[optional]` are collected in a separate registry and reported only if
+/// [`MetricsSettings::report_optional`] is set to `true`, whether they are collected
+/// programmatically or through the [telemetry server].
+///
+/// Can be used for heavy-weight metrics (e.g. with high cardinality) that don't need to be reported
+/// on a regular basis.
+///
+/// ## `#[with_removal]` (unstable)
+///
+/// **This feature is unstable and becomes a noop without `cfg(foundations_unstable)`.**
+///
+/// Metrics with labels make up a shared [`Family`]. Occasionally, it can be useful to
+/// remove one or all existing metrics from a family. This functionality is provided by
+/// the `#[with_removal]` attribute. Single metrics (without labels) do not support this
+/// argument.
+///
+/// If the attribute is present on a metric function, two additional functions are
+/// generated in addition to the metric itself. These are called `<metric>_remove` and
+/// `<metric>_clear`. The `_remove` variant takes the same arguments as the original
+/// function and removes that instance from the family. It returns a boolean indicating
+/// whether the labels were present before. The `_clear` variant takes no arguments
+/// and removes all existing metrics from the family.
+///
+/// # Example
+///
+/// ```
+/// # // As rustdoc puts doc tests in `fn main()`, the implicit `use super::*;` inserted
+/// # // in the metric mod doesn't see `SomeLabel`, so we wrap the entire test in a module.
+/// # mod rustdoc_workaround {
+/// use foundations::telemetry::metrics::{metrics, Counter, Gauge, HistogramBuilder, TimeHistogram};
+/// use serde_with::DisplayFromStr;
+/// use std::net::IpAddr;
+/// use std::io;
+/// use std::sync::Arc;
+///
+/// mod labels {
+///     use serde::Serialize;
+///
+///     #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
+///     #[serde(rename_all = "lowercase")]
+///     pub enum IpVersion {
+///         V4,
+///         V6,
+///     }
+///
+///     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+///     #[serde(rename_all = "lowercase")]
+///     pub enum L4Protocol {
+///         Tcp,
+///         Udp,
+///         Quic,
+///         Unknown,
+///     }
+///
+///     #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
+///     #[serde(rename_all = "lowercase")]
+///     pub enum ProxiedProtocol {
+///         Ip,
+///         Tcp,
+///         Udp,
+///         Quic,
+///         Unknown,
+///     }
+///
+///     impl From<L4Protocol> for ProxiedProtocol {
+///         fn from(l4: L4Protocol) -> Self {
+///             match l4 {
+///                 L4Protocol::Tcp => Self::Tcp,
+///                 L4Protocol::Udp => Self::Udp,
+///                 L4Protocol::Quic => Self::Quic,
+///                 L4Protocol::Unknown => Self::Unknown,
+///             }
+///         }
+///     }
+/// }
+///
+/// // The generated module contains an implicit `use super::*;` statement.
+/// #[metrics]
+/// pub mod my_app_metrics {
+///     /// Number of active client connections
+///     pub fn client_connections_active(
+///         // Labels with an anonymous reference type will get cloned.
+///         endpoint: &Arc<String>,
+///         protocol: labels::L4Protocol,
+///         ip_version: labels::IpVersion,
+///         ingress_ip: IpAddr,
+///     ) -> Gauge;
+///
+///     /// Histogram of task schedule delays
+///     #[ctor = HistogramBuilder {
+///         // 100 us to 1 second
+///         buckets: &[1E-4, 2E-4, 3E-4, 4E-4, 5E-4, 6E-4, 7E-4, 8E-4, 9E-4, 1E-3, 1E-2, 2E-2, 4E-2, 8E-2, 1E-1, 1.0],
+///     }]
+///     pub fn tokio_runtime_task_schedule_delay_histogram(
+///         task: &Arc<str>,
+///     ) -> TimeHistogram;
+///
+///     /// Number of client connections
+///     pub fn client_connections_total(
+///         endpoint: &Arc<String>,
+///         // Labels with type `impl Into<T>` will invoke `std::convert::Into<T>`.
+///         protocol: impl Into<labels::ProxiedProtocol>,
+///         ingress_ip: IpAddr,
+///     ) -> Counter;
+///
+///     /// Tunnel transmit error count
+///     pub fn tunnel_transmit_errors_total(
+///         endpoint: &Arc<String>,
+///         protocol: labels::L4Protocol,
+///         ingress_ip: IpAddr,
+///         // `serde_as` attribute is allowed without decorating the metric with `serde_with::serde_as`.
+///         #[serde_as(as = "DisplayFromStr")]
+///         kind: io::ErrorKind,
+///         raw_os_error: i32,
+///     ) -> Counter;
+///
+///     /// Number of stalled futures
+///     #[optional]
+///     pub fn debug_stalled_future_count(
+///         // Labels with a `'static` lifetime are used as is, without cloning.
+///         name: &'static str,
+///     ) -> Counter;
+///
+///     /// Number of Proxy-Status serialization errors
+///     // Metrics with no labels are also obviously supported.
+///     pub fn proxy_status_serialization_error_count() -> Counter;
+///
+///     /// Number of HTTP requests
+///     #[with_removal]
+///     pub fn requests_total(endpoint: &Arc<String>) -> Counter;
+/// }
+///
+/// fn usage() {
+///     let endpoint = Arc::new("http-over-tcp".to_owned());
+///     let l4_protocol = labels::L4Protocol::Tcp;
+///     let ingress_ip = "127.0.0.1".parse::<IpAddr>().unwrap();
+///
+///     my_app_metrics::client_connections_total(
+///         &endpoint,
+///         l4_protocol,
+///         ingress_ip,
+///     ).inc();
+///
+///     let client_connections_active = my_app_metrics::client_connections_active(
+///         &endpoint,
+///         l4_protocol,
+///         labels::IpVersion::V4,
+///         ingress_ip,
+///     );
+///
+///     client_connections_active.inc();
+///
+///     my_app_metrics::proxy_status_serialization_error_count().inc();
+///     my_app_metrics::requests_total(&endpoint).inc();
+///
+///     client_connections_active.dec();
+///
+/// #   #[cfg(foundations_unstable)] {
+///     my_app_metrics::requests_total_remove(&endpoint);
+///     // Or remove all existing instances:
+///     my_app_metrics::requests_total_clear();
+/// #   }
+/// }
+/// # }
+/// ```
+///
+/// # Renamed or reexported crate
+///
+/// The macro will fail to compile if `foundations` crate is reexported. However, the crate path
+/// can be explicitly specified for the macro to workaround that:
+///
+/// ```
+/// # mod rustdoc_workaround {
+/// mod reexport {
+///     pub use foundations::*;
+/// }
+///
+/// use self::reexport::telemetry::metrics::Counter;
+///
+/// #[reexport::telemetry::metrics::metrics(crate_path = "reexport")]
+/// mod my_app_metrics {
+///     /// Total number of tasks workers stole from each other.
+///     fn tokio_runtime_total_task_steal_count() -> Counter;
+/// }
+/// # }
+/// ```
+///
+/// [telemetry server]: crate::telemetry::init_with_server
+/// [`MetricsSettings::report_optional`]: crate::telemetry::settings::MetricsSettings::report_optional
+pub use foundations_macros::metrics;
+
+/// A macro that allows to define a Prometheus info metric.
+///
+/// The metrics defined by this function should be used with [`report_info`] and they can be
+/// collected with the telemetry server.
+///
+/// The struct name becomes the metric name in `snake_case`, and each field of the struct becomes
+/// a label.
+///
+/// # Simple example
+///
+/// See [`report_info`] for a simple example.
+///
+/// # Renaming the metric.
+///
+/// ```
+/// use foundations::telemetry::metrics::{info_metric, report_info};
+///
+/// /// Build information
+/// #[info_metric(name = "build_info")]
+/// struct BuildInformation {
+///     version: &'static str,
+/// }
+///
+/// report_info(BuildInformation {
+///     version: "1.2.3",
+/// });
+/// ```
+/// # Renamed or reexported crate
+///
+/// The macro will fail to compile if `foundations` crate is reexported. However, the crate path
+/// can be explicitly specified for the macro to workaround that:
+///
+/// ```
+/// # mod rustdoc_workaround {
+/// mod reexport {
+///     pub use foundations::*;
+/// }
+///
+/// /// Build information
+/// #[reexport::telemetry::metrics::info_metric(crate_path = "reexport")]
+/// struct BuildInfo {
+///     version: &'static str,
+/// }
+/// # }
+/// ```
+pub use foundations_macros::info_metric;
+
+/// Describes an info metric.
+///
+/// Info metrics are used to expose textual information, through the label set, which should not
+/// change often during process lifetime. Common examples are an application's version, revision
+/// control commit, and the version of a compiler.
+#[cfg(not(feature = "foundations-metrics-backend"))]
+pub trait InfoMetric: Serialize + Send + Sync + 'static {
+    /// The name of the info metric.
+    const NAME: &'static str;
+
+    /// The help message of the info metric.
+    const HELP: &'static str;
+}
+
+/// Registers an info metric, i.e. a gauge metric whose value is always `1`, set at init time.
+///
+/// # Examples
+///
+/// ```
+/// use foundations::telemetry::metrics::{info_metric, report_info};
+///
+/// /// Build information
+/// #[info_metric]
+/// struct BuildInfo {
+///     version: &'static str,
+/// }
+///
+/// report_info(BuildInfo {
+///     version: "1.2.3",
+/// });
+/// ```
+pub fn report_info<M>(info_metric: impl Into<Box<M>>)
+where
+    M: InfoMetric,
+{
+    #[cfg(not(feature = "foundations-metrics-backend"))]
+    {
+        Registries::get().info.write().insert(
+            TypeId::of::<M>(),
+            info_metric.into() as Box<dyn ErasedInfoMetric>,
+        );
+    }
+
+    #[cfg(feature = "foundations-metrics-backend")]
+    {
+        foundations_metrics::report_info(info_metric);
+    }
+}
+
+/// A builder suitable for [`Histogram`] and [`TimeHistogram`].
+///
+/// # Example
+///
+/// ```
+/// # // As rustdoc puts doc tests in `fn main()`, the implicit `use super::*;` inserted
+/// # // in the metric mod doesn't see `SomeLabel`, so we wrap the entire test in a module.
+/// # mod rustdoc_workaround {
+/// use foundations::telemetry::metrics::{metrics, HistogramBuilder, TimeHistogram};
+///
+/// #[metrics]
+/// pub mod my_app_metrics {
+///     #[ctor = HistogramBuilder {
+///         // 100 us to 1 second
+///         buckets: &[1E-4, 2E-4, 3E-4, 4E-4, 5E-4, 6E-4, 7E-4, 8E-4, 9E-4, 1E-3, 1E-2, 2E-2, 4E-2, 8E-2, 1E-1, 1.0],
+///     }]
+///     pub fn tokio_runtime_task_schedule_delay_histogram(
+///         task: String,
+///     ) -> TimeHistogram;
+/// }
+/// # }
+/// ```
+#[cfg(not(feature = "foundations-metrics-backend"))]
+#[derive(Clone)]
+pub struct HistogramBuilder {
+    /// The buckets of the histogram to be built.
+    pub buckets: &'static [f64],
+}
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+impl MetricConstructor<Histogram> for HistogramBuilder {
+    fn new_metric(&self) -> Histogram {
+        Histogram::new(self.buckets.iter().cloned())
+    }
+}
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+impl<S> MetricConstructor<HistogramWithExemplars<S>> for HistogramBuilder {
+    fn new_metric(&self) -> HistogramWithExemplars<S> {
+        HistogramWithExemplars::new(self.buckets.iter().cloned())
+    }
+}
+
+#[cfg(not(feature = "foundations-metrics-backend"))]
+impl MetricConstructor<TimeHistogram> for HistogramBuilder {
+    fn new_metric(&self) -> TimeHistogram {
+        TimeHistogram::new(self.buckets.iter().cloned())
+    }
+}
+
+/// Adds an [ExtraProducer] that runs whenever Prometheus metrics are scraped.
+/// The producer appends metrics into a provided buffer to make them available.
+///
+/// The motivation for this is enabling metrics export from third party libraries that
+/// do not integrate with `foundations`` directly in a forward and backward compatible way.
+///
+/// One can ask "why not expose a `Registry` from `prometheus_client`?" The reason is that
+/// it would require compatibility between `prometheus_client` version that `foundations`
+/// depend on and the version that the third party crates depend on. With a producer
+/// that simply appends bytes into a buffer we avoid the need to have this match,
+/// at the cost of requiring the consumers to do the encoding themselves.
+///
+/// # Example
+///
+/// In this example we have a `Cache` that would be provided from an external crate, which
+/// does not expose metrics directly, but allows registering them in a provided `Registry`.
+///
+/// The consumer code would make a `Registry` with whatever version they want and do
+/// the encoding in a text format to make a suitable [ExtraProducer].
+///
+/// ```
+/// #[derive(Default)]
+/// struct Cache {
+///   calls: prometheus_client::metrics::counter::Counter,
+/// }
+///
+/// impl Cache {
+///   fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+///     registry.register(
+///       "calls",
+///       "The number of calls into cache",
+///       Box::new(self.calls.clone()),
+///     )
+///   }
+/// }
+///
+/// let cache = Cache::default();
+///
+/// let mut registry = prometheus_client::registry::Registry::default();
+/// let mut sub_registry = registry.sub_registry_with_prefix("cache").sub_registry_with_label((
+///     std::borrow::Cow::Borrowed("cache"),
+///     std::borrow::Cow::Borrowed("things"),
+/// ));
+///
+/// cache.register_metrics(&mut sub_registry);
+///
+/// # #[allow(deprecated)]
+/// foundations::telemetry::metrics::add_extra_producer(move |buffer: &mut Vec<u8>| {
+///     prometheus_client::encoding::text::encode(buffer, &registry).unwrap();
+/// });
+/// ```
+// Only deprecated where `register` exists to replace it, so that services on the
+// old backend are not warned about an alternative they cannot reach.
+#[cfg_attr(
+    feature = "foundations-metrics-backend",
+    deprecated = "Text output bypasses validation and cannot be encoded as protobuf. Implement `EncodeMetric` and pass it to `register` instead."
+)]
+// TODO: remove before next major release
+#[allow(deprecated)]
+pub fn add_extra_producer<P>(p: P)
+where
+    P: ExtraProducer + 'static,
+{
+    #[cfg(not(feature = "foundations-metrics-backend"))]
+    Registries::get().add_extra_producer(Box::new(p));
+
+    #[cfg(feature = "foundations-metrics-backend")]
+    EXTRA_PRODUCERS
+        .get_or_init(Default::default)
+        .write()
+        .push(Box::new(p));
+}
+
+/// Producers appended to the collected metrics, in registration order.
+#[cfg(feature = "foundations-metrics-backend")]
+#[allow(deprecated)]
+static EXTRA_PRODUCERS: OnceLock<parking_lot::RwLock<Vec<Box<dyn ExtraProducer>>>> =
+    OnceLock::new();
+
+/// Describes something that can expand prometheus metrics but appending
+/// them in a text format to a provided buffer.
+#[cfg_attr(
+    feature = "foundations-metrics-backend",
+    deprecated = "Text output bypasses validation and cannot be encoded as protobuf. Implement `EncodeMetric` instead."
+)]
+// TODO: remove before next major release
+pub trait ExtraProducer: Send + Sync {
+    /// Takes a buffer and appends prometheus metrics in text format into it.
+    fn produce(&self, buffer: &mut Vec<u8>);
+}
+
+#[allow(deprecated)]
+impl<F> ExtraProducer for F
+where
+    F: Fn(&mut Vec<u8>) + Send + Sync,
+{
+    fn produce(&self, buffer: &mut Vec<u8>) {
+        self(buffer)
+    }
+}

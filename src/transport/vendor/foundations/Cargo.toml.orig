@@ -1,0 +1,327 @@
+[package]
+name = "foundations"
+description = "A Rust service foundations library."
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+readme = "../README.md"
+documentation = "https://docs.rs/foundations"
+categories = [
+    "config",
+    "development-tools",
+    "external-ffi-bindings",
+    "memory-management",
+]
+keywords = ["service", "telemetry", "settings", "seccomp", "metrics"]
+
+[package.metadata.release]
+shared-version = "foundations"
+tag-prefix = ""
+tag-message = "Release foundations version {{version}}"
+# run in the context of workspace root
+pre-release-hook = [
+    "git-cliff",
+    "-w",
+    "..",
+    "-o",
+    "../RELEASE_NOTES.md",
+    "--tag",
+    "{{version}}",
+]
+
+[features]
+# Default set of features.
+default = ["platform-common-default", "security"]
+
+# All non platform-specific features
+platform-common-default = [
+    "settings",
+    "jemalloc",
+    "telemetry",
+    "cli",
+    "testing",
+    "settings_deny_unknown_fields_by_default",
+    "panic_on_frozen_logger",
+    "panic_on_too_much_logger_nesting",
+    "sentry",
+]
+
+# DEPRECATED: Sentry integration for fatal error tracking.
+# Use the separate `foundations-sentry` crate instead.
+sentry = ["dep:sentry-core", "dep:serde", "dep:governor", "ratelimit", "metrics"]
+
+# A subset of features that can be used both on server and client sides. Useful for libraries
+# that can be used either way.
+server-client-common-default = ["settings", "client-telemetry", "testing"]
+
+# Enables serializable documented settings functionality.
+settings = [
+    "dep:foundations-macros",
+    "dep:serde_path_to_error",
+    "dep:serde_yaml",
+    "dep:yaml-merge-keys",
+    "dep:serde",
+    "dep:indexmap",
+    "dep:zeroize",
+]
+
+# Opt-in to the serde-saphyr YAML parser instead of the default serde_yaml.
+# serde-saphyr is a pure Rust YAML implementation and is actively maintained, but it
+# is more strict with regards to YAML spec compliance.
+serde-saphyr = ["dep:serde-saphyr"]
+
+# Whether settings structs annotated with `#[settings]` will, by default, error on unknown fields.
+settings_deny_unknown_fields_by_default = ["foundations-macros?/settings_deny_unknown_fields_by_default"]
+
+# Enables all the telemetry-related features ("logging", "metrics", "tracing", "telemetry-server").
+telemetry = [
+    "logging",
+    "memory-profiling",
+    "metrics",
+    "tracing",
+    "telemetry-server",
+    "client-telemetry",
+    "telemetry-otlp-grpc",
+]
+
+# Enables a subset of telemetry features suitable for usage in clients.
+client-telemetry = ["logging", "metrics", "tracing", "ratelimit"]
+
+# Enables the telemetry server.
+telemetry-server = [
+    "logging",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:socket2",
+    "dep:percent-encoding",
+    "dep:serde",
+    "dep:tokio",
+    "tokio/net",
+    "dep:futures-util",
+    "dep:matchit",
+]
+
+# Enables telemetry reporting over gRPC
+telemetry-otlp-grpc = ["dep:tonic", "dep:tonic-prost", "dep:tokio", "tokio/net", "dep:hyper"]
+
+# Enables experimental tokio runtime metrics
+tokio-runtime-metrics = [
+    "tokio/rt",
+    "metrics",
+    "serde/rc",
+    "dep:slab",
+]
+
+# Enables logging functionality.
+logging = [
+    "ratelimit",
+    "dep:parking_lot",
+    "dep:slog-async",
+    "dep:slog-json",
+    "dep:slog-term",
+    "dep:slog",
+    "dep:thread_local",
+    "dep:futures-util",
+    "dep:serde",
+    "dep:crossbeam-utils",
+]
+
+# Enables distributed tracing functionality.
+tracing = [
+    "ratelimit",
+    "dep:foundations-macros",
+    "dep:parking_lot",
+    "dep:rand",
+    "dep:cf-rustracing-jaeger",
+    "dep:cf-rustracing",
+    "dep:opentelemetry-proto",
+    "dep:thread_local",
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:serde",
+    "dep:slab",
+    "dep:libc",
+    "dep:http",
+    "dep:crossbeam-utils",
+]
+
+# Enables distributed user tracing functionality.
+user-tracing = [
+    "tracing",
+    "dep:hex",
+    "dep:hyper",
+    "hyper/client",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:serde_json",
+    "dep:prost",
+    "tokio/net",
+]
+
+# Enables metrics functionality.
+metrics = [
+    "dep:foundations-macros",
+    "dep:erased-serde",
+    "dep:parking_lot",
+    "dep:prometheus-client",
+    "dep:prometheus",
+    "dep:prometools",
+    "dep:serde_with",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:futures-util",
+]
+
+# Enables memory profiling features (require `jemalloc` feature to be enabled)
+memory-profiling = [
+    "dep:backtrace",
+    "dep:once_cell",
+    "dep:tikv-jemalloc-ctl",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:serde",
+    "jemalloc",
+]
+
+# Enables security-related features
+security = ["dep:bindgen", "dep:cc", "dep:once_cell"]
+
+# Enables jemalloc as a memory allocator
+jemalloc = ["dep:tikv-jemallocator"]
+
+# Enables command line interface functionality.
+cli = ["settings", "dep:clap"]
+
+# Enables testing-related functionality.
+testing = ["dep:foundations-macros"]
+
+# Enables the ratelimit! utility macro.
+ratelimit = ["dep:governor", "dep:crossbeam-utils"]
+
+# Enables panicking when a frozen logger is mutated
+panic_on_frozen_logger = []
+
+# Enables panicking when too much nesting is reached on the logger
+panic_on_too_much_logger_nesting = []
+
+# Enables pattern-based routing in `telemetry-server`. If this is not enabled,
+# pattern characters will be interpreted literally.
+telemetry-server-pattern-routing = []
+
+# Enables compatibility with `tracing-rs` by adding the ability to configure a
+# logging drain that forwards logs
+tracing-rs-compat = ["dep:tracing-slog"]
+
+# Selects the `foundations-metrics` implementation behind `telemetry::metrics`.
+foundations-metrics-backend = ["dep:foundations-metrics", "dep:foundations-metrics-registry"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "foundations_docsrs", "--cfg", "tokio_unstable", "--cfg", "foundations_unstable"]
+# it's necessary to _also_ pass `--cfg tokio_unstable` and `--cfg foundations_unstable`
+# to rustc, or else dependencies will not be enabled, and the docs build will fail.
+rustc-args = ["--cfg", "tokio_unstable", "--cfg", "foundations_unstable"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true, features = ["backtrace", "std"] }
+backtrace = { workspace = true, optional = true }
+foundations-macros = { workspace = true, optional = true, default-features = false }
+foundations-metrics = { workspace = true, optional = true, default-features = false }
+foundations-metrics-registry = { workspace = true, optional = true, default-features = false }
+cf-rustracing = { workspace = true, optional = true }
+cf-rustracing-jaeger = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+crossbeam-utils = { workspace = true, optional = true }
+erased-serde = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+governor = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio"] }
+indexmap = { workspace = true, optional = true, features = ["serde"] }
+libc = { workspace = true, optional = true }
+matchit = { workspace = true, optional = true }
+once_cell = { workspace = true, optional = true }
+opentelemetry-proto = { workspace = true, optional = true, features = ["gen-tonic-messages", "trace"] }
+parking_lot = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true, features = ["process", "protobuf"] }
+prometheus-client = { workspace = true, optional = true }
+prometools = { workspace = true, optional = true, features = ["serde"] }
+prost = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, optional = true }
+serde_path_to_error = { workspace = true, optional = true }
+serde-saphyr = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+yaml-merge-keys = { workspace = true, optional = true }
+serde_with = { workspace = true, optional = true }
+slab = { workspace = true, optional = true }
+slog = { workspace = true, optional = true, features = ["max_level_trace"] }
+slog-async = { workspace = true, optional = true }
+slog-json = { workspace = true, optional = true }
+slog-term = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
+tracing-slog = { workspace = true, optional = true }
+thread_local = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["sync", "rt", "macros"] }
+tonic = { workspace = true, optional = true, features = ["channel"] }
+tonic-prost = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true, features = [
+    "profiling",
+    "stats",
+    "background_threads",
+] }
+pin-project-lite = { workspace = true }
+zeroize = { workspace = true, optional = true }
+
+# needed for minver purposes
+ahash = { workspace = true, optional = true }
+annotate-snippets = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+encoding_rs_io = { workspace = true, optional = true }
+is-terminal = { workspace = true, optional = true }
+local-ip-address = { workspace = true, optional = true }
+lock_api = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+parking_lot_core = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+
+# Only used in deprecated code
+# TODO: remove before next major release
+sentry-core = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemalloc-ctl = { workspace = true, optional = true, features = [
+    "use_std",
+] }
+tempfile = { workspace = true, optional = true }
+
+# needed for minver purposes
+neli = { workspace = true, optional = true }
+neli-proc-macros = { workspace = true, optional = true }
+
+[dev-dependencies]
+backtrace = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+ipnetwork = { workspace = true }
+nix = { workspace = true , features = ["fs"] }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true, features = ["runtime"], optional = true }
+cc = { workspace = true, optional = true }

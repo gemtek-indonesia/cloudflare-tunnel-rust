@@ -1,0 +1,57 @@
+use crate::ratelimit::{DirectRateLimiter, Quota, StaticQuantaClock};
+use crate::telemetry::settings::ActiveSamplingSettings;
+use cf_rustracing::sampler::Sampler;
+use cf_rustracing::span::CandidateSpan;
+use cf_rustracing::{Result, sampler::ProbabilisticSampler};
+use std::num::NonZeroU32;
+
+#[derive(Debug)]
+pub(crate) struct RateLimitingProbabilisticSampler {
+    inner: ProbabilisticSampler,
+    rate_limiter: Option<DirectRateLimiter>,
+}
+
+impl Default for RateLimitingProbabilisticSampler {
+    fn default() -> Self {
+        Self {
+            inner: ProbabilisticSampler::new(0.0).unwrap(),
+            rate_limiter: None,
+        }
+    }
+}
+
+/// A tracing sampler which also optionally rate limits the number of spans emitted
+impl RateLimitingProbabilisticSampler {
+    /// If `sampling_rate` is not in the range `0.0...1.0`,
+    /// it will return an error with the kind `ErrorKind::InvalidInput`.
+    pub(crate) fn new(settings: &ActiveSamplingSettings) -> Result<Self> {
+        let rate_limiter = if settings.rate_limit.enabled
+            && let Some(rate) = NonZeroU32::new(settings.rate_limit.max_events_per_second)
+        {
+            Some(DirectRateLimiter::direct_with_clock(
+                Quota::per_second(rate),
+                StaticQuantaClock::default(),
+            ))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inner: ProbabilisticSampler::new(settings.sampling_ratio)?,
+            rate_limiter,
+        })
+    }
+}
+
+impl<T> Sampler<T> for RateLimitingProbabilisticSampler {
+    fn is_sampled(&self, span: &CandidateSpan<T>) -> bool {
+        if !self.inner.is_sampled(span) {
+            return false;
+        }
+
+        self.rate_limiter
+            .as_ref()
+            .map(|r| r.check().is_ok())
+            .unwrap_or(true)
+    }
+}

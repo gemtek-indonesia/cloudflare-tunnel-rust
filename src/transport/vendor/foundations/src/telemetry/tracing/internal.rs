@@ -1,0 +1,449 @@
+use super::StartTraceOptions;
+use super::init::TracingHarness;
+
+use crate::telemetry::tracing::live::LiveReferenceHandle;
+use cf_rustracing::sampler::BoxSampler;
+#[cfg(feature = "user-tracing")]
+use cf_rustracing::span::RoutingMetadata;
+use cf_rustracing::tag::Tag;
+#[cfg(feature = "user-tracing")]
+use cf_rustracing_jaeger::span::TraceId;
+use cf_rustracing_jaeger::span::{Span, SpanContext, SpanContextState};
+use parking_lot::RwLock;
+use rand::RngExt as _;
+use std::borrow::Cow;
+use std::error::Error;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
+
+pub(crate) type Tracer = cf_rustracing::Tracer<BoxSampler<SpanContextState>, SpanContextState>;
+
+/// Shared span with mutability and additional reference tracking for
+/// ad-hoc inspection.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedSpanHandle {
+    Tracked(Arc<LiveReferenceHandle<Arc<RwLock<Span>>>>),
+    Untracked(Arc<RwLock<Span>>),
+    #[cfg(feature = "user-tracing")]
+    Deferred(Arc<RwLock<Span>>),
+    Inactive,
+}
+
+impl SharedSpanHandle {
+    pub(crate) fn new(span: Span) -> Self {
+        TracingHarness::get().active_roots.track(span)
+    }
+
+    pub(crate) fn with_read<R>(&self, f: impl FnOnce(&Span) -> R) -> R {
+        static INACTIVE: Span = Span::inactive();
+
+        match self {
+            SharedSpanHandle::Tracked(handle) => f(&handle.read()),
+            SharedSpanHandle::Untracked(rw_lock) => f(&rw_lock.read()),
+            #[cfg(feature = "user-tracing")]
+            SharedSpanHandle::Deferred(rw_lock) => f(&rw_lock.read()),
+            SharedSpanHandle::Inactive => f(&INACTIVE),
+        }
+    }
+
+    /// Runs `f` against the span for mutation, taking a write lock for the duration.
+    ///
+    /// A no-op for inactive spans: there is nothing to mutate, and unlike [`Self::with_read`] we
+    /// can't substitute a shared placeholder.
+    pub(crate) fn with_write(&self, f: impl FnOnce(&mut Span)) {
+        match self {
+            SharedSpanHandle::Tracked(handle) => f(&mut handle.write()),
+            SharedSpanHandle::Untracked(rw_lock) => f(&mut rw_lock.write()),
+            #[cfg(feature = "user-tracing")]
+            SharedSpanHandle::Deferred(rw_lock) => f(&mut rw_lock.write()),
+            SharedSpanHandle::Inactive => {}
+        }
+    }
+}
+
+impl From<SharedSpanHandle> for Arc<RwLock<Span>> {
+    fn from(value: SharedSpanHandle) -> Self {
+        match value {
+            SharedSpanHandle::Tracked(handle) => Arc::clone(&handle),
+            SharedSpanHandle::Untracked(rw_lock) => rw_lock,
+            #[cfg(feature = "user-tracing")]
+            SharedSpanHandle::Deferred(rw_lock) => rw_lock,
+            // This is only used in `rustracing_span()`, which should rarely
+            // need to be called. Allocating a fresh Arc every time is thus fine.
+            SharedSpanHandle::Inactive => Arc::new(RwLock::new(Span::inactive())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SharedSpan {
+    // NOTE: we intentionally use a lock without poisoning here to not
+    // panic the threads if they just share telemetry with failed thread.
+    pub(crate) inner: SharedSpanHandle,
+    // NOTE: store sampling flag separately, so we don't need to acquire lock
+    // every time we need to check the flag. Deferred user roots are the exception:
+    // their initially inactive span can be replaced in place, which is represented
+    // by the `0xFF` sentinel (`DEFERRED_SAMPLING`).
+    is_sampled: AtomicU8,
+    /// USDT span probe state, recorded when the span's probe semaphore is
+    /// non-zero (a tracer is attached), regardless of sampling. Shared by all
+    /// clones, so the `span_end__*` probe fires exactly once when the last
+    /// clone of the span drops.
+    pub(crate) probe: Option<Arc<SpanProbe>>,
+}
+
+impl SharedSpan {
+    /// Sentinel value to indicate a deferred span in `is_sampled`.
+    const DEFERRED_SAMPLING: u8 = 0xFF;
+
+    /// Creates a [`SharedSpan`] equivalent to [`Span::inactive()`].
+    #[cfg(feature = "user-tracing")]
+    pub(crate) const fn inactive() -> Self {
+        Self {
+            inner: SharedSpanHandle::Inactive,
+            is_sampled: AtomicU8::new(false as u8),
+            probe: None,
+        }
+    }
+
+    /// Creates a [`SharedSpan`] whose root can be activated in place
+    /// after contexts have captured it.
+    #[cfg(feature = "user-tracing")]
+    pub(crate) fn deferred() -> Self {
+        Self {
+            inner: SharedSpanHandle::Deferred(Arc::new(RwLock::new(Span::inactive()))),
+            is_sampled: AtomicU8::new(Self::DEFERRED_SAMPLING),
+            probe: None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_sampled(&self) -> bool {
+        match self.is_sampled.load(Ordering::Relaxed) {
+            0 => return false,
+            1 => return true,
+            // Deferred SharedSpan, look inside the lock
+            _v => {
+                debug_assert_eq!(
+                    _v,
+                    Self::DEFERRED_SAMPLING,
+                    "unexpected value in SharedSpan::is_sampled",
+                );
+            }
+        }
+
+        let is_sampled = self.inner.with_read(|span| span.is_sampled());
+        if is_sampled {
+            // We never de-initialize a span inside SharedSpan, so we can
+            // save the result once its true.
+            self.is_sampled.store(true as u8, Ordering::Relaxed);
+        }
+        is_sampled
+    }
+}
+
+impl Clone for SharedSpan {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            is_sampled: AtomicU8::new(self.is_sampled.load(Ordering::Relaxed)),
+            probe: self.probe.clone(),
+        }
+    }
+}
+
+/// Maximum number of u64 arguments a span probe can carry (arg0 is always the
+/// span duration in nanoseconds; the rest are caller-chosen values).
+pub(crate) const MAX_PROBE_ARGS: usize = 4;
+
+/// Probe state for a single span invocation. Dropping it fires the span's
+/// `span_end__*` USDT probe, passing `&args`: the span duration in
+/// nanoseconds (arg0) followed by the caller-chosen values. The probe function
+/// defines how many of those values are exposed/meaningful.
+#[derive(Debug)]
+pub(crate) struct SpanProbe {
+    start: Instant,
+    end_probe: fn(&[u64; MAX_PROBE_ARGS]),
+    args: [u64; MAX_PROBE_ARGS],
+}
+
+impl SpanProbe {
+    /// `args[0]` is overwritten at drop time with the span duration; the
+    /// remaining `args[1..4]` are the caller-chosen values.
+    pub(crate) fn new(end_probe: fn(&[u64; MAX_PROBE_ARGS]), args: [u64; MAX_PROBE_ARGS]) -> Self {
+        Self {
+            start: Instant::now(),
+            end_probe,
+            args,
+        }
+    }
+}
+
+impl Drop for SpanProbe {
+    fn drop(&mut self) {
+        self.args[0] = self.start.elapsed().as_nanos() as u64;
+        (self.end_probe)(&self.args);
+    }
+}
+
+/// Wraps a span and registers it with the internal harness's `active_roots` for live tracking.
+pub(crate) fn shared_span(span: Span) -> SharedSpan {
+    let is_sampled = span.is_sampled();
+
+    SharedSpan {
+        inner: SharedSpanHandle::new(span),
+        is_sampled: AtomicU8::new(is_sampled as u8),
+        probe: None,
+    }
+}
+
+/// Wraps a user span as `Untracked`/`Inactive`, bypassing `active_roots` so user spans never
+/// enter the internal harness's live registry.
+#[cfg(feature = "user-tracing")]
+pub(crate) fn user_shared_span(span: Span) -> SharedSpan {
+    let is_sampled = span.is_sampled();
+
+    let inner = if is_sampled {
+        SharedSpanHandle::Untracked(Arc::new(RwLock::new(span)))
+    } else {
+        SharedSpanHandle::Inactive
+    };
+
+    SharedSpan {
+        inner,
+        is_sampled: AtomicU8::new(is_sampled as u8),
+        probe: None,
+    }
+}
+
+pub fn write_current_span(write_fn: impl FnOnce(&mut Span)) {
+    // Check the cached flag before touching the lock. Writing to an unsampled span is a no-op
+    // anyway, so this only avoids taking a write guard for nothing.
+    let span = match current_span() {
+        Some(span) if span.is_sampled() => span,
+        _ => return,
+    };
+
+    span.inner.with_write(write_fn);
+}
+
+pub(crate) fn create_span(name: impl Into<Cow<'static, str>>) -> SharedSpan {
+    shared_span(match current_span() {
+        Some(parent) => parent.inner.with_read(|s| s.child(name, |o| o.start())),
+        None => start_trace(name, Default::default()),
+    })
+}
+
+pub(crate) fn current_span() -> Option<SharedSpan> {
+    TracingHarness::get().span_scope_stack.current()
+}
+
+pub(crate) fn span_trace_id(span: &Span) -> Option<String> {
+    span.context().map(|c| c.state().trace_id().to_string())
+}
+
+pub(crate) fn start_trace(
+    root_span_name: impl Into<Cow<'static, str>>,
+    options: StartTraceOptions,
+) -> Span {
+    let tracer = TracingHarness::get().tracer();
+    let root_span_name = root_span_name.into();
+    let mut span_builder = tracer.span(root_span_name.clone());
+
+    if let Some(state) = options.stitch_with_trace {
+        let ctx = SpanContext::new(state, vec![]);
+
+        span_builder = span_builder.child_of(&ctx);
+    }
+
+    if let Some(ratio) = options.override_sampling_ratio {
+        span_builder = span_builder.tag(Tag::new(
+            "sampling.priority",
+            if should_sample(ratio) { 1 } else { 0 },
+        ));
+    }
+
+    let mut current_span = match current_span() {
+        Some(current_span) if current_span.is_sampled() => current_span,
+        _ => return span_builder.start(),
+    };
+
+    // if a prior trace was ongoing (e.g. during stitching, forking), we want to
+    // link the new trace with the existing one
+    let mut new_trace_root_span = span_builder.start();
+
+    link_new_trace_with_current(&mut current_span, &root_span_name, &mut new_trace_root_span);
+
+    new_trace_root_span
+}
+
+#[cfg(feature = "user-tracing")]
+pub(crate) fn current_user_span() -> Option<SharedSpan> {
+    TracingHarness::get_user().span_scope_stack.current()
+}
+
+/// Child of the current user span, or inactive when no user trace is active (never a root).
+#[cfg(feature = "user-tracing")]
+pub(crate) fn create_user_span(name: impl Into<Cow<'static, str>>) -> SharedSpan {
+    match current_user_span() {
+        Some(parent) => child_user_span(&parent, name),
+        None => user_shared_span(Span::inactive()),
+    }
+}
+
+/// Child of an explicitly given user span. Inactive when `parent` is, since an inactive span's
+/// children are inactive.
+#[cfg(feature = "user-tracing")]
+pub(crate) fn child_user_span(
+    parent: &SharedSpan,
+    name: impl Into<Cow<'static, str>>,
+) -> SharedSpan {
+    user_shared_span(parent.inner.with_read(|s| s.child(name, |o| o.start())))
+}
+
+#[cfg(feature = "user-tracing")]
+pub fn write_current_user_span(write_fn: impl FnOnce(&mut Span)) {
+    let span = match current_user_span() {
+        Some(span) if span.is_sampled() => span,
+        _ => return,
+    };
+
+    span.inner.with_write(write_fn);
+}
+
+/// Starts an inactive untracked root in place. Other spans and already-started roots are unchanged.
+#[cfg(feature = "user-tracing")]
+pub(crate) fn activate_deferred_user_trace(
+    span: &SharedSpan,
+    name: impl Into<Cow<'static, str>>,
+    routing: impl RoutingMetadata + 'static,
+    inbound: Option<super::TraceparentContext>,
+) {
+    let SharedSpanHandle::Deferred(span) = &span.inner else {
+        return;
+    };
+
+    if inbound
+        .as_ref()
+        .is_some_and(|inbound| !inbound.is_sampled())
+    {
+        return;
+    }
+
+    // Keep caller-controlled conversion and destruction outside the span lock.
+    let name = name.into();
+    let routing: Arc<dyn RoutingMetadata> = Arc::new(routing);
+    let mut span = span.write();
+    if span.is_sampled() {
+        return;
+    }
+
+    *span = start_user_trace(name, routing, inbound);
+}
+
+/// Starts a root user span on the user harness, optionally continuing the inbound W3C trace.
+/// `routing` is set at construction and inherited by child spans.
+#[cfg(feature = "user-tracing")]
+pub(crate) fn start_user_trace(
+    name: impl Into<Cow<'static, str>>,
+    routing: Arc<dyn RoutingMetadata>,
+    inbound: Option<super::TraceparentContext>,
+) -> Span {
+    let tracer = TracingHarness::get_user().tracer();
+    let mut builder = tracer.span(name).routing(routing);
+
+    if let Some(tp) = inbound {
+        let trace_id = TraceId {
+            high: u64::from_be_bytes(tp.trace_id[..8].try_into().unwrap()),
+            low: u64::from_be_bytes(tp.trace_id[8..].try_into().unwrap()),
+        };
+        let state = SpanContextState::new(
+            trace_id,
+            u64::from_be_bytes(tp.parent_id),
+            tp.trace_flags,
+            String::new(),
+        );
+        builder = builder.child_of(&SpanContext::new(state, vec![]));
+    }
+
+    builder.start()
+}
+
+pub(super) fn reporter_error(err: impl Error) {
+    #[cfg(feature = "logging")]
+    crate::telemetry::log::error!("failed to report traces to the traces sink"; "error" => %err);
+
+    #[cfg(not(feature = "logging"))]
+    drop(err);
+}
+
+// Link a newly created trace in the current span's ref span and vice-versa
+fn link_new_trace_with_current(
+    current_span: &mut SharedSpan,
+    root_span_name: &str,
+    new_trace_root_span: &mut Span,
+) {
+    let (mut new_trace_ref_span, current_trace_id) = current_span.inner.with_read(|s| {
+        let trace_id = span_trace_id(s);
+        let ref_span = create_fork_ref_span(root_span_name, s);
+        (ref_span, trace_id)
+    });
+
+    if let Some(trace_id) = span_trace_id(&*new_trace_root_span) {
+        new_trace_ref_span.set_tag(|| {
+            Tag::new(
+                "note",
+                "current trace was forked at this point, see the `trace_id` field to obtain the forked trace",
+            )
+        });
+
+        new_trace_ref_span.set_tag(|| Tag::new("trace_id", trace_id));
+    }
+
+    if let Some(trace_id) = current_trace_id {
+        new_trace_root_span.set_tag(|| Tag::new("trace_id", trace_id));
+    }
+
+    if let Some(new_trace_ref_ctx) = new_trace_ref_span.context() {
+        let new_trace_ref_span_id = format!("{:32x}", new_trace_ref_ctx.state().span_id());
+
+        new_trace_root_span.set_tag(|| Tag::new("fork_of_span_id", new_trace_ref_span_id));
+    }
+}
+
+pub(crate) fn fork_trace(fork_name: impl Into<Cow<'static, str>>) -> SharedSpan {
+    match current_span() {
+        Some(span) if span.is_sampled() => span,
+        _ => return shared_span(Span::inactive()),
+    };
+
+    let fork_name = fork_name.into();
+
+    shared_span(start_trace(
+        fork_name,
+        StartTraceOptions {
+            // NOTE: If the current span is sampled, then forked trace is also forcibly sampled
+            override_sampling_ratio: Some(1.0),
+            ..Default::default()
+        },
+    ))
+}
+
+fn create_fork_ref_span(fork_name: &str, current_span: &Span) -> Span {
+    let fork_ref_span_name = format!("[{fork_name} ref]");
+    current_span.child(fork_ref_span_name, |o| o.start())
+}
+
+fn should_sample(sampling_ratio: f64) -> bool {
+    // NOTE: quick paths first, without rng involved
+    if sampling_ratio == 0.0 {
+        return false;
+    }
+
+    if sampling_ratio == 1.0 {
+        return true;
+    }
+
+    rand::rng().random_range(0.0..1.0) < sampling_ratio
+}

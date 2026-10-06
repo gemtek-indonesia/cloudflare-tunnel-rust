@@ -64,3 +64,4 @@ assets = []
 
 [patch.crates-io]
 datagram-socket = { path = "src/transport/vendor/datagram-socket" }
+foundations = { path = "src/transport/vendor/foundations" }

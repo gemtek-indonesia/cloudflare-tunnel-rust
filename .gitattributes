@@ -1,2 +1,4 @@
 # Preserve the frozen upstream schema verbatim.
 schemas/tunnelrpc.capnp whitespace=-blank-at-eol
+# Preserve the verbatim upstream foundations snapshot.
+src/transport/vendor/foundations/** whitespace=-blank-at-eof,-blank-at-eol
