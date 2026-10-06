@@ -1,0 +1,14 @@
+cloudflare-tunnel-rust
+Copyright 2026 cloudflare-tunnel-rust contributors
+
+This project adapts configuration contracts, CLI behavior, protocol schemas and
+wire formats from Cloudflare's cloudflared project, release 2026.10.0,
+commit 18cdfe0a6fc7b72a0702d255a1f984e776ce0498.
+Upstream: https://github.com/cloudflare/cloudflared
+Copyright Cloudflare, Inc. and its contributors.
+Licensed under the Apache License, Version 2.0.
+
+The Rust implementation is modified/new work. It is an independent project,
+not an official Cloudflare distribution. Cloudflare trademarks remain with
+their owners. Refer to schema/source notices and dependency licenses for
+additional attribution.

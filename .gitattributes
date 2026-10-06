@@ -1,0 +1,2 @@
+# Preserve the frozen upstream schema verbatim.
+schemas/tunnelrpc.capnp whitespace=-blank-at-eol

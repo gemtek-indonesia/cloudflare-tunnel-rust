@@ -1,0 +1,92 @@
+name: Offline checks and Linux builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Native prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev capnproto
+      - name: Locked dependencies
+        run: cargo fetch --locked
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Offline synthetic tests
+        run: cargo test --locked --offline
+      - name: Clippy
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+      - name: Publication checker self-test
+        run: python3 scripts/check-publication.py --self-test
+      - name: Pinned oracle selector regression
+        run: python3 scripts/test-interop-selector.py
+      - name: Native binary
+        run: cargo build --locked --offline --release
+  interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cloudflare/cloudflared
+          ref: 18cdfe0a6fc7b72a0702d255a1f984e776ce0498
+          path: .cache/reference
+          persist-credentials: false
+      - name: Oracle prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev capnproto curl
+      - name: Pinned Go and Rust protocol oracle
+        env:
+          CLOUDFLARED_REFERENCE: ${{ github.workspace }}/.cache/reference
+        run: scripts/test-interop.sh
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pinned Gitleaks
+        run: |
+          mkdir -p .cache/gitleaks
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o .cache/gitleaks/archive.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  .cache/gitleaks/archive.tar.gz' | sha256sum --check --strict
+          tar -xzf .cache/gitleaks/archive.tar.gz -C .cache/gitleaks gitleaks
+          .cache/gitleaks/gitleaks git --log-opts=HEAD --redact --no-banner
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [x86-64-v2, x86-64-v3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Static build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev capnproto curl xz-utils binutils ripgrep
+      - name: Static CPU variant
+        env:
+          CPU_TIER: ${{ matrix.cpu }}
+        run: scripts/build-musl.sh "$CPU_TIER"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cloudflared-linux-${{ matrix.cpu }}
+          path: dist/cloudflared-linux-${{ matrix.cpu }}
+          if-no-files-found: error
+          retention-days: 14

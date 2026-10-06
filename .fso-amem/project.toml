@@ -1,0 +1,6 @@
+[project]
+name = "gti-cloudflare-tunnel"
+slug = "gti-cloudflare-tunnel"
+
+[amem]
+server = "https://amem.flusci.org"

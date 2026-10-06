@@ -1,0 +1,13 @@
+title = "cloudflare-tunnel-rust"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+# This exact dependency pair is public metadata; every other match remains scanned.
+description = "Public crypto_box dependency pair in Cargo metadata"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)Cargo\.lock$''']
+regexTarget = "match"
+regexes = ['''^crypto_secretbox",\r?\n[ \t]*"curve25519-dalek"$''']

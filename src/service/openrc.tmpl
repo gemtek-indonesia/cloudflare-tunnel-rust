@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+
+description="Cloudflare Tunnel client"
+
+: "${cloudflared_user:=root}"
+
+command="{{.Path}}"
+command_args="{{ range .ExtraArgs }} {{ . }}{{ end }}"
+command_user="${cloudflared_user}"
+
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.err"
+
+# Use OpenRC's supervisor so the tunnel is restarted on failure.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need net
+	use dns logger
+	after net firewall
+}
