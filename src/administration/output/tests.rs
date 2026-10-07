@@ -68,6 +68,109 @@ fn typed_tunnel_json_keeps_zero_fields_null_slices_and_html_escaping() {
     assert!(!encoded.contains("ignored"));
 }
 
+fn token_cases() -> Vec<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut cases: Vec<String> = [
+        "{}", "null", "[]", "{\"s\":null}", "{\"s\":\"\"}", "{\"ſ\":\"AQ==\"}",
+        "{\"s\":[0,255]}", "{\"s\":\"AB==\"}", "{\"s\":\"AA\\r\\n==\"}",
+        "{\"A\":\"upper\",\"S\":\"AA==\",\"T\":\"11111111-1111-1111-1111-111111111111\",\"E\":\"fed\"}",
+        "{\"a\":\"<&>\u{2028}\u{2029}\",\"e\":\"<&>\u{2028}\u{2029}\"}",
+        "{\"z\":1,\"e\":\"\",\"t\":\"11111111-1111-1111-1111-111111111111\",\"s\":\"AA==\",\"a\":\"fixture\"}",
+        "{\"a\":\"first\",\"a\":null,\"e\":\"fed\",\"e\":null,\"t\":\"11111111-1111-1111-1111-111111111111\",\"t\":null}",
+        "{\"a\":\"first\",\"a\":\"last\",\"s\":\"AA==\",\"s\":null}",
+        "{\"s\":[256]}", "{\"s\":[1.0]}", "{\"s\":false}", "{\"s\":\"A A==\"}",
+        "{\"t\":\"invalid\"}", "{\"t\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
+        "{\"a\":1}", "{\"e\":false}", "true", "{", "\"string\"",
+    ].into_iter().map(|value| STANDARD.encode(value)).collect();
+    cases.extend(
+        [
+            "e30=",
+            "e31=",
+            "e30",
+            "e30==",
+            "e3\r\n0=",
+            "e3 0=",
+            "e3\t0=",
+            "bnVsbA==",
+            "bnVsbB==",
+            "bnVsbA",
+            "bnVsbA===",
+            "-___",
+        ]
+        .map(str::to_owned),
+    );
+    cases
+}
+
+#[test]
+fn api_token_encoding_preserves_source_data_without_runtime_admission() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let token = ApiTunnelToken::parse("e31=").unwrap();
+    let encoded = token.encode().unwrap();
+    assert_eq!(
+        STANDARD.decode(&encoded).unwrap(),
+        br#"{"a":"","s":null,"t":"00000000-0000-0000-0000-000000000000"}"#
+    );
+    assert!(crate::config::credentials_from_token(&encoded).is_err());
+    let token = ApiTunnelToken::parse(
+        &STANDARD.encode("{\"a\":\"first\",\"a\":null,\"s\":\"\",\"e\":\"<&>\u{2028}\"}"),
+    )
+    .unwrap();
+    let encoded = String::from_utf8(STANDARD.decode(token.encode().unwrap()).unwrap()).unwrap();
+    assert!(encoded.contains("\"a\":\"first\""));
+    assert!(encoded.contains("\"s\":\"\""));
+    assert!(encoded.contains("<&>\u{2028}"));
+    assert!(
+        token
+            .credentials()
+            .unwrap()
+            .contains("\\u003c\\u0026\\u003e\\u2028")
+    );
+}
+
+#[test]
+#[ignore = "requires pinned Go administration oracle; run scripts/test-interop.sh"]
+fn go_administration_token_codec_contract() {
+    let directory = std::env::temp_dir().join(format!("token-codec-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    for (index, encoded) in token_cases().into_iter().enumerate() {
+        let file = directory.join("input.json");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"command":"token-codec","args":[encoded]})).unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(
+            std::env::var_os("CLOUDFLARED_GO_ADMIN_ORACLE").expect("run scripts/test-interop.sh"),
+        )
+        .arg(file)
+        .env_clear()
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "oracle token case{index}");
+        let source: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let native = ApiTunnelToken::parse(&encoded);
+        assert_eq!(
+            native.is_err(),
+            source["failure"].as_bool().unwrap(),
+            "token case{index}"
+        );
+        if let Ok(token) = native {
+            assert_eq!(
+                token.encode().unwrap(),
+                source["output"],
+                "canonical token case{index}"
+            );
+            assert_eq!(
+                token.credentials().unwrap(),
+                source["credentials"],
+                "credential bytes case{index}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 #[ignore = "requires pinned Go administration oracle; run scripts/test-interop.sh"]
 fn go_administration_output_contract() {

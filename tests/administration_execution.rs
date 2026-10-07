@@ -104,6 +104,7 @@ async fn execute(
         "routes" => vec!["tunnel", "route", "ip", "show"],
         "delete" => vec!["tunnel", "delete"],
         "cleanup" => vec!["tunnel", "cleanup"],
+        "token" => vec!["tunnel", "token"],
         _ => unreachable!(),
     };
     let mut native = directory.command(env!("CARGO_BIN_EXE_cloudflared"));
@@ -338,6 +339,155 @@ async fn go_administration_bulk_resolution_contract() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_api_token_errors_hide_payload_and_extra_arguments_make_no_request() {
+    let directory = Directory::new();
+    let id = "11111111-1111-1111-1111-111111111111";
+    let (output, requests) = execute(
+        &directory,
+        "token",
+        &[id.into()],
+        vec![json!({"success":true,"result":"DO-NOT-ECHO-TOKEN"})],
+        &[],
+    )
+    .await;
+    assert_eq!(requests.len(), 1);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("DO-NOT-ECHO-TOKEN")
+    );
+    let (output, requests) = execute(
+        &directory,
+        "token",
+        &[id.into(), "extra".into()],
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(255));
+    assert!(requests.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires pinned Go administration oracle; run scripts/test-interop.sh"]
+async fn go_administration_token_execution_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = Directory::new();
+    let id = "11111111-1111-1111-1111-111111111111";
+    let mut tokens: Vec<String> = [
+        "{}", "null", "{\"s\":null}", "{\"s\":\"\"}",
+        "{\"s\":[0,255],\"a\":\"fixture\",\"t\":\"11111111-1111-1111-1111-111111111111\"}",
+        "{\"a\":\"first\",\"a\":null,\"s\":\"AA==\",\"s\":null,\"e\":\"fed\"}",
+        "{\"a\":\"<&>\u{2028}\u{2029}\",\"s\":\"AB==\",\"t\":\"11111111-1111-1111-1111-111111111111\",\"e\":\"\"}",
+        "{\"z\":1,\"A\":\"upper\",\"S\":\"AA\\r\\n==\",\"T\":\"11111111-1111-1111-1111-111111111111\",\"E\":\"fed\"}",
+        "[]", "{\"s\":false}", "{\"t\":\"invalid\"}",
+    ].into_iter().map(|value| STANDARD.encode(value)).collect();
+    tokens.extend(["e31=", "e3\r\n0=", "e30", "e3 0=", "DO-NOT-ECHO-TOKEN"].map(str::to_owned));
+    for (index, token) in tokens.into_iter().enumerate() {
+        for mode in ["", "absent", "existing", "missing-parent", "directory"] {
+            let credential = if mode == "missing-parent" {
+                directory.0.join("missing/credentials.json")
+            } else {
+                directory.0.join("credentials.json")
+            };
+            match mode {
+                "existing" => {
+                    std::fs::write(&credential, b"preserved").unwrap();
+                    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                "directory" => std::fs::create_dir(&credential).unwrap(),
+                _ => {}
+            }
+            let pages = vec![json!({"success":true,"result":token})];
+            let input = directory.0.join("input.json");
+            std::fs::write(&input, serde_json::to_vec(&json!({"command":"token","args":[id],"parent_args":["--loglevel","fatal"],"pages":pages,"file_mode":mode})).unwrap()).unwrap();
+            let source = directory
+                .command(
+                    std::env::var_os("CLOUDFLARED_GO_ADMIN_ORACLE")
+                        .expect("run scripts/test-interop.sh"),
+                )
+                .arg(input)
+                .output()
+                .unwrap();
+            assert!(source.status.success());
+            let source: Value = serde_json::from_slice(&source.stdout).unwrap();
+            let mut args = vec!["--loglevel".into(), "fatal".into()];
+            if !mode.is_empty() {
+                args.extend([
+                    "--credentials-file".into(),
+                    credential.to_str().unwrap().into(),
+                ]);
+            }
+            args.push(id.into());
+            let (native, requests) = execute(&directory, "token", &args, pages, &[]).await;
+            assert_eq!(
+                json!(requests),
+                source["requests"],
+                "token requests {index}/{mode}"
+            );
+            assert_eq!(
+                native.status.code().unwrap(),
+                source["exit_code"].as_i64().unwrap() as i32,
+                "token exit {index}/{mode}"
+            );
+            assert_eq!(
+                String::from_utf8(native.stdout).unwrap(),
+                source["output"],
+                "token stdout {index}/{mode}"
+            );
+            let exists = credential.is_file();
+            assert_eq!(
+                exists,
+                source["file_exists"].as_bool().unwrap(),
+                "token file {index}/{mode}"
+            );
+            if exists {
+                assert_eq!(
+                    std::fs::read_to_string(&credential).unwrap(),
+                    source["credentials"],
+                    "credential bytes {index}/{mode}"
+                );
+                assert_eq!(
+                    std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
+                    source["file_perm"].as_u64().unwrap() as u32,
+                    "credential mode {index}/{mode}"
+                );
+                std::fs::remove_file(&credential).unwrap();
+            } else if credential.is_dir() {
+                std::fs::remove_dir(&credential).unwrap();
+            }
+        }
+    }
+    for args in [vec![], vec![id, "extra"]] {
+        let file = directory.0.join("input.json");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"command":"token","args":args,"pages":[]})).unwrap(),
+        )
+        .unwrap();
+        let source = directory
+            .command(
+                std::env::var_os("CLOUDFLARED_GO_ADMIN_ORACLE")
+                    .expect("run scripts/test-interop.sh"),
+            )
+            .arg(file)
+            .output()
+            .unwrap();
+        let source: Value = serde_json::from_slice(&source.stdout).unwrap();
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let (native, requests) = execute(&directory, "token", &args, vec![], &[]).await;
+        assert_eq!(json!(requests), source["requests"]);
+        assert_eq!(
+            native.status.code().unwrap(),
+            source["exit_code"].as_i64().unwrap() as i32
+        );
     }
 }
 

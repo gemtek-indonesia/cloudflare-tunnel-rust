@@ -17,13 +17,20 @@ pub(super) fn format(invocation: &Invocation) -> &str {
 }
 
 pub(super) fn json<T: Serialize>(value: &T) -> Result<String> {
-    Ok(serde_json::to_string_pretty(value)?
+    Ok(escape_json(serde_json::to_string_pretty(value)?) + "\n")
+}
+
+pub(super) fn compact_json<T: Serialize>(value: &T) -> Result<String> {
+    Ok(escape_json(serde_json::to_string(value)?))
+}
+
+fn escape_json(value: String) -> String {
+    value
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026")
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
-        + "\n")
 }
 
 pub(super) fn tunnel_rows(values: Vec<serde_json::Value>) -> Result<Vec<Tunnel>> {

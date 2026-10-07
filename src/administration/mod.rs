@@ -109,20 +109,23 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             );
         }
         "tunnel token" => {
+            if invocation.args.len() != 1 {
+                return Err(crate::cli::ExitFailure {
+                    code: 255,
+                    message: "\"cloudflared tunnel token\" requires exactly 1 argument, the name or UUID of tunnel to fetch the credentials token for.\nSee 'cloudflared tunnel token --help'.".into(),
+                }.into());
+            }
             let id = client
                 .resolve_tunnel(argument(&invocation, 0, "tunnel ID or name")?)
                 .await?;
-            let token = client.token(id).await?;
+            let token = models::ApiTunnelToken::parse(&client.token(id).await?)?;
             if invocation.string("credentials-file").is_empty() {
-                println!("{token}");
+                println!("{}", token.encode()?);
             } else {
-                let creds = crate::config::credentials_from_token(&token)?;
-                let body = serde_json::to_vec(
-                    &json!({"AccountTag":creds.account_tag,"TunnelSecret":STANDARD.encode(&creds.tunnel_secret),"TunnelID":creds.tunnel_id,"Endpoint":creds.endpoint}),
-                )?;
+                let body = token.credentials()?;
                 credentials::atomic_create(
                     &expanded(invocation.string("credentials-file"))?,
-                    &body,
+                    body.as_bytes(),
                     0o400,
                 )?;
             }

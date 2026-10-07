@@ -25,6 +25,7 @@ type RustAdministrationInput struct {
 	ParentArgs []string          `json:"parent_args"`
 	Pages      []json.RawMessage `json:"pages"`
 	Statuses   []int             `json:"statuses"`
+	FileMode   string            `json:"file_mode"`
 }
 
 type RustAdministrationOutput struct {
@@ -36,6 +37,10 @@ type RustAdministrationOutput struct {
 	ParseFailure bool     `json:"parse_failure"`
 	Unix         int64    `json:"unix"`
 	Nanoseconds  int      `json:"nanoseconds"`
+	Credentials  string   `json:"credentials"`
+	FileExists   bool     `json:"file_exists"`
+	FilePerm     uint32   `json:"file_perm"`
+	ExitCode     int      `json:"exit_code"`
 }
 
 type rustDeniedUpdateTransport struct{}
@@ -45,6 +50,24 @@ func (rustDeniedUpdateTransport) RoundTrip(*http.Request) (*http.Response, error
 }
 
 func RustInteropAdministration(input RustAdministrationInput) (RustAdministrationOutput, error) {
+	if input.Command == "token-codec" {
+		if len(input.Args) != 1 {
+			return RustAdministrationOutput{}, errors.New("synthetic token codec requires one argument")
+		}
+		token, err := ParseToken(input.Args[0])
+		output := RustAdministrationOutput{Queries: []string{}, Requests: []string{}, Failure: err != nil}
+		if err != nil {
+			return output, nil
+		}
+		output.Output, err = token.Encode()
+		output.Failure = err != nil
+		credentials, err := json.Marshal(token.Credentials())
+		if err != nil {
+			return RustAdministrationOutput{}, err
+		}
+		output.Credentials = string(credentials)
+		return output, nil
+	}
 	if input.Command == "date" {
 		date, err := time.Parse(time.RFC3339, input.Args[0])
 		output := RustAdministrationOutput{Queries: []string{}, ParseFailure: err != nil}
@@ -72,6 +95,8 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 		command = []string{"tunnel", "delete"}
 	case "cleanup":
 		command = []string{"tunnel", "cleanup"}
+	case "token":
+		command = []string{"tunnel", "token"}
 	default:
 		return RustAdministrationOutput{}, errors.New("unsupported synthetic command")
 	}
@@ -107,6 +132,22 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	if err := os.WriteFile(configPath, []byte("{}\n"), 0600); err != nil {
 		return RustAdministrationOutput{}, err
 	}
+	credentialPath := filepath.Join(directory, "credentials.json")
+	switch input.FileMode {
+	case "", "absent":
+	case "existing":
+		if err := os.WriteFile(credentialPath, []byte("preserved"), 0400); err != nil {
+			return RustAdministrationOutput{}, err
+		}
+	case "missing-parent":
+		credentialPath = filepath.Join(directory, "missing", "credentials.json")
+	case "directory":
+		if err := os.Mkdir(credentialPath, 0700); err != nil {
+			return RustAdministrationOutput{}, err
+		}
+	default:
+		return RustAdministrationOutput{}, errors.New("unsupported synthetic credential-file mode")
+	}
 	output := RustAdministrationOutput{Queries: []string{}, Requests: []string{}}
 	var mutex sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -141,7 +182,10 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	args = append(args, input.ParentArgs...)
 	args = append(args, command[1:]...)
 	if input.Command == "delete" {
-		args = append(args, "--credentials-file", filepath.Join(directory, "credentials.json"))
+		args = append(args, "--credentials-file", credentialPath)
+	}
+	if input.Command == "token" && input.FileMode != "" {
+		args = append(args, "--credentials-file", credentialPath)
 	}
 	args = append(args, input.Args...)
 	reader, writer, err := os.Pipe()
@@ -173,6 +217,23 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	reader.Close()
 	errorReader.Close()
 	output.Failure = err != nil
+	if err != nil {
+		output.ExitCode = 1
+		if exit, ok := err.(cli.ExitCoder); ok {
+			output.ExitCode = exit.ExitCode() & 255
+		}
+	}
+	if input.FileMode != "" {
+		if stat, err := os.Stat(credentialPath); err == nil && stat.Mode().IsRegular() {
+			output.FileExists = true
+			output.FilePerm = uint32(stat.Mode().Perm())
+			body, err := os.ReadFile(credentialPath)
+			if err != nil {
+				return RustAdministrationOutput{}, err
+			}
+			output.Credentials = string(body)
+		}
+	}
 	return output, nil
 }
 
