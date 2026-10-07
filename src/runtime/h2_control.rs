@@ -3,6 +3,11 @@ use std::{io, task::Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::task::JoinHandle;
 
+pub(crate) enum Completion {
+    End,
+    Reset,
+}
+
 pub(crate) async fn send_data(
     stream: &mut h2::SendStream<Bytes>,
     mut bytes: Bytes,
@@ -26,9 +31,24 @@ pub(crate) async fn send_data(
 }
 
 pub(crate) fn bridge(
+    receive: h2::RecvStream,
+    send: h2::SendStream<Bytes>,
+) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
+    bridge_inner(receive, send, false)
+}
+
+pub(crate) fn registration_bridge(
+    receive: h2::RecvStream,
+    send: h2::SendStream<Bytes>,
+) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
+    bridge_inner(receive, send, true)
+}
+
+fn bridge_inner(
     mut receive: h2::RecvStream,
     mut send: h2::SendStream<Bytes>,
-) -> (DuplexStream, JoinHandle<io::Result<()>>) {
+    keep_response_open: bool,
+) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
     let (application, transport) = tokio::io::duplex(64 * 1024);
     let (mut read, mut write) = tokio::io::split(transport);
     let task = tokio::task::spawn_local(async move {
@@ -48,16 +68,22 @@ pub(crate) fn bridge(
             loop {
                 let n = read.read(&mut buf).await?;
                 if n == 0 {
+                    if keep_response_open {
+                        futures::future::poll_fn(|cx| send.poll_reset(cx))
+                            .await
+                            .map_err(io::Error::other)?;
+                        return Ok(Completion::Reset);
+                    }
                     send.send_data(Bytes::new(), true)
                         .map_err(io::Error::other)?;
                     break;
                 }
                 send_data(&mut send, Bytes::copy_from_slice(&buf[..n])).await?;
             }
-            Ok::<_, io::Error>(())
+            Ok::<_, io::Error>(Completion::End)
         };
-        tokio::try_join!(incoming, outgoing)?;
-        Ok(())
+        let (_, completion) = tokio::try_join!(incoming, outgoing)?;
+        Ok(completion)
     });
     (application, task)
 }

@@ -3,6 +3,9 @@ use crate::config::{Credentials, OriginRequest};
 use crate::protocol::tunnelrpc_capnp as wire;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+#[path = "control_lifetime_tests.rs"]
+mod control_lifetime;
+
 pub(crate) fn config() -> RunConfig {
     let configuration =
         LoadedConfig::from_json(r#"{"ingress":[{"service":"http_status:203"}]}"#).unwrap();
@@ -155,26 +158,89 @@ fn source_retry_policy_distinguishes_startup_registration_and_live_disconnect() 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn decoded_ack_then_control_eof_preserves_admission_history_without_readiness() {
-    tokio::task::LocalSet::new().run_until(async {
-        let (result,_)=registration::tests::acknowledged_then_eof().await;
-        let mut connection=result.unwrap();
-        let mut config=config();config.protocol=Protocol::Auto;
-        let mut runtime=runtime(config);let (events,mut received)=mpsc::unbounded_channel();Arc::get_mut(&mut runtime).unwrap().events=events;
-        let lease=runtime.registered(2,EdgeProtocol::Quic,"127.0.0.1:7844".parse().unwrap(),&connection).await.unwrap();
-        assert_eq!(runtime.readiness.count(),0);assert_eq!(runtime.context.metrics.ha_connections.get(),0);
-        assert_eq!(runtime.context.metrics.register_success.with_label_values(&["registerConnection"]).get(),1);
-        assert_eq!(runtime.context.metrics.register_fail.with_label_values(&["server_error","registerConnection"]).get(),0);
-        assert!(runtime.ever_quic.load(Ordering::Acquire));
-        assert!(matches!(received.recv().await,Some(Event::Connected(2,EdgeProtocol::Quic))));
-        assert_eq!(connection.identity().client_id(),runtime.client_id);assert_eq!(connection.identity().tunnel_id(),runtime.config.credentials.tunnel_id);
-        connection.disconnected().await;
-        let error=anyhow::Error::new(RegistrationError::Disconnected);
-        let retry=retry_policy(&error,true,runtime.startup_announced.load(Ordering::Acquire));
-        assert!(!retry.stop_startup);assert!(!retry.supervised);assert!(retry.allow_fallback);
-        assert!(!runtime.should_fallback(EdgeProtocol::Quic,true,true),"historical acknowledged QUIC suppresses auto fallback even when every current connection is dead");
-        drop(lease);assert!(runtime.readiness.slots.lock().unwrap().is_empty());
-    }).await;
+async fn decoded_ack_on_canceled_attempt_counts_success_without_readiness() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (result, _) = registration::tests::acknowledged_then_eof().await;
+            let mut connection = result.unwrap();
+            let mut config = config();
+            config.protocol = Protocol::Auto;
+            let mut runtime = runtime(config);
+            let (events, mut received) = mpsc::unbounded_channel();
+            Arc::get_mut(&mut runtime).unwrap().events = events;
+            let pending = scope::PendingSessionContext::new(
+                &runtime.config,
+                2,
+                "http2",
+                "127.0.0.1:7844".parse().unwrap(),
+                features::FeatureSnapshot {
+                    version: crate::network::DatagramVersion::V2,
+                    features: connection.identity().features().to_vec(),
+                    skip_prechecks: true,
+                },
+                runtime.config.management_hostname.clone(),
+            );
+            let control = pending.cancellation().child_token();
+            control.cancel();
+            let lease = runtime
+                .registered(
+                    2,
+                    EdgeProtocol::Http2,
+                    "127.0.0.1:7844".parse().unwrap(),
+                    &connection,
+                    &pending,
+                    SessionLiveness::Http2 { control },
+                )
+                .await
+                .unwrap();
+            assert_eq!(runtime.readiness.count(), 0);
+            assert_eq!(runtime.context.metrics.ha_connections.get(), 0);
+            assert_eq!(
+                runtime
+                    .context
+                    .metrics
+                    .register_success
+                    .with_label_values(&["registerConnection"])
+                    .get(),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .context
+                    .metrics
+                    .register_fail
+                    .with_label_values(&["server_error", "registerConnection"])
+                    .get(),
+                0
+            );
+            assert!(!runtime.ever_quic.load(Ordering::Acquire));
+            assert!(matches!(
+                received.recv().await,
+                Some(Event::Connected(2, EdgeProtocol::Http2))
+            ));
+            assert_eq!(connection.identity().client_id(), runtime.client_id);
+            assert_eq!(
+                connection.identity().tunnel_id(),
+                runtime.config.credentials.tunnel_id
+            );
+            connection.disconnected().await;
+            let error = anyhow::Error::new(RegistrationError::Disconnected);
+            let retry = retry_policy(
+                &error,
+                true,
+                runtime.startup_announced.load(Ordering::Acquire),
+            );
+            assert!(!retry.stop_startup);
+            assert!(!retry.supervised);
+            assert!(retry.allow_fallback);
+            assert!(
+                runtime.should_fallback(EdgeProtocol::Quic, true, true),
+                "H2 admission must not fabricate QUIC history"
+            );
+            drop(lease);
+            assert!(runtime.readiness.slots.lock().unwrap().is_empty());
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

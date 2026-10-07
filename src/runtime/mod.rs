@@ -14,8 +14,7 @@ use crate::{
         },
         metadata::{self, StreamKind},
         registration::{
-            self, ConnectionLiveness, RegisteredConnection, RegistrationError, RegistrationRequest,
-            TunnelAuth,
+            self, RegisteredConnection, RegistrationError, RegistrationRequest, TunnelAuth,
         },
     },
     proxy::{self, ProxyState},
@@ -54,8 +53,31 @@ enum Event {
 
 struct LiveSlot {
     generation: u64,
-    liveness: ConnectionLiveness,
+    liveness: SessionLiveness,
     details: serde_json::Value,
+}
+enum SessionLiveness {
+    Quic {
+        attempt: CancellationToken,
+        transport: transport::quic::QuicLiveness,
+    },
+    Http2 {
+        control: CancellationToken,
+    },
+}
+impl SessionLiveness {
+    fn is_ready(&self) -> bool {
+        match self {
+            Self::Quic { attempt, transport } => !attempt.is_cancelled() && !transport.is_closed(),
+            Self::Http2 { control } => !control.is_cancelled(),
+        }
+    }
+    fn protocol(&self) -> EdgeProtocol {
+        match self {
+            Self::Quic { .. } => EdgeProtocol::Quic,
+            Self::Http2 { .. } => EdgeProtocol::Http2,
+        }
+    }
 }
 struct Readiness {
     slots: Mutex<HashMap<u8, LiveSlot>>,
@@ -88,6 +110,7 @@ impl Readiness {
     fn bind(
         self: &Arc<Self>,
         registered: &RegisteredConnection,
+        liveness: SessionLiveness,
         metrics: Arc<crate::observability::metrics::Metrics>,
         details: serde_json::Value,
     ) -> Lease {
@@ -97,7 +120,7 @@ impl Readiness {
             index,
             LiveSlot {
                 generation,
-                liveness: registered.liveness(),
+                liveness,
                 details,
             },
         );
@@ -295,9 +318,20 @@ impl Runtime {
         protocol: EdgeProtocol,
         address: SocketAddr,
         registered: &RegisteredConnection,
+        pending: &scope::PendingSessionContext,
+        liveness: SessionLiveness,
     ) -> Result<Lease> {
         if index != registered.identity().connection_index() {
             bail!("registration index does not match connection owner");
+        }
+        if protocol != liveness.protocol()
+            || index != pending.index()
+            || pending.tunnel_id() != registered.identity().tunnel_id()
+            || pending.snapshot().features != registered.identity().features()
+            || self.client_id != registered.identity().client_id()
+            || self.config.credentials.tunnel_id != registered.identity().tunnel_id()
+        {
+            bail!("registration identity does not match transport owner");
         }
         let mut details = serde_json::Map::new();
         details.insert("isConnected".into(), serde_json::json!(true));
@@ -310,6 +344,7 @@ impl Runtime {
         }
         let lease = self.readiness.bind(
             registered,
+            liveness,
             self.context.metrics.clone(),
             serde_json::Value::Object(details),
         );
@@ -909,6 +944,7 @@ async fn serve_quic(
 ) -> Result<()> {
     let options = edge_options(&runtime.config);
     let mut conn = tokio::select! {_=runtime.shutdown.cancelled()=>return Ok(()),result=transport::quic::dial_with_options(address,"quic.cftunnel.com",tls,&options)=>result.map_err(DialFailure)?};
+    let transport_liveness = conn.liveness();
     let snapshot = runtime.features.snapshot(true);
     let pending = scope::PendingSessionContext::new(
         &runtime.config,
@@ -963,16 +999,19 @@ async fn serve_quic(
                 return Ok(());
             }
             result = &mut registration, if registered.is_none() => {
-                let value = result.map_err(|error|runtime.registration_failure(error))?;
-                _lease = Some(runtime.registered(index, EdgeProtocol::Quic, address, &value).await?);
+                let value = result.map_err(|error| runtime.registration_failure(error))?;
+                let liveness = SessionLiveness::Quic {
+                    attempt: pending.cancellation(),
+                    transport: conn.liveness(),
+                };
+                _lease = Some(runtime.registered(
+                    index, EdgeProtocol::Quic, address, &value, &pending, liveness,
+                ).await?);
                 push_local_configuration(&runtime, index, &value, &mut tasks).await?;
                 registered = Some(value);
                 *reset_after = Some(Instant::now() + Duration::from_secs(4 * (1u64 << retries.min(31))));
             }
-            _ = async {
-                if let Some(registered) = registered.as_mut() { registered.disconnected().await }
-                else { futures::future::pending().await }
-            } => bail!(RegistrationError::Disconnected),
+            _ = transport_liveness.closed() => bail!("connection with edge closed"),
             stream = incoming.streams.recv() => {
                 let stream = stream.context("failed to accept QUIC stream")?;
                 let shared = runtime.clone();
@@ -1076,13 +1115,14 @@ async fn serve_h2(
         runtime.config.management_hostname.clone(),
     );
     let requests = pending.requests();
+    let control_scope = pending.cancellation().child_token();
     let mut registered = None::<RegisteredConnection>;
     let mut control_pending = false;
     let mut tasks = JoinSet::new();
     let (tx, mut rx) =
         mpsc::unbounded_channel::<std::result::Result<RegisteredConnection, RegistrationError>>();
     let mut _lease = None;
-    let mut _control_pump = None;
+    let mut control_pump = None::<AbortTask<std::io::Result<h2_control::Completion>>>;
     loop {
         tokio::select! {
             _ = runtime.shutdown.cancelled() => {
@@ -1097,13 +1137,44 @@ async fn serve_h2(
                 }
                 return Ok(());
             }
-            _ = async {
-                if let Some(registered) = registered.as_mut() { registered.disconnected().await }
-                else { futures::future::pending().await }
-            } => bail!(RegistrationError::Disconnected),
+            result = async {
+                if let Some(pump) = control_pump.as_mut() {
+                    (&mut pump.0).await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                control_pump = None;
+                let reset = match &result {
+                    Ok(Ok(h2_control::Completion::Reset)) => true,
+                    Ok(Err(error)) => error.get_ref()
+                        .and_then(|cause| cause.downcast_ref::<h2::Error>())
+                        .is_some_and(h2::Error::is_reset),
+                    _ => false,
+                };
+                if reset {
+                    control_scope.cancel();
+                    _lease = None;
+                } else {
+                    match result {
+                        Ok(Err(error)) => runtime.warn(&format!("H2 control stream: {error}")),
+                        Err(error) => runtime.warn(&format!("H2 control task: {error}")),
+                        Ok(Ok(_)) => {}
+                    }
+                }
+            }
             result = rx.recv(), if control_pending => {
-                let value = result.context("control registration task closed")?.map_err(|error|runtime.registration_failure(error))?;
-                _lease = Some(runtime.registered(index, EdgeProtocol::Http2, address, &value).await?);
+                let value = result.context("control registration task closed")?
+                    .map_err(|error| runtime.registration_failure(error))?;
+                let liveness = SessionLiveness::Http2 {
+                    control: control_scope.clone(),
+                };
+                _lease = Some(runtime.registered(
+                    index, EdgeProtocol::Http2, address, &value, &pending, liveness,
+                ).await?);
+                if control_scope.is_cancelled() {
+                    _lease = None;
+                }
                 push_local_configuration(&runtime, index, &value, &mut tasks).await?;
                 registered = Some(value);
                 control_pending = false;
@@ -1121,8 +1192,8 @@ async fn serve_h2(
                         }
                         control_pending = true;
                         let send = response.send_response(http::Response::builder().status(200).body(())?, false)?;
-                        let (control, pump) = h2_control::bridge(request.into_body(), send);
-                        _control_pump = Some(AbortTask(pump));
+                        let (control, pump) = h2_control::registration_bridge(request.into_body(), send);
+                        control_pump = Some(AbortTask(pump));
                         let tx = tx.clone();
                         let shared = runtime.clone();
                         let snapshot = snapshot.clone();

@@ -58,6 +58,9 @@ impl PendingSessionContext {
     pub(crate) fn index(&self) -> u8 {
         self.identity.index
     }
+    pub(super) fn tunnel_id(&self) -> Uuid {
+        self.identity.tunnel_id
+    }
     pub(crate) fn generation(&self) -> Uuid {
         self.identity.generation
     }

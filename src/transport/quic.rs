@@ -196,6 +196,21 @@ pub struct QuicIncoming {
     pub datagrams: mpsc::Receiver<Bytes>,
 }
 
+#[derive(Clone)]
+pub(crate) struct QuicLiveness {
+    cancel: CancellationToken,
+}
+
+impl QuicLiveness {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.cancel.cancelled().await;
+    }
+}
+
 pub struct QuicConnection {
     commands: mpsc::Sender<Command>,
     incoming: Option<QuicIncoming>,
@@ -207,6 +222,12 @@ pub struct QuicConnection {
 }
 
 impl QuicConnection {
+    pub(crate) fn liveness(&self) -> QuicLiveness {
+        QuicLiveness {
+            cancel: self.cancel.clone(),
+        }
+    }
+
     pub fn sender(&self) -> QuicSender {
         QuicSender {
             commands: self.commands.clone(),
