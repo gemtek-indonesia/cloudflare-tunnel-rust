@@ -73,6 +73,7 @@ pub async fn dial_tls_with_options(
     ssl.param_mut()
         .set_host(server_name)
         .map_err(io::Error::other)?;
+    crate::crypto::enforce_hostname_policy(&mut ssl);
     let stream = tokio::time::timeout(
         options.dial_timeout,
         tokio_boring::SslStreamBuilder::new(ssl, socket).connect(),

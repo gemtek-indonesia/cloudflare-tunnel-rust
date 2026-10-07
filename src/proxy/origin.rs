@@ -1,6 +1,6 @@
 use super::{RequestHead, body::ChannelBody};
 use crate::config::OriginRequest;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use boring::{
     ssl::{SslConnector, SslMethod, SslVerifyMode},
     x509::{X509, store::X509StoreBuilder},
@@ -16,7 +16,7 @@ use hyper_util::{
 use std::{
     future::Future,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -26,6 +26,9 @@ use tokio::{
     net::UnixStream,
 };
 use tower_service::Service as ConnectorService;
+
+#[cfg(test)]
+mod ca_tests;
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
@@ -54,7 +57,11 @@ pub struct OriginResponse {
 }
 
 impl Origin {
-    pub fn new(service: &str, settings: OriginRequest) -> Result<Self> {
+    pub fn new(
+        service: &str,
+        settings: OriginRequest,
+        observability: &crate::observability::Context,
+    ) -> Result<Self> {
         let verifier = settings
             .access
             .as_ref()
@@ -105,7 +112,8 @@ impl Origin {
         };
         let (client, websocket_client) =
             if matches!(service, Service::Http(_) | Service::Unix { .. }) {
-                let connector = OriginConnector::new(service.clone(), settings.clone())?;
+                let connector =
+                    OriginConnector::new(service.clone(), settings.clone(), observability)?;
                 let mut websocket = connector.clone();
                 websocket.force_http1 = true;
                 (
@@ -248,8 +256,57 @@ struct OriginConnector {
     force_http1: bool,
 }
 
+fn origin_roots(
+    path: Option<&Path>,
+    observability: &crate::observability::Context,
+) -> Result<Vec<X509>> {
+    use crate::observability::logging::{Event, Level};
+    let custom = path
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(std::fs::read)
+        .transpose()
+        .context("Cannot read origin CA pool")?;
+    let mut roots = match crate::crypto::native_roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            let _ = observability.logger.log(
+                Level::Error,
+                Event::Cloudflared,
+                "error obtaining the system certificates",
+                serde_json::json!({"error":error.to_string()}),
+            );
+            Vec::new()
+        }
+    };
+    roots.extend(X509::stack_from_pem(include_bytes!(
+        "../crypto/cloudflare-roots.pem"
+    ))?);
+    roots.extend(X509::stack_from_pem(include_bytes!(
+        "../crypto/hello-root.pem"
+    ))?);
+    if let Some(pem) = custom {
+        let certs = crate::crypto::pem_certificates(&pem);
+        if certs.is_empty() {
+            let _ = observability.logger.log(
+                Level::Info,
+                Event::Cloudflared,
+                "could not append the provided origin CA to the cloudflared certificate pool",
+                serde_json::json!({}),
+            );
+        }
+        roots.extend(certs);
+    }
+    Ok(roots)
+}
+
 impl OriginConnector {
-    fn new(service: Service, settings: OriginRequest) -> Result<Self> {
+    fn new(
+        service: Service,
+        settings: OriginRequest,
+        observability: &crate::observability::Context,
+    ) -> Result<Self> {
+        let roots_certificates =
+            origin_roots(settings.ca_pool.as_deref().map(Path::new), observability)?;
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         let connect_timeout = settings
@@ -277,19 +334,8 @@ impl OriginConnector {
         let tls = if secure {
             let mut builder = SslConnector::builder(SslMethod::tls())?;
             let mut roots = X509StoreBuilder::new()?;
-            if let Some(pool) = &settings.ca_pool {
-                let pem = std::fs::read(pool).context("Cannot read origin CA pool")?;
-                let certificates = X509::stack_from_pem(&pem).context("Invalid origin CA pool")?;
-                if certificates.is_empty() {
-                    bail!("Origin CA pool contains no certificates");
-                }
-                for certificate in certificates {
-                    roots.add_cert(certificate)?;
-                }
-            } else {
-                for certificate in crate::crypto::native_roots()? {
-                    roots.add_cert(certificate)?;
-                }
+            for certificate in roots_certificates {
+                roots.add_cert(certificate)?;
             }
             builder.set_cert_store_builder(roots);
             builder.set_verify(if settings.no_tls_verify == Some(true) {
@@ -426,6 +472,7 @@ impl ConnectorService<http::Uri> for OriginConnector {
                 let mut ssl = config
                     .into_ssl(name.trim_matches(['[', ']']))
                     .map_err(io::Error::other)?;
+                crate::crypto::enforce_hostname_policy(&mut ssl);
                 if connector.settings.http2_origin == Some(true) && !connector.force_http1 {
                     ssl.set_alpn_protos(b"\x02h2\x08http/1.1")
                         .map_err(io::Error::other)?;

@@ -8,6 +8,9 @@ Upstream: https://github.com/cloudflare/cloudflared
 Copyright Cloudflare, Inc. and its contributors.
 Licensed under the Apache License, Version 2.0.
 
+src/crypto/cloudflare-roots.pem and src/crypto/hello-root.pem preserve the public
+certificates from upstream tlsconfig at the frozen commit above.
+
 src/proxy/hello.html reproduces the indexTemplate from upstream hello/hello.go
 at the frozen commit above. The request rendering/server code is modified Rust
 work. Copyright Cloudflare, Inc. and its contributors; Apache-2.0.

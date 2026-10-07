@@ -19,15 +19,7 @@ pub struct AccountClient {
 
 pub(crate) fn verified_tls_connector() -> Result<boring::ssl::SslConnectorBuilder> {
     let mut ssl = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())?;
-    let certs = crate::crypto::native_roots()?;
-    if certs.is_empty() {
-        bail!("no platform CA certificates available for account API");
-    }
-    let mut roots = boring::x509::store::X509StoreBuilder::new()?;
-    for cert in certs {
-        roots.add_cert(&cert)?;
-    }
-    ssl.set_cert_store_builder(roots);
+    ssl.set_cert_store_builder(boring::x509::store::X509StoreBuilder::new()?);
     ssl.set_min_proto_version(Some(boring::ssl::SslVersion::TLS1_2))?;
     Ok(ssl)
 }
@@ -36,7 +28,9 @@ pub(crate) fn verified_connector() -> Result<hyper_boring::HttpsConnector<HttpCo
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(15)));
-    Ok(hyper_boring::HttpsConnector::with_connector(http, ssl)?)
+    let mut connector = hyper_boring::HttpsConnector::with_connector(http, ssl)?;
+    connector.set_ssl_callback(|ssl, _| crate::crypto::configure_platform_trust(ssl));
+    Ok(connector)
 }
 
 impl AccountClient {

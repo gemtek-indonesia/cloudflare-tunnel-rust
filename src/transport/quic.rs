@@ -367,7 +367,7 @@ pub async fn dial_with_options(
     config.verify_peer(true);
     let mut cid = [0; 20];
     boring::rand::rand_bytes(&mut cid).map_err(io::Error::other)?;
-    let conn: QuicheConnection = quiche::connect_with_buffer_factory(
+    let mut conn: QuicheConnection = quiche::connect_with_buffer_factory(
         Some(server_name),
         &quiche::ConnectionId::from_ref(&cid),
         local_addr,
@@ -375,6 +375,7 @@ pub async fn dial_with_options(
         &mut config,
     )
     .map_err(io::Error::other)?;
+    crate::crypto::enforce_hostname_policy(conn.as_mut());
     attach_connection(conn, socket, address, local_addr, None).await
 }
 
@@ -814,6 +815,30 @@ mod tests {
         config.set_initial_max_streams_bidi(128);
         config.enable_dgram(true, 32, 32);
         config
+    }
+
+    #[tokio::test]
+    async fn quic_requires_san_even_when_common_name_matches() {
+        for (names, succeeds) in [(vec![], false), (vec!["edge.test"], true)] {
+            let (cert, key) = crate::crypto::tests::certificate_for_names("edge.test", &names);
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let peer = tokio::spawn(echo_peer(socket, peer_config(&cert, &key), 0, false));
+            let tls =
+                EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+            let client =
+                tokio::time::timeout(Duration::from_secs(6), dial(addr, "edge.test", &tls))
+                    .await
+                    .unwrap();
+            assert_eq!(client.is_ok(), succeeds);
+            if let Ok(client) = client {
+                client.close();
+            }
+            tokio::time::timeout(Duration::from_secs(6), peer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

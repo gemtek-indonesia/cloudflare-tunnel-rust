@@ -231,7 +231,8 @@ pub(crate) async fn dial_socket(
     let connector = connector.build();
     let mut config = connector.configure()?;
     config.set_verify_hostname(insecure_sni.is_none());
-    let ssl = config.into_ssl(insecure_sni.unwrap_or(host))?;
+    let mut ssl = config.into_ssl(insecure_sni.unwrap_or(host))?;
+    crate::crypto::configure_platform_trust(&mut ssl)?;
     let socket = tokio::time::timeout(
         Duration::from_secs(30),
         tokio_boring::SslStreamBuilder::new(ssl, socket).connect(),

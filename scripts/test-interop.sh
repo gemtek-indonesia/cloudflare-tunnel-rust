@@ -63,6 +63,7 @@ cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/oracle" ./tests/rust-interop-oracle
+GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/trust-oracle" "${repo_dir}/tests/interop/trust.go"
 cd "${repo_dir}"
 CLOUDFLARED_GO_ORACLE="${scratch}/oracle" cargo test --locked --test interop -- --ignored --nocapture
-CLOUDFLARED_GO_ORACLE="${scratch}/oracle" cargo test --locked --lib go_ -- --ignored --nocapture
+CLOUDFLARED_GO_ORACLE="${scratch}/oracle" CLOUDFLARED_GO_TRUST_ORACLE="${scratch}/trust-oracle" cargo test --locked --lib go_ -- --ignored --nocapture

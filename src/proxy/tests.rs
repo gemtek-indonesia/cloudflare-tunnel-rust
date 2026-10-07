@@ -669,7 +669,7 @@ async fn origin_access_admits_before_status_and_hello_world() {
             ..Default::default()
         };
         let state = state_with_settings(service, settings.clone());
-        let mut origin = Origin::new(service, settings).unwrap();
+        let mut origin = Origin::new(service, settings, &state.observability).unwrap();
         origin.verifier = Some(verifier.clone());
         state.snapshot.write().await.origins[0] = Arc::new(origin);
         for (jwt, expected) in [

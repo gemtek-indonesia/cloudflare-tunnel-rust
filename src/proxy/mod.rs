@@ -67,14 +67,17 @@ impl ProxyState {
         ));
         Ok(Self {
             tags,
-            snapshot: RwLock::new(Self::build(configuration)?),
+            snapshot: RwLock::new(Self::build(configuration, &observability)?),
             normalize: !config.disable_path_normalization,
             observability,
             quick_authorizer: config.quick_authorizer.clone(),
         })
     }
 
-    fn build(mut configuration: LoadedConfig) -> Result<Snapshot> {
+    fn build(
+        mut configuration: LoadedConfig,
+        observability: &crate::observability::Context,
+    ) -> Result<Snapshot> {
         if configuration.ingress.is_empty() {
             configuration.ingress.push(IngressRule {
                 service: "http_status:503".into(),
@@ -91,7 +94,7 @@ impl ProxyState {
                     // Dedicated SOCKS access policy uses the rule's own IP rules.
                     settings.ip_rules = rule.origin_request.ip_rules.clone();
                 }
-                Origin::new(&rule.service, settings).map(Arc::new)
+                Origin::new(&rule.service, settings, observability).map(Arc::new)
             })
             .collect::<Result<Vec<_>>>()?;
         configuration.settings.clear();
@@ -107,7 +110,7 @@ impl ProxyState {
     }
 
     pub async fn replace(&self, configuration: LoadedConfig) -> Result<()> {
-        let snapshot = Self::build(configuration)?;
+        let snapshot = Self::build(configuration, &self.observability)?;
         *self.snapshot.write().await = snapshot;
         Ok(())
     }
