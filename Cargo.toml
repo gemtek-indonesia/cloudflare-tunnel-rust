@@ -37,6 +37,7 @@ jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rus
 libc = "0.2"
 prometheus = { version = "0.14", features = ["process"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
+oxiri = { version = "=0.3.1", default-features = false }
 prost = "0.14"
 socket2 = "0.6"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }

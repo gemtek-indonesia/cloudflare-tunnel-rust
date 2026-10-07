@@ -420,6 +420,7 @@ dependencies = [
  "libc",
  "mime",
  "opentelemetry-proto",
+ "oxiri",
  "percent-encoding",
  "prometheus",
  "prost",
@@ -2441,6 +2442,15 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "oxiri"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6bd0ef560f078e41ce2ebf370cce217e7fb2c3695ffa87541151c9de94e83a"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

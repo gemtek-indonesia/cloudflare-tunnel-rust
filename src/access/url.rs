@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, HeaderValue, Uri};
+use oxiri::IriRef;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
-use std::net::Ipv6Addr;
+use std::{borrow::Cow, net::Ipv6Addr};
+
+#[path = "url/redirect.rs"]
+mod redirect;
 
 const PATH: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -29,6 +33,34 @@ const USER: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b',')
     .remove(b';')
     .remove(b'=');
+const HOST_ZONE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b':')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b'[')
+    .remove(b']')
+    .remove(b'<')
+    .remove(b'>')
+    .remove(b'"');
+const FRAGMENT: &AsciiSet = &PATH
+    .remove(b'?')
+    .remove(b'!')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*');
 
 /// A parsed application address retains Go request-URI path/authority semantics.
 #[derive(Clone)]
@@ -39,6 +71,7 @@ pub struct ApplicationUrl {
     port: Option<String>,
     path: String,
     query: Option<String>,
+    fragment: Option<String>,
     userinfo: Option<(Vec<u8>, Option<Vec<u8>>)>,
     serialized: String,
 }
@@ -84,7 +117,31 @@ impl ApplicationUrl {
         Ok(target)
     }
     pub(crate) fn remote(input: &str) -> Result<Self> {
-        Self::parse(input, false)
+        if input.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+            bail!("invalid control character in application URL");
+        }
+        let (input, fragment) = input
+            .split_once('#')
+            .map_or((input, None), |(input, fragment)| (input, Some(fragment)));
+        let parts = IriRef::parse_unchecked(input);
+        let authority = parts
+            .authority()
+            .context("application URL requires an authority")?;
+        let projected = redirect::redirect_authority(authority)?;
+        let prefix_length = parts.scheme().map_or(2, |scheme| scheme.len() + 3);
+        let prepared = format!(
+            "{}{projected}{}",
+            &input[..prefix_length],
+            &input[prefix_length + authority.len()..]
+        );
+        let mut result = Self::parse(&prepared, false)?;
+        redirect::restore_redirect_zone(&mut result, authority)?;
+        result.fragment = fragment
+            .map(|value| escaped_component(value, FRAGMENT, true))
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        result.rebuild();
+        Ok(result)
     }
     fn parse(input: &str, validate_header: bool) -> Result<Self> {
         if input.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
@@ -187,15 +244,7 @@ impl ApplicationUrl {
             .map_or((remainder, None), |(path, query)| {
                 (path, Some(query.to_owned()))
             });
-        let decoded_path = decode(path)?;
-        let path = if path
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,/:;=@[]%".contains(&byte))
-        {
-            path.to_owned()
-        } else {
-            percent_encoding::percent_encode(&decoded_path, PATH).to_string()
-        };
+        let path = escaped_component(path, PATH, false)?;
         let mut result = Self {
             scheme: scheme.to_ascii_lowercase(),
             host,
@@ -203,6 +252,7 @@ impl ApplicationUrl {
             port,
             path,
             query,
+            fragment: None,
             userinfo,
             serialized: String::new(),
         };
@@ -220,14 +270,21 @@ impl ApplicationUrl {
                 });
                 format!("{name}{password}@")
             });
-        let host = self.host.replace('%', "%25");
+        let host = if self.host.starts_with('[') && self.host.contains('%') {
+            percent_encoding::utf8_percent_encode(&self.host, HOST_ZONE).to_string()
+        } else {
+            self.host.replace('%', "%25")
+        };
         self.serialized = format!(
-            "{}://{user}{host}{}{}",
+            "{}://{user}{host}{}{}{}",
             self.scheme,
             self.path,
             self.query
                 .as_ref()
-                .map_or(String::new(), |query| format!("?{query}"))
+                .map_or(String::new(), |query| format!("?{query}")),
+            self.fragment
+                .as_ref()
+                .map_or(String::new(), |fragment| format!("#{fragment}"))
         );
     }
     pub fn as_str(&self) -> &str {
@@ -251,6 +308,13 @@ impl ApplicationUrl {
     pub fn path(&self) -> &str {
         &self.path
     }
+    pub(crate) fn decoded_path(&self) -> Cow<'_, [u8]> {
+        if self.path.contains('%') {
+            Cow::Owned(percent_encoding::percent_decode_str(&self.path).collect())
+        } else {
+            Cow::Borrowed(self.path.as_bytes())
+        }
+    }
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()
     }
@@ -273,6 +337,10 @@ impl ApplicationUrl {
         }
         let mut result = self.clone();
         result.userinfo = None;
+        result.fragment = None;
+        if result.path.is_empty() {
+            result.path = "/".into();
+        }
         if result.port.as_deref() == Some("") {
             result.host.pop();
             result.port = None;
@@ -308,16 +376,25 @@ impl ApplicationUrl {
     pub(crate) fn query_pairs(&self) -> url::form_urlencoded::Parse<'_> {
         url::form_urlencoded::parse(self.query.as_deref().unwrap_or("").as_bytes())
     }
-    pub(crate) fn join(&self, location: &str) -> Result<Self> {
-        let resolved = ::url::Url::parse(self.as_str())?.join(location)?;
-        Self::remote(resolved.as_str())
-    }
     pub(crate) fn authority_prefix(&self) -> String {
         let mut value = self.clone();
         value.path.clear();
         value.query = None;
+        value.fragment = None;
         value.rebuild();
         value.serialized
+    }
+}
+fn escaped_component(value: &str, set: &'static AsciiSet, question: bool) -> Result<String> {
+    let decoded = decode(value)?;
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || b"-._~!$&'()*+,/:;=@[]%".contains(&byte)
+            || question && byte == b'?'
+    }) {
+        Ok(value.to_owned())
+    } else {
+        Ok(percent_encoding::percent_encode(&decoded, set).to_string())
     }
 }
 fn decode(value: &str) -> Result<Vec<u8>> {
@@ -385,3 +462,7 @@ mod tests {
         assert!(headers.contains_key(http::header::AUTHORIZATION));
     }
 }
+
+#[cfg(test)]
+#[path = "url/join_tests.rs"]
+mod join_tests;

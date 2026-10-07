@@ -413,18 +413,21 @@ impl TokenClient {
         let mut session = None;
         let mut was_authorized = false;
         for _ in 0..10 {
+            let path = current.decoded_path();
+            let login = path
+                .windows(b"/cdn-cgi/access/login".len())
+                .any(|part| part == b"/cdn-cgi/access/login");
+            let authorized = path
+                .windows(b"/cdn-cgi/access/authorized".len())
+                .any(|part| part == b"/cdn-cgi/access/authorized");
             let mut request = http::Request::builder()
                 .method("HEAD")
                 .uri(current.request_uri()?)
                 .header(http::header::USER_AGENT, "cloudflared-rust");
-            if current.path().contains("/cdn-cgi/access/login")
-                && current.hostname() == info.auth_domain
-            {
+            if login && current.hostname() == info.auth_domain {
                 request = request.header(http::header::COOKIE, format!("CF_Authorization={org}"));
             }
-            if current.path().contains("/cdn-cgi/access/authorized")
-                && let Some(session) = &session
-            {
+            if authorized && let Some(session) = &session {
                 request = request.header(http::header::COOKIE, format!("CF_AppSession={session}"));
             }
             let mut request = request.body(Full::new(Bytes::new()))?;
@@ -448,12 +451,13 @@ impl TokenClient {
             if was_authorized || !response.status().is_redirection() {
                 break;
             }
+            let location = response
+                .headers()
+                .get(http::header::LOCATION)
+                .context("Access redirect missing location")?;
             let next = current.join(
-                response
-                    .headers()
-                    .get(http::header::LOCATION)
-                    .context("Access redirect missing location")?
-                    .to_str()?,
+                std::str::from_utf8(location.as_bytes())
+                    .map_err(|_| anyhow::anyhow!("invalid Access redirect location"))?,
             )?;
             if next.scheme() != "https"
                 || !(next.hostname() == application.hostname()
@@ -461,7 +465,7 @@ impl TokenClient {
             {
                 bail!("Access SSO redirect left the bound application/authentication hosts");
             }
-            was_authorized = current.path().contains("/cdn-cgi/access/authorized");
+            was_authorized = authorized;
             current = next;
         }
         bail!("Access SSO exchange did not return an application token")
@@ -501,9 +505,9 @@ impl TokenClient {
                 && response
                     .headers()
                     .get(http::header::LOCATION)
-                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
                     .and_then(|location| check.join(location).ok())
-                    .is_some_and(|url| url.path().starts_with("/cdn-cgi/access/login"));
+                    .is_some_and(|url| url.decoded_path().starts_with(b"/cdn-cgi/access/login"));
             if !login {
                 return Ok(token);
             }
@@ -862,6 +866,19 @@ mod tests {
                                 let response = if request.uri().path() == "/certs" {
                                     http::Response::new(Full::new(Bytes::from(keys)))
                                 } else if request.method() == http::Method::HEAD {
+                                    if request.uri().path() == "/%63dn-cgi/access/login" {
+                                        assert_eq!(
+                                            request.headers()[http::header::COOKIE],
+                                            "CF_Authorization=synthetic-org"
+                                        );
+                                        return Ok(http::Response::builder()
+                                            .header(
+                                                http::header::SET_COOKIE,
+                                                "CF_Authorization=synthetic-exchange-token; Path=/",
+                                            )
+                                            .body(Full::new(Bytes::new()))
+                                            .unwrap());
+                                    }
                                     assert_eq!(request.uri().path(), "/a/../b");
                                     http::Response::builder()
                                         .header("cf-access-metadata", metadata)
@@ -888,6 +905,16 @@ mod tests {
                                                 std::fs::remove_file(path).unwrap();
                                             }
                                         }
+                                        3 => {
+                                            return Ok(http::Response::builder()
+                                                .status(302)
+                                                .header(
+                                                    http::header::LOCATION,
+                                                    "/%63dn-cgi/access/login",
+                                                )
+                                                .body(Full::new(Bytes::new()))
+                                                .unwrap());
+                                        }
                                         _ => {}
                                     }
                                     http::Response::new(Full::new(Bytes::new()))
@@ -907,6 +934,17 @@ mod tests {
         client.jwks_override = Some(format!("http://{address}/certs"));
         let app = ApplicationUrl::curl(&format!("http://{address}/a/../b")).unwrap();
         let info = client.discover(&app).await.unwrap();
+        let encoded_login =
+            ApplicationUrl::remote(&format!("http://{address}/%63dn-cgi/access/login")).unwrap();
+        let mut login_info = info.clone();
+        login_info.auth_domain = "127.0.0.1".into();
+        assert_eq!(
+            client
+                .exchange_org(&encoded_login, "synthetic-org", &login_info)
+                .await
+                .unwrap(),
+            "synthetic-exchange-token"
+        );
         let token = client.token_path(&info).unwrap();
         *cache.lock().unwrap() = Some(token.clone());
         let executable = directory.join("mock-curl");
@@ -946,6 +984,15 @@ printf '%s\n' "$@" > "$0.called"
         assert!(arguments.contains("@"));
         assert!(!arguments.contains(&jwt));
         std::fs::remove_file(&called).unwrap();
+        mode.store(3, Ordering::SeqCst);
+        assert!(
+            super::super::run_curl(&client, &app, &info, true, false, browser, command())
+                .await
+                .is_err()
+        );
+        assert!(!called.exists());
+        assert!(!token.exists());
+        crate::administration::credentials::atomic_create(&token, jwt.as_bytes(), 0o600).unwrap();
         mode.store(2, Ordering::SeqCst);
         super::super::run_curl(&client, &app, &info, true, false, browser, command())
             .await
