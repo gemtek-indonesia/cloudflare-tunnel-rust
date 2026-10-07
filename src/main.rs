@@ -108,6 +108,9 @@ async fn dispatch() -> Result<()> {
         }
         Action::Service(invocation) => cloudflare_tunnel_rust::service::execute(invocation).await?,
         Action::Access(invocation) => cloudflare_tunnel_rust::access::execute(invocation).await?,
+        Action::Watch(invocation) => {
+            cloudflare_tunnel_rust::access::watcher::execute(invocation).await?
+        }
         Action::Operations(invocation) => {
             cloudflare_tunnel_rust::observability::tail::execute(invocation).await?
         }

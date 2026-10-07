@@ -14,7 +14,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(crate) type Socket = Pin<Box<dyn Io>>;
 pub(crate) type WebSocket = WebSocketStream<Socket>;
 
-struct Options {
+pub(super) struct Options {
     app: ApplicationUrl,
     endpoint: ApplicationUrl,
     sni: Option<String>,
@@ -75,16 +75,51 @@ impl Options {
             auto_close: invocation.bool("auto-close"),
         })
     }
+    pub(super) fn from_forwarder(
+        forwarder: &super::watcher::Forwarder,
+        directory: &std::path::Path,
+    ) -> Result<Self> {
+        // Configured forwarders pass their URL directly to the carrier, without CLI HTTPS upgrading.
+        let app = ApplicationUrl::remote(&forwarder.url)?;
+        let mut headers = HeaderMap::new();
+        for (value, name) in [
+            (&forwarder.token_client_id, "cf-access-client-id"),
+            (&forwarder.token_secret, "cf-access-client-secret"),
+            (&forwarder.destination, "cf-access-jump-destination"),
+        ] {
+            if !value.is_empty() {
+                headers.insert(name, HeaderValue::from_str(value)?);
+            }
+        }
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_str(&format!("cloudflared/{}", crate::config::UPSTREAM_VERSION))?,
+        );
+        Ok(Self {
+            endpoint: app.clone(),
+            app,
+            sni: None,
+            headers,
+            client: tokio::sync::OnceCell::new(),
+            directory: directory.to_owned(),
+            fedramp: forwarder.is_fedramp,
+            auto_close: false,
+        })
+    }
     async fn dial(&self, token: Option<&str>) -> std::result::Result<WebSocket, Error> {
         let mut target = self
             .endpoint
             .request_uri()
             .map_err(|_| Error::Io(std::io::Error::other("invalid Access WebSocket URL")))?
             .into_parts();
-        target.scheme = Some(if self.endpoint.scheme() == "https" {
-            "wss".parse().expect("static WebSocket scheme")
-        } else {
-            "ws".parse().expect("static WebSocket scheme")
+        target.scheme = Some(match self.endpoint.scheme() {
+            "https" | "wss" => "wss".parse().expect("static WebSocket scheme"),
+            "http" | "ws" => "ws".parse().expect("static WebSocket scheme"),
+            _ => {
+                return Err(Error::Url(
+                    tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme,
+                ));
+            }
         });
         let target = http::Uri::from_parts(target)
             .map_err(|_| Error::Io(std::io::Error::other("invalid Access WebSocket URI")))?;
@@ -138,7 +173,7 @@ impl Options {
         })?
         .map(|(socket, _)| socket)
     }
-    async fn connect(&self) -> Result<WebSocket> {
+    pub(super) async fn connect(&self) -> Result<WebSocket> {
         match self.dial(None).await {
             Ok(socket) => return Ok(socket),
             Err(error) if is_login(&error) => {}
@@ -271,17 +306,8 @@ pub async fn execute(invocation: crate::cli::Invocation) -> Result<()> {
         )
         .await;
     }
-    let url = ApplicationUrl::remote(
-        if listener.contains("://") {
-            listener.to_owned()
-        } else {
-            format!("http://{listener}")
-        }
-        .as_str(),
-    )?;
-    let port = url.port()?;
-    let host = url.hostname();
-    let listener = tokio::net::TcpListener::bind((host, port))
+    let address = super::watcher::listener_address(listener)?;
+    let listener = super::watcher::bind_listener(&address)
         .await
         .context("cannot bind Access listener")?;
     let mut tasks = tokio::task::JoinSet::new();

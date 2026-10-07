@@ -72,6 +72,7 @@ pub enum Action {
     Diagnostics(Invocation),
     Quick(Invocation),
     Adhoc(Invocation),
+    Watch(Invocation),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +88,59 @@ pub struct Invocation {
     pub configuration: LoadedConfig,
     values: BTreeMap<String, Vec<String>>,
     specified: BTreeMap<String, bool>,
+    source_flags_set: bool,
+}
+
+// These root altsrc flags are not part of the current runtime flag definitions.
+const ROOT_YAML_EXTRA: &[(&str, Kind, Option<&str>)] = &[
+    ("access-key-id", Kind::String, Some("ACCESS_CLIENT_ID")),
+    ("bucket-name", Kind::String, Some("BUCKET_ID")),
+    (
+        "compression-quality",
+        Kind::Integer,
+        Some("TUNNEL_COMPRESSION_LEVEL"),
+    ),
+    ("heartbeat-count", Kind::Integer, None),
+    ("heartbeat-interval", Kind::Duration, None),
+    ("host-key-path", Kind::String, Some("HOST_KEY_PATH")),
+    ("is-autoupdated", Kind::Bool, None),
+    (
+        "metrics-update-freq",
+        Kind::Duration,
+        Some("TUNNEL_METRICS_UPDATE_FREQ"),
+    ),
+    ("region-name", Kind::String, Some("REGION_ID")),
+    ("s3-url-host", Kind::String, Some("S3_URL")),
+    ("secret-id", Kind::String, Some("SECRET_ID")),
+    ("session-token", Kind::String, Some("SESSION_TOKEN_ID")),
+    ("ui", Kind::Bool, None),
+    (
+        "use-reconnect-token",
+        Kind::Bool,
+        Some("TUNNEL_USE_RECONNECT_TOKEN"),
+    ),
+];
+fn root_yaml_kind(name: &str) -> Option<Kind> {
+    if [
+        "credentials-contents",
+        "features",
+        "output",
+        "token",
+        "token-file",
+    ]
+    .contains(&name)
+    {
+        return None;
+    }
+    flags::find(name)
+        .filter(|flag| flag.yaml)
+        .map(|flag| flag.kind)
+        .or_else(|| {
+            ROOT_YAML_EXTRA
+                .iter()
+                .find(|(key, _, _)| *key == name)
+                .map(|(_, kind, _)| *kind)
+        })
 }
 
 impl Invocation {
@@ -101,6 +155,7 @@ impl Invocation {
                 "TUNNEL_SERVICE_HOSTNAME",
                 "TUNNEL_SERVICE_URL",
             ])
+            .chain(ROOT_YAML_EXTRA.iter().filter_map(|(_, _, key)| *key))
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
             .collect();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -212,10 +267,32 @@ impl Invocation {
         }
         let command = positional[..count].join(" ");
         let command_args = positional[count..].to_vec();
+        if command.is_empty() {
+            for &(name, kind, environment) in ROOT_YAML_EXTRA {
+                if let Some(value) = environment.and_then(|key| env.get(key))
+                    && !value.is_empty()
+                {
+                    match kind {
+                        Kind::Integer => {
+                            root_integer(value).with_context(|| {
+                                format!("invalid environment value for --{name}")
+                            })?;
+                        }
+                        Kind::Duration => {
+                            root_duration(value).with_context(|| {
+                                format!("invalid environment value for --{name}")
+                            })?;
+                        }
+                        _ => validate_value(name, kind, value)?,
+                    }
+                }
+            }
+        }
         let mut specified = values
             .keys()
             .map(|name| (name.to_owned(), true))
             .collect::<BTreeMap<_, _>>();
+        let mut source_flags_set = !values.is_empty();
         if values
             .get("help")
             .is_some_and(|v| v.last().is_some_and(|v| v == "true"))
@@ -229,6 +306,7 @@ impl Invocation {
                 configuration: LoadedConfig::default(),
                 values,
                 specified,
+                source_flags_set,
             });
         }
         let path = values
@@ -240,6 +318,8 @@ impl Invocation {
         let access = command.starts_with("access ");
         let configuration = if access {
             LoadedConfig::default()
+        } else if command.is_empty() {
+            root_configuration(path.as_deref())?
         } else {
             LoadedConfig::read(path.as_deref())?
         };
@@ -264,14 +344,20 @@ impl Invocation {
                 values.insert(flag.name.to_owned(), split_value(flag.kind, value));
                 specified.insert(flag.name.to_owned(), true);
             } else if flag.yaml
+                && (!command.is_empty() || root_yaml_kind(flag.name).is_some())
                 && let Some(value) = configuration.settings.get(flag.name)
             {
-                let value = yaml_value(flag.kind, value)
-                    .with_context(|| format!("invalid YAML type for {}", flag.name))?;
+                let value = if command.is_empty() {
+                    root_yaml_value(flag.kind, value)
+                } else {
+                    yaml_value(flag.kind, value)
+                }
+                .with_context(|| format!("invalid YAML type for {}", flag.name))?;
                 if let Some(value) = value {
                     validate_value(flag.name, flag.kind, &value)?;
                     values.insert(flag.name.to_owned(), split_value(flag.kind, &value));
                     specified.insert(flag.name.to_owned(), true);
+                    source_flags_set = true;
                 }
             }
             if !values.contains_key(flag.name)
@@ -281,12 +367,25 @@ impl Invocation {
                 values.insert(flag.name.to_owned(), split_value(flag.kind, value));
             }
         }
+        if command.is_empty() {
+            for &(name, kind, environment) in ROOT_YAML_EXTRA {
+                if environment.is_some_and(|key| env.contains_key(key)) {
+                    continue;
+                }
+                if let Some(value) = configuration.settings.get(name) {
+                    source_flags_set |= root_yaml_value(kind, value)
+                        .with_context(|| format!("invalid YAML type for {name}"))?
+                        .is_some();
+                }
+            }
+        }
         Ok(Self {
             command,
             args: command_args,
             configuration,
             values,
             specified,
+            source_flags_set,
         })
     }
 
@@ -320,6 +419,9 @@ impl Invocation {
             return Ok(Action::Version {
                 short: self.bool("short"),
             });
+        }
+        if self.command.is_empty() && self.args.is_empty() && !self.source_flags_set {
+            return Ok(Action::Watch(self));
         }
         if ["", "tunnel", "tunnel run"].contains(&self.command.as_str()) {
             for name in ["tag", "socks5"] {
@@ -410,7 +512,9 @@ impl Invocation {
             "" | "tunnel" if !self.string("hostname").is_empty() => {
                 bail!("Classic tunnels have been deprecated, please use Named Tunnels.")
             }
-            "" => bail!("Configuration watcher service mode is not implemented yet"),
+            "" => {
+                bail!("Use `cloudflared tunnel run` for a named tunnel or --url for a Quick Tunnel")
+            }
             "tunnel" => {
                 bail!("Use `cloudflared tunnel run` for a named tunnel or --url for a Quick Tunnel")
             }
@@ -838,6 +942,96 @@ fn validate_value(name: &str, kind: Kind, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn root_configuration(path: Option<&Path>) -> Result<LoadedConfig> {
+    let Some(path) = path else {
+        return Ok(LoadedConfig::default());
+    };
+    let bytes = std::fs::read(path).context("Cannot read configuration file")?;
+    let document = serde_yaml_ng::Deserializer::from_slice(&bytes).next();
+    let mut configuration = match document {
+        Some(document) => <Option<LoadedConfig> as serde::Deserialize>::deserialize(document)
+            .map(Option::unwrap_or_default)
+            .map_err(|_| anyhow::anyhow!("error parsing YAML in config file"))?,
+        None => LoadedConfig::default(),
+    };
+    configuration.source = Some(path.to_owned());
+    Ok(configuration)
+}
+
+fn root_yaml_value(kind: Kind, value: &serde_yaml_ng::Value) -> Result<Option<String>> {
+    use serde_yaml_ng::Value;
+    match (kind, value) {
+        (Kind::Duration, Value::String(duration)) if duration.starts_with('-') => {
+            root_duration(duration)?;
+            Ok(None)
+        }
+        (Kind::Duration, Value::String(duration)) if duration.starts_with('+') => {
+            root_duration(duration)?;
+            yaml_value(kind, &Value::String(duration[1..].into()))
+        }
+        _ => yaml_value(kind, value),
+    }
+}
+
+fn root_duration(value: &str) -> Result<()> {
+    let magnitude = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    if magnitude.starts_with(['+', '-']) {
+        bail!("invalid duration sign");
+    }
+    config::parse_duration(magnitude)?;
+    Ok(())
+}
+
+fn root_integer(value: &str) -> Result<()> {
+    let negative = value.starts_with('-');
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let (radix, digits, prefix) = if let Some(digits) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        (16, digits, true)
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
+        (2, digits, true)
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0o")
+        .or_else(|| unsigned.strip_prefix("0O"))
+    {
+        (8, digits, true)
+    } else if unsigned.starts_with('0') && unsigned.len() > 1 {
+        (8, unsigned, false)
+    } else {
+        (10, unsigned, false)
+    };
+    if digits.contains(['+', '-']) {
+        bail!("invalid integer sign");
+    }
+    for (index, byte) in digits.bytes().enumerate() {
+        if byte == b'_'
+            && !(index == 0 && prefix || index > 0 && digits.as_bytes()[index - 1] != b'_')
+        {
+            bail!("invalid integer separator");
+        }
+    }
+    if digits.ends_with('_') {
+        bail!("invalid integer separator");
+    }
+    let magnitude =
+        u64::from_str_radix(&digits.replace('_', ""), radix).context("invalid integer")?;
+    if magnitude > i64::MAX as u64 + u64::from(negative) {
+        bail!("integer outside supported range");
+    }
+    Ok(())
+}
+
 fn yaml_value(kind: Kind, value: &serde_yaml_ng::Value) -> Result<Option<String>> {
     use serde_yaml_ng::Value;
     Ok(match (kind, value) {
@@ -889,6 +1083,147 @@ pub fn help(command: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    #[ignore = "requires the pinned Go source oracle"]
+    fn go_root_altsrc_scope_contract() {
+        let oracle = std::env::var_os("CLOUDFLARED_GO_ORACLE").expect("pinned Go oracle");
+        let output = std::process::Command::new(oracle)
+            .args(["watcher", "[]"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let source: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let source = source["root_yaml_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let names = flags::FLAGS
+            .iter()
+            .map(|flag| flag.name)
+            .chain(ROOT_YAML_EXTRA.iter().map(|(name, _, _)| *name));
+        let actual = names
+            .filter(|name| root_yaml_kind(name).is_some())
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, source);
+    }
+
+    #[test]
+    fn watcher_dispatch_counts_cli_and_effective_yaml_but_not_environment() {
+        let home = std::env::temp_dir().join(format!(
+            "cloudflared-empty-invocation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let directory = home.join(".cloudflared");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.yml");
+        for (args, environment, yaml, watcher) in [
+            (vec![], BTreeMap::new(), "forwarders: []\n", true),
+            (vec!["--"], BTreeMap::new(), "forwarders: []\n", true),
+            (
+                vec![],
+                BTreeMap::from([("TUNNEL_NAME", "synthetic")]),
+                "forwarders: []\n",
+                true,
+            ),
+            (
+                vec![],
+                BTreeMap::from([("TUNNEL_LOGLEVEL", "debug")]),
+                "loglevel: error\n",
+                true,
+            ),
+            (
+                vec!["--hello-world=false"],
+                BTreeMap::new(),
+                "forwarders: []\n",
+                false,
+            ),
+            (vec!["version"], BTreeMap::new(), "forwarders: []\n", false),
+            (vec![], BTreeMap::new(), "loglevel: debug\n", false),
+            (
+                vec![],
+                BTreeMap::new(),
+                "no-tls-verify: false\nha-connections: 0\nurl: ''\nrpc-timeout: -1s\n",
+                true,
+            ),
+            (vec![], BTreeMap::new(), "edge: []\n", false),
+            (
+                vec![],
+                BTreeMap::new(),
+                "token: ignored\nfeatures: [ignored]\noutput: json\n",
+                true,
+            ),
+            (vec![], BTreeMap::new(), "bucket-name: synthetic\n", false),
+            (
+                vec![],
+                BTreeMap::from([("BUCKET_ID", "")]),
+                "bucket-name: synthetic\n",
+                true,
+            ),
+            (
+                vec![],
+                BTreeMap::new(),
+                "forwarders: []\n---\ninvalid: [\n",
+                true,
+            ),
+        ] {
+            std::fs::write(&path, yaml).unwrap();
+            let env = environment
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect();
+            let invocation =
+                Invocation::parse(args.into_iter().map(str::to_owned), &env, Some(&home)).unwrap();
+            assert_eq!(
+                matches!(invocation.action(Some(&home)), Ok(Action::Watch(_))),
+                watcher,
+                "{yaml}"
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn watcher_extra_environment_initialization_matches_source_types() {
+        let home = std::env::temp_dir().join(format!(
+            "cloudflared-extra-environment-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let directory = home.join(".cloudflared");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("config.yml"), "forwarders: []\n").unwrap();
+        for (key, value, valid) in [
+            ("TUNNEL_COMPRESSION_LEVEL", "invalid", false),
+            ("TUNNEL_COMPRESSION_LEVEL", "", true),
+            ("TUNNEL_COMPRESSION_LEVEL", "0x10", true),
+            ("TUNNEL_COMPRESSION_LEVEL", "-1", true),
+            ("TUNNEL_METRICS_UPDATE_FREQ", "invalid", false),
+            ("TUNNEL_METRICS_UPDATE_FREQ", "", true),
+            ("TUNNEL_METRICS_UPDATE_FREQ", "-1s", true),
+            ("TUNNEL_METRICS_UPDATE_FREQ", "+0", true),
+            ("TUNNEL_METRICS_UPDATE_FREQ", "-+1s", false),
+            ("TUNNEL_USE_RECONNECT_TOKEN", "invalid", false),
+            ("TUNNEL_USE_RECONNECT_TOKEN", "", true),
+        ] {
+            let env = BTreeMap::from([(key.into(), value.into())]);
+            let invocation = Invocation::parse(std::iter::empty(), &env, Some(&home));
+            assert_eq!(invocation.is_ok(), valid, "{key}/{value}");
+            if let Ok(invocation) = invocation {
+                assert!(matches!(
+                    invocation.action(Some(&home)),
+                    Ok(Action::Watch(_))
+                ));
+            }
+        }
+        for invalid in ["rpc-timeout: 1\n", "rpc-timeout: 1.5\n", "loglevel: null\n"] {
+            std::fs::write(directory.join("config.yml"), invalid).unwrap();
+            assert!(Invocation::parse(std::iter::empty(), &BTreeMap::new(), Some(&home)).is_err());
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn env_cli_precedence_and_token_runtime_inputs() {

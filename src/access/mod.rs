@@ -4,6 +4,7 @@ mod ssh;
 #[path = "url.rs"]
 mod target;
 pub mod token;
+pub mod watcher;
 pub use target::ApplicationUrl;
 
 use anyhow::{Context, Result, bail};

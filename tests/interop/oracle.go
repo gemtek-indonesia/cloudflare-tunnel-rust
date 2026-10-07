@@ -20,6 +20,7 @@ import (
 	"time"
 
 	cfaccess "github.com/cloudflare/cloudflared/cmd/cloudflared/access"
+	cftunnel "github.com/cloudflare/cloudflared/cmd/cloudflared/tunnel"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/ingress"
@@ -28,7 +29,9 @@ import (
 	"github.com/cloudflare/cloudflared/tunnelrpc"
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	rpcquic "github.com/cloudflare/cloudflared/tunnelrpc/quic"
+	"github.com/cloudflare/cloudflared/validation"
 	"github.com/google/uuid"
+	"github.com/urfave/cli/v2/altsrc"
 	capnp "zombiezen.com/go/capnproto2"
 )
 
@@ -210,6 +213,8 @@ func main() {
 		panic("oracle mode argument required")
 	}
 	switch os.Args[1] {
+	case "watcher":
+		watcherCorpus(os.Args[2])
 	case "access-url":
 		accessURLCorpus(os.Args[2])
 	case "quick-mime":
@@ -238,6 +243,35 @@ func main() {
 	default:
 		panic("unknown oracle mode")
 	}
+}
+
+func watcherCorpus(input string) {
+	var vectors []struct {
+		Forwarder config.Forwarder `json:"forwarder"`
+		Listener  string           `json:"listener"`
+	}
+	must(json.Unmarshal([]byte(input), &vectors))
+	results := make([]map[string]any, 0, len(vectors))
+	for _, vector := range vectors {
+		result := map[string]any{"hash": vector.Forwarder.Hash(), "listener_valid": false}
+		listener, err := validation.ValidateUrl(vector.Listener)
+		if err == nil {
+			_, port, addressErr := net.SplitHostPort(listener.Host)
+			if addressErr == nil && port != "" {
+				result["listener_valid"] = true
+				result["listener_address"] = listener.Host
+			}
+		}
+		results = append(results, result)
+	}
+	names := make([]string, 0)
+	for _, flag := range cftunnel.Flags() {
+		if _, ok := flag.(altsrc.FlagInputSourceExtension); ok {
+			names = append(names, flag.Names()[0])
+		}
+	}
+	sort.Strings(names)
+	must(json.NewEncoder(os.Stdout).Encode(map[string]any{"root_yaml_names": names, "vectors": results}))
 }
 
 func accessURLCorpus(input string) {

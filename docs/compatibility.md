@@ -7,7 +7,7 @@ The reference is Cloudflare `cloudflared` release 2026.10.0, commit [`18cdfe0a6f
 | Contract | Current implementation | Acceptance still owed |
 | --- | --- | --- |
 | Credentials | Base64 token `a/s/t/e`, JSON `AccountTag/TunnelSecret/TunnelID/Endpoint`, precedence and old JSON ID enrichment; name-to-UUID API resolution; private atomic credential writes and redacted errors | Expanded malformed-input and account API coverage |
-| Configuration | YAML discovery, aliases/env, CLI > env > YAML > defaults, source duration syntax, typed origin/private-network settings; invalid remote updates preserve the accepted version | Complete command-specific precedence and flag-placement corpus; empty-invocation Access-forwarder watcher is unimplemented and fails explicitly |
+| Configuration | YAML discovery, aliases/env, CLI > env > YAML > defaults, typed origin/private-network settings; invalid remote updates preserve the accepted version; empty-invocation Access-forwarder watcher with file-write reloads and retained established streams | Complete command-specific precedence, flag-placement, type and duration grammar corpus; nullable/multiple-document handling outside root mode |
 | Ingress | Ordered matching, catch-all/wildcard/service validation, validate/rule commands; Access-dependent path normalization, decoded invalid-UTF8 matching, frozen Go Unicode categories/scripts/case folding and ASCII Perl classes | Full Go regexp syntax/acceptance and engine-limit parity; expanded routing and IP-rule validation corpus |
 | Transport and wire | Verified TLS, QUIC streams/datagrams, H2 and Cap'n Proto registration/callback codecs; pinned Go/Rust interoperability checks | Expanded malformed/error interoperability and live edge acceptance |
 | Named tunnel daemon | Actual TLS/RPC registration over QUIC/H2, HA connection identity, pre-ack work, retries, readiness, service notification/PID file, graceful unregister and atomic remote configuration | Complete reconnect/failure/feature-selection differential coverage; live QUIC/H2 acceptance |
@@ -42,9 +42,10 @@ Frozen altsrc quirks are retained for covered flags: YAML `false`, zero/nonposit
 
 [Flag definitions](../src/cli/flags.rs) and the [command-family manifest](../src/cli/mod.rs) list parsing coverage and upstream commands.
 
+The Access-forwarder watcher reloads in-place file writes; replacing a file by rename does not rearm its watch. Malformed reloads keep existing listeners; an empty configuration removes listeners while established streams continue. An unchanged failed listener is retried only after its configuration hash changes. That hash follows upstream and excludes `isFedramp`. Forwarder URLs retain their configured schemes, while CLI Access application URLs are upgraded to HTTPS. The [source-context corpus](../tests/interop/source_bridge/watcher_test.go) and [watcher tests](../src/access/watcher.rs) cover these behaviors.
+
 ## Known behavioral gaps
 
-* Empty invocation does not run the upstream Access-forwarder configuration watcher.
 * Explicit tunnel `--tag` and `--socks5` options fail before connector or account operations. The tag header behavior and CLI SOCKS override are unimplemented; this does not exclude a configured SOCKS origin service.
 * HTTP clients and origins do not implement Go `ProxyFromEnvironment` selection, including `NO_PROXY`, proxy authentication and CGI rules.
 * Origin TLS currently chooses custom roots or native roots. Upstream adds custom roots to its native/Cloudflare/HelloWorld pool and retains that base pool for invalid custom PEM. Edge and account TLS verification remain separate from origin overrides.
