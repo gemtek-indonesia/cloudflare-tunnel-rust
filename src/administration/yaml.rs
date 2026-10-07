@@ -38,18 +38,31 @@ struct YamlTunnel<'a> {
     deletedat: Time<'a>,
     connections: Vec<YamlConnection<'a>>,
 }
+impl<'a> From<&'a Tunnel> for YamlTunnel<'a> {
+    fn from(value: &'a Tunnel) -> Self {
+        Self {
+            id: value.id,
+            name: &value.name,
+            createdat: Time(&value.created_at),
+            deletedat: Time(&value.deleted_at),
+            connections: connections(value.connections.as_deref().unwrap_or_default()),
+        }
+    }
+}
+pub(super) fn created_tunnel(value: &TunnelWithToken) -> Result<String> {
+    #[derive(Serialize)]
+    struct Created<'a> {
+        tunnel: YamlTunnel<'a>,
+        token: &'a str,
+    }
+    Ok(serde_yaml_ng::to_string(&Created {
+        tunnel: (&value.tunnel).into(),
+        token: &value.token,
+    })?)
+}
 pub(super) fn tunnels(values: &[Tunnel]) -> Result<String> {
     Ok(serde_yaml_ng::to_string(
-        &values
-            .iter()
-            .map(|value| YamlTunnel {
-                id: value.id,
-                name: &value.name,
-                createdat: Time(&value.created_at),
-                deletedat: Time(&value.deleted_at),
-                connections: connections(value.connections.as_deref().unwrap_or_default()),
-            })
-            .collect::<Vec<_>>(),
+        &values.iter().map(YamlTunnel::from).collect::<Vec<_>>(),
     )?)
 }
 

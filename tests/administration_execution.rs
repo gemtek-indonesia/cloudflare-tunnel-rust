@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -49,10 +49,24 @@ async fn execute(
     pages: Vec<Value>,
     statuses: &[u16],
 ) -> (std::process::Output, Vec<String>) {
+    let (output, requests, _) =
+        execute_with_bodies(directory, command, args, pages, statuses).await;
+    (output, requests)
+}
+
+async fn execute_with_bodies(
+    directory: &Directory,
+    command: &str,
+    args: &[String],
+    pages: Vec<Value>,
+    statuses: &[u16],
+) -> (std::process::Output, Vec<String>, Vec<String>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let captured_bodies = bodies.clone();
     let pages = Arc::new(pages);
     let statuses = Arc::new(statuses.to_vec());
     let server = tokio::spawn(async move {
@@ -60,12 +74,14 @@ async fn execute(
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             let captured = captured.clone();
+            let captured_bodies = captured_bodies.clone();
             let pages = pages.clone();
             let statuses = statuses.clone();
             connections.spawn(async move {
                 let service = hyper::service::service_fn(
                     move |request: http::Request<hyper::body::Incoming>| {
                         let captured = captured.clone();
+                        let captured_bodies = captured_bodies.clone();
                         let pages = pages.clone();
                         let statuses = statuses.clone();
                         async move {
@@ -73,9 +89,15 @@ async fn execute(
                                 request.headers()[http::header::AUTHORIZATION],
                                 "Bearer synthetic-token"
                             );
+                            let method_uri = format!("{} {}", request.method(), request.uri());
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            captured_bodies
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8(body.to_vec()).unwrap());
                             let mut requests = captured.lock().unwrap();
                             let index = requests.len();
-                            requests.push(format!("{} {}", request.method(), request.uri()));
+                            requests.push(method_uri);
                             let page = pages
                                 .get(index)
                                 .cloned()
@@ -105,6 +127,7 @@ async fn execute(
         "delete" => vec!["tunnel", "delete"],
         "cleanup" => vec!["tunnel", "cleanup"],
         "token" => vec!["tunnel", "token"],
+        "create" => vec!["tunnel", "create"],
         _ => unreachable!(),
     };
     let mut native = directory.command(env!("CARGO_BIN_EXE_cloudflared"));
@@ -125,7 +148,8 @@ async fn execute(
     server.abort();
     let _ = server.await;
     let requests = requests.lock().unwrap().clone();
-    (output, requests)
+    let bodies = bodies.lock().unwrap().clone();
+    (output, requests, bodies)
 }
 
 fn page(rows: Value) -> Value {
@@ -372,6 +396,315 @@ async fn malformed_api_token_errors_hide_payload_and_extra_arguments_make_no_req
     .await;
     assert_eq!(output.status.code(), Some(255));
     assert!(requests.is_empty());
+}
+
+struct CreateCase {
+    args: Vec<String>,
+    mode: &'static str,
+    pages: Vec<Value>,
+    statuses: Vec<u16>,
+}
+
+fn create_cases() -> Vec<CreateCase> {
+    let id = "11111111-1111-1111-1111-111111111111";
+    let secret = STANDARD.encode([b'x'; 32]);
+    let row = json!({"id":id,"name":"returned","token":"synthetic-output-token"});
+    let response = |row| json!({"success":true,"result":row});
+    let error = json!({"success":false,"errors":[{"code":1000,"message":format!("synthetic failure {secret} synthetic-token")}]});
+    let mut cases = Vec::new();
+    for value in [
+        row.clone(),
+        json!({"id":id,"name":"<&>\u{2028}","token":"<&>\u{2029}","created_at":"2026-10-07T01:02:03.123456789+02:00","connections":[{"id":id,"colo_name":"fixture","origin_ip":"192.0.2.1","opened_at":"2026-10-07T01:02:03Z"}],"unknown":"discard"}),
+    ] {
+        for format in ["", "json", "yaml", "invalid-format"] {
+            for mode in ["", "absent"] {
+                let mut args = vec!["--secret".into(), secret.clone()];
+                if !format.is_empty() {
+                    args.extend(["--output".into(), format.into()]);
+                }
+                args.push("requested".into());
+                cases.push(CreateCase {
+                    args,
+                    mode,
+                    pages: vec![response(value.clone())],
+                    statuses: vec![],
+                });
+            }
+        }
+    }
+    for mode in ["existing", "missing-parent", "directory"] {
+        for rollback_error in [false, true] {
+            cases.push(CreateCase {
+                args: vec!["--secret".into(), secret.clone(), "requested".into()],
+                mode,
+                pages: vec![
+                    response(row.clone()),
+                    if rollback_error {
+                        error.clone()
+                    } else {
+                        json!({"success":true})
+                    },
+                ],
+                statuses: vec![200, if rollback_error { 500 } else { 200 }],
+            });
+        }
+    }
+    for (value, status) in [
+        (error, 500),
+        (json!({"success":false}), 409),
+        (
+            response(json!({"id":"DO-NOT-ECHO-ID","name":"returned"})),
+            200,
+        ),
+    ] {
+        cases.push(CreateCase {
+            args: vec!["--secret".into(), secret.clone(), "requested".into()],
+            mode: "absent",
+            pages: vec![value],
+            statuses: vec![status],
+        });
+    }
+    for encoded in [
+        secret.replace('=', "\r\n="),
+        secret.replace("Hg=", "Hh="),
+        STANDARD.encode([b'x'; 31]),
+        "DO-NOT-ECHO-SECRET".into(),
+        secret.replace('=', ""),
+    ] {
+        cases.push(CreateCase {
+            args: vec!["--secret".into(), encoded, "requested".into()],
+            mode: "absent",
+            pages: vec![response(row.clone())],
+            statuses: vec![],
+        });
+    }
+    for names in [vec![], vec!["requested", "extra"], vec![id], vec![""]] {
+        let mut args = vec!["--secret".into(), secret.clone()];
+        args.extend(names.into_iter().map(str::to_owned));
+        cases.push(CreateCase {
+            args,
+            mode: "absent",
+            pages: vec![],
+            statuses: vec![],
+        });
+    }
+    cases
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires pinned Go administration oracle; run scripts/test-interop.sh"]
+async fn go_administration_create_execution_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    for (index, case) in create_cases().into_iter().enumerate() {
+        let directory = Directory::new();
+        let credential = directory.0.join(match case.mode {
+            "" => "11111111-1111-1111-1111-111111111111.json",
+            "missing-parent" => "missing/credentials.json",
+            _ => "credentials.json",
+        });
+        match case.mode {
+            "existing" => {
+                std::fs::write(&credential, b"preserved").unwrap();
+                std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o400))
+                    .unwrap();
+            }
+            "directory" => std::fs::create_dir(&credential).unwrap(),
+            _ => {}
+        }
+        let input = directory.0.join("input.json");
+        std::fs::write(&input, serde_json::to_vec(&json!({"command":"create","args":case.args,"pages":case.pages,"statuses":case.statuses,"file_mode":case.mode})).unwrap()).unwrap();
+        let source = directory
+            .command(
+                std::env::var_os("CLOUDFLARED_GO_ADMIN_ORACLE")
+                    .expect("run scripts/test-interop.sh"),
+            )
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(
+            source.status.success(),
+            "create source {index}: {}",
+            String::from_utf8_lossy(&source.stderr)
+        );
+        let source: Value = serde_json::from_slice(&source.stdout).unwrap();
+        let mut args = vec!["--loglevel".into(), "fatal".into()];
+        if !case.mode.is_empty() {
+            args.extend([
+                "--credentials-file".into(),
+                credential.to_str().unwrap().into(),
+            ]);
+        }
+        args.extend(case.args);
+        let (native, requests, bodies) =
+            execute_with_bodies(&directory, "create", &args, case.pages, &case.statuses).await;
+        assert_eq!(
+            json!(requests),
+            source["requests"],
+            "create requests {index}"
+        );
+        let decoded = |bodies: Vec<String>| {
+            bodies
+                .into_iter()
+                .map(|body| {
+                    if body.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::from_str(&body).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_bodies: Vec<String> = serde_json::from_value(source["bodies"].clone()).unwrap();
+        assert_eq!(
+            decoded(bodies),
+            decoded(source_bodies),
+            "create bodies {index}"
+        );
+        assert_eq!(
+            native.status.code().unwrap(),
+            source["exit_code"].as_i64().unwrap() as i32,
+            "create exit {index}: {}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let stdout = String::from_utf8(native.stdout)
+            .unwrap()
+            .replace(directory.0.to_str().unwrap(), "<directory>");
+        if args.iter().any(|arg| arg == "yaml") && native.status.success() {
+            assert_eq!(
+                serde_yaml_ng::from_str::<Value>(&stdout).unwrap(),
+                serde_yaml_ng::from_str::<Value>(source["output"].as_str().unwrap()).unwrap(),
+                "create yaml {index}"
+            );
+        } else {
+            assert_eq!(stdout, source["output"], "create stdout {index}");
+        }
+        let stderr = String::from_utf8(native.stderr).unwrap();
+        for secret in [
+            STANDARD.encode([b'x'; 32]),
+            "synthetic-token".into(),
+            "DO-NOT-ECHO-SECRET".into(),
+            "DO-NOT-ECHO-ID".into(),
+        ] {
+            assert!(
+                !stderr.contains(&secret),
+                "create diagnostic leaked synthetic credential {index}"
+            );
+        }
+        if source["error"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic failure")
+        {
+            assert!(stderr.contains("synthetic failure"));
+            assert!(stderr.contains("[redacted]"));
+        }
+        if requests.len() == 2 {
+            assert!(requests[1].ends_with("?cascade=true"));
+            assert!(stderr.contains("Your tunnel 'returned' was created with ID"));
+            assert_eq!(
+                stderr.contains("The tunnel was deleted"),
+                case.statuses[1] == 200
+            );
+            assert_eq!(
+                stderr.contains("The delete tunnel error is:"),
+                case.statuses[1] != 200
+            );
+        }
+        assert_eq!(
+            credential.is_file(),
+            source["file_exists"].as_bool().unwrap(),
+            "create file {index}"
+        );
+        if credential.is_file() {
+            assert_eq!(
+                std::fs::read_to_string(&credential).unwrap(),
+                source["credentials"],
+                "create credential bytes {index}"
+            );
+            assert_eq!(
+                std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
+                source["file_perm"].as_u64().unwrap() as u32,
+                "create credential mode {index}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&directory.0).unwrap().count(),
+            4 + usize::from(credential.exists()),
+            "create temporary files {index}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_generated_secret_owns_file_and_api_identity() {
+    let directory = Directory::new();
+    let id = "11111111-1111-1111-1111-111111111111";
+    let (output, requests, bodies) = execute_with_bodies(
+        &directory,
+        "create",
+        &["requested".into()],
+        vec![json!({"success":true,"result":{"id":id,"name":"returned"}})],
+        &[],
+    )
+    .await;
+    assert!(output.status.success());
+    assert_eq!(
+        requests,
+        ["POST /client/v4/accounts/synthetic-account/cfd_tunnel"]
+    );
+    let body: Value = serde_json::from_str(&bodies[0]).unwrap();
+    let secret = body["tunnel_secret"].as_str().unwrap();
+    assert_eq!(STANDARD.decode(secret).unwrap().len(), 32);
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(directory.0.join(format!("{id}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(file["TunnelSecret"], secret);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Created tunnel returned")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_invalid_output_format_redacts_known_credentials_after_private_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let id = "11111111-1111-1111-1111-111111111111";
+    let secret = STANDARD.encode([b'x'; 32]);
+    for format in ["synthetic-token".to_owned(), secret.clone()] {
+        let directory = Directory::new();
+        let args = vec![
+            "--secret".into(),
+            secret.clone(),
+            "--output".into(),
+            format.clone(),
+            "requested".into(),
+        ];
+        let (output, requests) = execute(
+            &directory,
+            "create",
+            &args,
+            vec![json!({"success":true,"result":{"id":id,"name":"returned"}})],
+            &[],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            requests,
+            ["POST /client/v4/accounts/synthetic-account/cfd_tunnel"]
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("Unknown output format '[redacted]'"));
+        assert!(!stderr.contains(&format));
+        let file = directory.0.join(format!("{id}.json"));
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let credentials: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(credentials["TunnelSecret"], secret);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

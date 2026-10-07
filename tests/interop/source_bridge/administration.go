@@ -31,6 +31,8 @@ type RustAdministrationInput struct {
 type RustAdministrationOutput struct {
 	Queries      []string `json:"queries"`
 	Requests     []string `json:"requests"`
+	Bodies       []string `json:"bodies"`
+	Error        string   `json:"error"`
 	Output       string   `json:"output"`
 	Stderr       string   `json:"stderr"`
 	Failure      bool     `json:"failure"`
@@ -97,6 +99,8 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 		command = []string{"tunnel", "cleanup"}
 	case "token":
 		command = []string{"tunnel", "token"}
+	case "create":
+		command = []string{"tunnel", "create"}
 	default:
 		return RustAdministrationOutput{}, errors.New("unsupported synthetic command")
 	}
@@ -133,6 +137,9 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 		return RustAdministrationOutput{}, err
 	}
 	credentialPath := filepath.Join(directory, "credentials.json")
+	if input.Command == "create" && input.FileMode == "" {
+		credentialPath = filepath.Join(directory, "11111111-1111-1111-1111-111111111111.json")
+	}
 	switch input.FileMode {
 	case "", "absent":
 	case "existing":
@@ -148,17 +155,24 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	default:
 		return RustAdministrationOutput{}, errors.New("unsupported synthetic credential-file mode")
 	}
-	output := RustAdministrationOutput{Queries: []string{}, Requests: []string{}}
+	output := RustAdministrationOutput{Queries: []string{}, Requests: []string{}, Bodies: []string{}}
 	var mutex sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		if (request.Method != http.MethodGet && request.Method != http.MethodDelete) || !strings.HasPrefix(request.URL.Path, "/client/v4/accounts/synthetic-account/") {
+		create := input.Command == "create" && request.Method == http.MethodPost && request.URL.Path == "/client/v4/accounts/synthetic-account/cfd_tunnel"
+		if (!create && request.Method != http.MethodGet && request.Method != http.MethodDelete) || !strings.HasPrefix(request.URL.Path, "/client/v4/accounts/synthetic-account/") {
 			http.Error(w, "unexpected synthetic request", http.StatusBadRequest)
 			return
 		}
 		output.Queries = append(output.Queries, request.URL.RawQuery)
 		output.Requests = append(output.Requests, request.Method+" "+request.URL.RequestURI())
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(w, "synthetic body read failed", http.StatusBadRequest)
+			return
+		}
+		output.Bodies = append(output.Bodies, string(body))
 		index := len(output.Queries) - 1
 		if index >= len(input.Pages) {
 			http.Error(w, "unexpected page", http.StatusBadRequest)
@@ -184,7 +198,7 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	if input.Command == "delete" {
 		args = append(args, "--credentials-file", credentialPath)
 	}
-	if input.Command == "token" && input.FileMode != "" {
+	if (input.Command == "token" || input.Command == "create") && input.FileMode != "" {
 		args = append(args, "--credentials-file", credentialPath)
 	}
 	args = append(args, input.Args...)
@@ -218,12 +232,13 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	errorReader.Close()
 	output.Failure = err != nil
 	if err != nil {
+		output.Error = err.Error()
 		output.ExitCode = 1
 		if exit, ok := err.(cli.ExitCoder); ok {
 			output.ExitCode = exit.ExitCode() & 255
 		}
 	}
-	if input.FileMode != "" {
+	if input.FileMode != "" || input.Command == "create" {
 		if stat, err := os.Stat(credentialPath); err == nil && stat.Mode().IsRegular() {
 			output.FileExists = true
 			output.FilePerm = uint32(stat.Mode().Perm())
@@ -233,6 +248,11 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 			}
 			output.Credentials = string(body)
 		}
+	}
+	if input.Command == "create" {
+		output.Output = strings.ReplaceAll(output.Output, directory, "<directory>")
+		output.Error = strings.ReplaceAll(output.Error, directory, "<directory>")
+		output.Stderr = strings.ReplaceAll(output.Stderr, directory, "<directory>")
 	}
 	return output, nil
 }

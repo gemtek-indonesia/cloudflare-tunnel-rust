@@ -39,18 +39,17 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
     let client = AccountClient::new(cert, invocation.string("api-url"))?;
     match invocation.command.as_str() {
         "tunnel create" => {
-            let name = argument(&invocation, 0, "tunnel name")?;
             if invocation.args.len() != 1 {
-                bail!("cloudflared tunnel create requires exactly one tunnel name");
+                return Err(crate::cli::ExitFailure { code: 255, message: "\"cloudflared tunnel create\" requires exactly 1 argument, the name of tunnel to create.\nSee 'cloudflared tunnel create --help'.".into() }.into());
             }
+            let name = &invocation.args[0];
             let secret = if invocation.string("secret").is_empty() {
                 let mut data = vec![0; 32];
                 boring::rand::rand_bytes(&mut data)?;
                 data
             } else {
-                STANDARD
-                    .decode(invocation.string("secret"))
-                    .context("invalid base64 tunnel secret")?
+                models::decode_api_base64(invocation.string("secret"))
+                    .map_err(|_| anyhow::anyhow!("Couldn't decode tunnel secret from base64"))?
             };
             if secret.len() < 32 {
                 bail!("Decoded tunnel secret must be at least 32 bytes long");
@@ -63,14 +62,28 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
                 &cert_path,
             )
             .await?;
-            let id = created.tunnel_id;
-            if output_format(&invocation).is_some() {
-                render(&invocation, &tunnel)?;
-            } else {
-                println!(
-                    "Tunnel credentials written to {}. Keep this file secret.\n\nCreated tunnel {name} with id {id}",
-                    path.display()
-                );
+            match output::format(&invocation) {
+                "json" => print!("{}", output::json(&tunnel)?),
+                "yaml" => print!("{}", yaml::created_tunnel(&tunnel)?),
+                "" => {
+                    let source = if invocation.string("credentials-file").is_empty() {
+                        " cloudflared chose this file based on where your origin certificate was found."
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "Tunnel credentials written to {}.{source} Keep this file secret. To revoke these credentials, delete the tunnel.\n\nCreated tunnel {} with id {}",
+                        path.display(),
+                        tunnel.tunnel.name,
+                        created.tunnel_id
+                    );
+                }
+                format => bail!(
+                    "{}",
+                    client
+                        .redact(&format!("Unknown output format '{format}'"))
+                        .replace(&STANDARD.encode(&created.tunnel_secret), "[redacted]")
+                ),
             }
         }
         "tunnel list" => {
@@ -210,12 +223,11 @@ async fn create_with_credentials(
     secret: Vec<u8>,
     explicit_path: &str,
     cert_path: &std::path::Path,
-) -> Result<(Value, crate::config::Credentials, PathBuf)> {
-    let tunnel = client.create(name, &secret).await?;
-    let id: Uuid = tunnel["id"]
-        .as_str()
-        .context("API returned no tunnel ID")?
-        .parse()?;
+) -> Result<(models::TunnelWithToken, crate::config::Credentials, PathBuf)> {
+    let tunnel: models::TunnelWithToken =
+        serde_json::from_value(client.create(name, &secret).await?)
+            .map_err(|_| anyhow::anyhow!("invalid Create Tunnel API response"))?;
+    let id = tunnel.tunnel.id;
     let path = if explicit_path.is_empty() {
         cert_path
             .parent()
@@ -224,18 +236,22 @@ async fn create_with_credentials(
     } else {
         expanded(explicit_path)?
     };
-    let body = serde_json::to_vec(
-        &json!({"AccountTag":client.account(),"TunnelSecret":STANDARD.encode(&secret),"TunnelID":id,"Endpoint":client.endpoint()}),
-    )?;
-    if let Err(error) = credentials::atomic_create(&path, &body, 0o400) {
-        let rollback = client.delete(id, true).await;
+    let body = models::credentials_json(client.account(), Some(&secret), id, client.endpoint())?;
+    if let Err(error) = credentials::atomic_create(&path, body.as_bytes(), 0o400) {
+        let mut message = format!(
+            "Your tunnel '{}' was created with ID {id}. However, cloudflared couldn't write tunnel credentials to {}.\nThe file-writing error is: {error}\n",
+            tunnel.tunnel.name,
+            path.display()
+        );
+        match client.delete(id, true).await {
+            Ok(()) => message.push_str("The tunnel was deleted, because the tunnel can't be run without the credentials file"),
+            Err(error) => message.push_str(&format!("Cloudflared tried to delete the tunnel for you, but encountered an error. You should use `cloudflared tunnel delete {id}` to delete the tunnel yourself, because the tunnel can't be run without the tunnelfile.\nThe delete tunnel error is: {error}")),
+        }
         bail!(
-            "Tunnel {id} was created but credentials could not be saved: {error}. Cleanup {}.",
-            if rollback.is_ok() {
-                "deleted the tunnel"
-            } else {
-                "failed; delete the tunnel manually"
-            }
+            "{}",
+            client
+                .redact(&message)
+                .replace(&STANDARD.encode(&secret), "[redacted]")
         );
     }
     Ok((

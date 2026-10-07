@@ -3,7 +3,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{NaiveDateTime, Timelike};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-fn decode_api_base64(value: &str) -> Result<Vec<u8>> {
+pub(super) fn decode_api_base64(value: &str) -> Result<Vec<u8>> {
     const ENGINE: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
         &base64::alphabet::STANDARD,
         base64::engine::general_purpose::PAD.with_decode_allow_trailing_bits(true),
@@ -18,12 +18,12 @@ fn decode_api_base64(value: &str) -> Result<Vec<u8>> {
         .map_err(|_| anyhow::anyhow!("Provided Tunnel token is not valid."))
 }
 
-fn serialize_api_secret<S: Serializer>(
-    secret: &Option<Vec<u8>>,
+fn serialize_api_secret<S: Serializer, T: AsRef<[u8]>>(
+    secret: &Option<T>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     match secret {
-        Some(secret) => serializer.serialize_str(&STANDARD.encode(secret)),
+        Some(secret) => serializer.serialize_str(&STANDARD.encode(secret.as_ref())),
         None => serializer.serialize_none(),
     }
 }
@@ -109,24 +109,38 @@ impl ApiTunnelToken {
         Ok(STANDARD.encode(serde_json::to_vec(self)?))
     }
     pub fn credentials(&self) -> Result<String> {
-        #[derive(Serialize)]
-        struct File<'a> {
-            #[serde(rename = "AccountTag")]
-            account: &'a str,
-            #[serde(rename = "TunnelSecret", serialize_with = "serialize_api_secret")]
-            secret: &'a Option<Vec<u8>>,
-            #[serde(rename = "TunnelID")]
-            id: uuid::Uuid,
-            #[serde(rename = "Endpoint")]
-            endpoint: &'a str,
-        }
-        super::output::compact_json(&File {
-            account: &self.account_tag,
-            secret: &self.tunnel_secret,
-            id: self.tunnel_id,
-            endpoint: &self.endpoint,
-        })
+        credentials_json(
+            &self.account_tag,
+            self.tunnel_secret.as_deref(),
+            self.tunnel_id,
+            &self.endpoint,
+        )
     }
+}
+
+pub(super) fn credentials_json(
+    account: &str,
+    secret: Option<&[u8]>,
+    id: uuid::Uuid,
+    endpoint: &str,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct File<'a> {
+        #[serde(rename = "AccountTag")]
+        account: &'a str,
+        #[serde(rename = "TunnelSecret", serialize_with = "serialize_api_secret")]
+        secret: Option<&'a [u8]>,
+        #[serde(rename = "TunnelID")]
+        id: uuid::Uuid,
+        #[serde(rename = "Endpoint")]
+        endpoint: &'a str,
+    }
+    super::output::compact_json(&File {
+        account,
+        secret,
+        id,
+        endpoint,
+    })
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -313,6 +327,15 @@ pub(super) struct Tunnel {
     pub created_at: ApiTime,
     pub deleted_at: ApiTime,
     pub connections: Option<Vec<Connection>>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(super) struct TunnelWithToken {
+    #[serde(flatten)]
+    pub tunnel: Tunnel,
+    #[serde(deserialize_with = "null_default")]
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

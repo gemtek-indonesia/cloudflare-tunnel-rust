@@ -85,6 +85,9 @@ impl AccountClient {
     pub fn endpoint(&self) -> &str {
         &self.credentials.endpoint
     }
+    pub(super) fn redact(&self, message: &str) -> String {
+        message.replace(&self.credentials.api_token, "[redacted]")
+    }
     fn path(&self, suffix: &str) -> String {
         format!("accounts/{}/{suffix}", self.credentials.account_id)
     }
@@ -154,10 +157,7 @@ impl AccountClient {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            bail!(
-                "{}",
-                message.replace(&self.credentials.api_token, "[redacted]")
-            );
+            bail!("{}", self.redact(&message));
         }
         if status == http::StatusCode::CONFLICT {
             bail!("tunnel with name already exists");
@@ -268,7 +268,27 @@ impl AccountClient {
         if name.is_empty() || Uuid::parse_str(name).is_ok() {
             bail!("tunnel name required; UUIDs cannot be tunnel names");
         }
-        let v=self.request(http::Method::POST,&self.path("cfd_tunnel"),&[],Some(json!({"name":name,"tunnel_secret":base64::engine::general_purpose::STANDARD.encode(secret)})),true).await?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
+        let v = self
+            .request(
+                http::Method::POST,
+                &self.path("cfd_tunnel"),
+                &[],
+                Some(json!({"name":name,"tunnel_secret":encoded})),
+                true,
+            )
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                anyhow::anyhow!(
+                    "{}",
+                    if encoded.is_empty() {
+                        message
+                    } else {
+                        message.replace(&encoded, "[redacted]")
+                    }
+                )
+            })?;
         Ok(v["result"].clone())
     }
     pub async fn tunnel(&self, id: Uuid) -> Result<Value> {
