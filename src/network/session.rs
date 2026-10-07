@@ -27,6 +27,16 @@ struct Route {
     sender: QuicSender,
     cancel: CancellationToken,
 }
+struct MigrationRequest {
+    route: Route,
+    accepted: tokio::sync::oneshot::Sender<()>,
+}
+struct PendingMigration {
+    requests: mpsc::Sender<MigrationRequest>,
+    route: Route,
+    session_cancel: CancellationToken,
+    activity: watch::Sender<Instant>,
+}
 struct Session {
     generation: u64,
     socket: Arc<tokio::net::UdpSocket>,
@@ -38,6 +48,20 @@ struct Session {
     version: DatagramVersion,
     started: tokio::sync::Notify,
     metrics: Arc<crate::observability::metrics::Metrics>,
+    migrations: Option<mpsc::Sender<MigrationRequest>>,
+    #[cfg(test)]
+    write_fault: Mutex<Option<OriginWriteFault>>,
+}
+#[cfg(test)]
+pub(super) enum OriginWriteOutcome {
+    Send,
+    Short(usize),
+    Error(std::io::Error),
+}
+#[cfg(test)]
+struct OriginWriteFault {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<OriginWriteOutcome>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum RegistrationKind {
@@ -51,6 +75,32 @@ struct V3Registration {
     registry: Weak<Registry>,
     id: [u8; 16],
     owns_pending_creation: bool,
+    migration: Option<PendingMigration>,
+}
+impl V3Registration {
+    async fn accept_migration(&mut self) -> Result<()> {
+        let Some(migration) = self.migration.take() else {
+            return Ok(());
+        };
+        let attempt_cancel = migration.route.cancel.clone();
+        let (accepted, acceptance) = tokio::sync::oneshot::channel();
+        tokio::select! {
+            biased;
+            _ = attempt_cancel.cancelled() => anyhow::bail!("migration attempt canceled"),
+            _ = migration.session_cancel.cancelled() => anyhow::bail!("migration session closed"),
+            result = migration.requests.send(MigrationRequest { route: migration.route, accepted }) => {
+                result.map_err(|_| anyhow::anyhow!("migration session closed"))?;
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = attempt_cancel.cancelled() => anyhow::bail!("migration attempt canceled"),
+            _ = migration.session_cancel.cancelled() => anyhow::bail!("migration session closed"),
+            result = acceptance => result.map_err(|_| anyhow::anyhow!("migration session closed"))?,
+        }
+        migration.activity.send_replace(Instant::now());
+        Ok(())
+    }
 }
 impl Drop for V3Registration {
     fn drop(&mut self) {
@@ -62,6 +112,25 @@ impl Drop for V3Registration {
     }
 }
 impl Session {
+    async fn send_origin(&self, payload: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        {
+            let fault = self.write_fault.lock().unwrap().take();
+            if let Some(fault) = fault {
+                let _ = fault.entered.send(());
+                match fault
+                    .release
+                    .await
+                    .map_err(|_| std::io::Error::other("origin write gate closed"))?
+                {
+                    OriginWriteOutcome::Send => {}
+                    OriginWriteOutcome::Short(n) => return Ok(n),
+                    OriginWriteOutcome::Error(error) => return Err(error),
+                }
+            }
+        }
+        self.socket.send(payload).await
+    }
     fn untrack(&self) {
         if self.version == DatagramVersion::V2 {
             self.metrics.udp_active_sessions.dec();
@@ -82,6 +151,25 @@ impl Drop for Registry {
     }
 }
 impl Registry {
+    #[cfg(test)]
+    pub(super) fn gate_next_origin_write(
+        &self,
+        id: [u8; 16],
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<OriginWriteOutcome>,
+    ) {
+        let session = self.sessions.lock().unwrap().get(&id).cloned().unwrap();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, outcome) = tokio::sync::oneshot::channel();
+        let mut fault = session.write_fault.lock().unwrap();
+        assert!(fault.is_none(), "origin write gate already armed");
+        *fault = Some(OriginWriteFault {
+            entered,
+            release: outcome,
+        });
+        (observed, release)
+    }
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.sessions.lock().unwrap().len()
@@ -130,6 +218,12 @@ impl Registry {
             cancel: connection.cancel.clone(),
         });
         let (activity, _) = watch::channel(Instant::now());
+        let (migrations, migration_requests) = if connection.version == DatagramVersion::V3 {
+            let (sender, receiver) = mpsc::channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let session = Arc::new(Session {
             generation: self.generation.fetch_add(1, Ordering::Relaxed),
             socket,
@@ -141,6 +235,9 @@ impl Registry {
             version: connection.version,
             started: tokio::sync::Notify::new(),
             metrics: connection.state.context.metrics.clone(),
+            migrations,
+            #[cfg(test)]
+            write_fault: Mutex::new(None),
         });
         let previous = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -160,26 +257,15 @@ impl Registry {
         }
         let registry = Arc::downgrade(self);
         let weak = Arc::downgrade(&connection);
+        let context = connection.state.context.clone();
         let actor = session.clone();
+        let initial_route = session.route.borrow().clone();
         tokio::task::spawn_local(async move {
             if !start_immediately {
-                let mut pending_route = actor.route.subscribe();
-                let started = loop {
-                    let target = pending_route.borrow().clone();
-                    tokio::select! {
-                        _ = actor.started.notified() => break true,
-                        _ = actor.cancel.cancelled() => break false,
-                        result = pending_route.changed() => {
-                            if result.is_err() {
-                                break false;
-                            }
-                        },
-                        _ = target.cancel.cancelled() => {
-                            if pending_route.borrow().generation == target.generation {
-                                break false;
-                            }
-                        }
-                    }
+                let started = tokio::select! {
+                    _ = actor.started.notified() => true,
+                    _ = actor.cancel.cancelled() => false,
+                    _ = initial_route.cancel.cancelled() => false,
                 };
                 if !started {
                     if let Some(registry) = registry.upgrade() {
@@ -188,7 +274,30 @@ impl Registry {
                     return;
                 }
             }
-            serve(registry, weak, id, actor, receiver, permit, idle).await;
+            if actor.version == DatagramVersion::V3 {
+                let result = V3Lifecycle {
+                    registry,
+                    id,
+                    session: actor,
+                    input: receiver,
+                    migrations: migration_requests.expect("V3 session owns migration receiver"),
+                    permit,
+                    idle,
+                    target: initial_route,
+                }
+                .run()
+                .await;
+                if let Err(error) = result {
+                    let _ = context.logger.log(
+                        crate::observability::logging::Level::Error,
+                        crate::observability::logging::Event::Udp,
+                        "UDP flow closed with an error",
+                        serde_json::json!({"error": error.to_string()}),
+                    );
+                }
+            } else {
+                serve(registry, weak, id, actor, receiver, permit, idle).await;
+            }
         });
         Ok(session)
     }
@@ -218,26 +327,40 @@ impl Registry {
         let existing = self.sessions.lock().unwrap().get(&id).cloned();
         if let Some(session) = existing {
             let current = session.route.borrow().clone();
-            let kind = if current.index != connection.index
-                || current.generation != connection.generation
-            {
-                session.route.send_replace(Route {
+            let migrating =
+                current.index != connection.index || current.generation != connection.generation;
+            let migration = if migrating {
+                let route = Route {
                     index: connection.index,
                     generation: connection.generation,
                     sender: connection.sender.clone(),
                     cancel: connection.cancel.clone(),
-                });
-                session.activity.send_replace(Instant::now());
-                RegistrationKind::Migration
+                };
+                session.route.send_replace(route.clone());
+                Some(PendingMigration {
+                    requests: session
+                        .migrations
+                        .as_ref()
+                        .expect("V3 session owns migration sender")
+                        .clone(),
+                    route,
+                    session_cancel: session.cancel.clone(),
+                    activity: session.activity.clone(),
+                })
             } else {
-                RegistrationKind::Retry
+                None
             };
             return Ok(V3Registration {
                 generation: session.generation,
-                kind,
+                kind: if migrating {
+                    RegistrationKind::Migration
+                } else {
+                    RegistrationKind::Retry
+                },
                 registry: Arc::downgrade(self),
                 id,
                 owns_pending_creation: false,
+                migration,
             });
         }
         let session = self.create(connection, id, address, idle, false).await?;
@@ -247,6 +370,7 @@ impl Registry {
             registry: Arc::downgrade(self),
             id,
             owns_pending_creation: true,
+            migration: None,
         })
     }
     async fn response_completed(&self, id: [u8; 16], mut registration: V3Registration, sent: bool) {
@@ -287,6 +411,110 @@ impl Registry {
             }
         } else {
             let _ = session.input.try_send(payload);
+        }
+    }
+}
+
+struct V3Lifecycle {
+    registry: Weak<Registry>,
+    id: [u8; 16],
+    session: Arc<Session>,
+    input: mpsc::Receiver<Vec<u8>>,
+    migrations: mpsc::Receiver<MigrationRequest>,
+    permit: Permit,
+    idle: Duration,
+    target: Route,
+}
+impl V3Lifecycle {
+    async fn run(mut self) -> Result<()> {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn_local(v3_read(self.id, self.session.clone()));
+        workers.spawn_local(v3_write(self.session.clone(), self.input));
+        let mut activity = self.session.activity.subscribe();
+        let mut idle = IdleTimeout::new(DatagramVersion::V3, self.idle);
+        let outcome = loop {
+            tokio::select! {
+                _ = self.session.cancel.cancelled() => break Ok(()),
+                _ = self.target.cancel.cancelled() => break Ok(()),
+                _ = idle.expired() => break Ok(()),
+                completed = workers.join_next() => break match completed {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) => Err(error.into()),
+                    None => Ok(()),
+                },
+                result = activity.changed() => {
+                    if result.is_err() {
+                        break Ok(());
+                    }
+                    idle.mark_active(Instant::now());
+                }
+                request = self.migrations.recv() => {
+                    let Some(request) = request else {
+                        break Ok(());
+                    };
+                    if request.accepted.is_closed() || request.route.cancel.is_cancelled() {
+                        continue;
+                    }
+                    if request.accepted.send(()).is_ok() {
+                        self.target = request.route;
+                    }
+                }
+            }
+        };
+        self.session.cancel.cancel();
+        drop(self.migrations);
+        while workers.join_next().await.is_some() {}
+        if let Some(registry) = self.registry.upgrade() {
+            registry.remove_now(self.id, Some(self.session.generation));
+        }
+        drop(self.session);
+        drop(self.permit);
+        outcome
+    }
+}
+async fn v3_read(id: [u8; 16], session: Arc<Session>) -> Result<()> {
+    let mut buffer = [0; 1500];
+    loop {
+        let n = tokio::select! {
+            _ = session.cancel.cancelled() => return Ok(()),
+            result = session.socket.recv(&mut buffer) => result?,
+        };
+        if n > 1280 {
+            continue;
+        }
+        let bytes = DatagramV3::Payload {
+            id,
+            payload: buffer[..n].to_vec(),
+        }
+        .encode()
+        .map_err(anyhow::Error::msg)?;
+        let sender = session.route.borrow().sender.clone();
+        tokio::select! {
+            _ = session.cancel.cancelled() => return Ok(()),
+            result = sender.send_datagram(Bytes::from(bytes)) => result?,
+        }
+        session.activity.send_replace(Instant::now());
+    }
+}
+async fn v3_write(session: Arc<Session>, mut input: mpsc::Receiver<Vec<u8>>) -> Result<()> {
+    loop {
+        let payload = tokio::select! {
+            _ = session.cancel.cancelled() => return Ok(()),
+            payload = input.recv() => match payload {
+                Some(payload) => payload,
+                None => return Ok(()),
+            },
+        };
+        let sent = tokio::select! {
+            _ = session.cancel.cancelled() => return Ok(()),
+            result = tokio::time::timeout(Duration::from_millis(200), session.send_origin(&payload)) => result,
+        };
+        match sent {
+            Ok(Ok(n)) if n == payload.len() => {
+                session.activity.send_replace(Instant::now());
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            _ => {}
         }
     }
 }
@@ -527,7 +755,7 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
                 idle_seconds,
                 ..
             } => {
-                let result = connection
+                let mut result = connection
                     .state
                     .v3
                     .register_v3(
@@ -537,6 +765,9 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
                         Duration::from_secs(u64::from(idle_seconds)),
                     )
                     .await;
+                if let Ok(registration) = &mut result {
+                    registration.accept_migration().await?;
+                }
                 let response_type = match &result {
                     Ok(_) => 0,
                     Err(error) if error.downcast_ref::<super::TooManyFlows>().is_some() => 3,

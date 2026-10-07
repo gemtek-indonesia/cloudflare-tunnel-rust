@@ -161,6 +161,7 @@ pub struct QuicSender {
 }
 #[cfg(test)]
 struct DatagramFault {
+    kind: u8,
     entered: oneshot::Sender<()>,
     release: oneshot::Receiver<io::Result<()>>,
 }
@@ -169,11 +170,25 @@ impl QuicSender {
     pub(crate) fn gate_next_registration_datagram(
         &mut self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<io::Result<()>>) {
+        self.gate_next_datagram(3)
+    }
+    #[cfg(test)]
+    pub(crate) fn gate_next_payload_datagram(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<io::Result<()>>) {
+        self.gate_next_datagram(1)
+    }
+    #[cfg(test)]
+    fn gate_next_datagram(
+        &mut self,
+        kind: u8,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<io::Result<()>>) {
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let mut fault = self.datagram_fault.lock().unwrap();
         assert!(fault.is_none(), "datagram fault already armed");
         *fault = Some(DatagramFault {
+            kind,
             entered: entered_tx,
             release: release_rx,
         });
@@ -193,8 +208,18 @@ impl QuicSender {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         #[cfg(test)]
-        if payload.first() == Some(&3) {
-            let fault = self.datagram_fault.lock().unwrap().take();
+        {
+            let fault = {
+                let mut slot = self.datagram_fault.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|fault| payload.first() == Some(&fault.kind))
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
             if let Some(fault) = fault {
                 let _ = fault.entered.send(());
                 tokio::select! {

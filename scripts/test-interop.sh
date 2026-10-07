@@ -55,6 +55,7 @@ cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connectio
 cp "${repo_dir}/tests/interop/udp_v2_lifecycle_test.go" "${scratch}/connection/udp_v2_lifecycle_test.go"
 cp "${repo_dir}/tests/interop/udp_v2_cadence_test.go" "${scratch}/datagramsession/udp_v2_cadence_test.go"
 cp "${repo_dir}/tests/interop/udp_v3_ack_test.go" "${scratch}/connection/udp_v3_ack_test.go"
+cp "${repo_dir}/tests/interop/udp_v3_duplex_test.go" "${scratch}/connection/udp_v3_duplex_test.go"
 cp "${repo_dir}/tests/interop/udp_v3_clock_test.go" "${scratch}/quic/v3/udp_v3_clock_test.go"
 cp "${repo_dir}/tests/interop/global_shutdown_test.go" "${scratch}/connection/global_shutdown_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/shutdown.go" "${scratch}/cmd/cloudflared/tunnel/rust_shutdown_exports.go"

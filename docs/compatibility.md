@@ -60,7 +60,6 @@ Default HTTP clients use source connect, TLS and idle-timeout settings, with two
 
 ## Known behavioral gaps
 
-* UDPv3 acknowledges a migration while the creator's first response is pending; pinned Go delays that acknowledgment until its session loop accepts migration. A canceled creator's matching session generation is retired, while exact migration acknowledgment ordering remains incomplete.
 * Certificates encoding IPv4-mapped addresses as 16-byte IP SANs are rejected, while Go treats them as IPv4 equivalents. Ordinary and mapped references verify against standard 4-byte IPv4 SANs. [TLS name tests](../src/crypto/name_tests.rs) preserve this fail-closed difference.
 * Automatic redirects remain incomplete for login/Access transfer polling and `tunnel ready`. Access/JWKS discovery and broker requests retain their source-specific redirect restrictions.
 * Automatic gzip negotiation and decoding are incomplete.

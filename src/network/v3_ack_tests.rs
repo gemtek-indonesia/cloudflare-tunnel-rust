@@ -1,4 +1,24 @@
 use super::*;
+use futures::FutureExt;
+
+pub(super) async fn pending_migration(
+    pair: &mut Pair,
+    id: [u8; 16],
+    destination: SocketAddr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>> {
+    pair.peer
+        .send_datagram(Bytes::from(registration(id, destination)))
+        .await
+        .unwrap();
+    let bytes = timeout(Duration::from_secs(1), pair.received.datagrams.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let connection = pair.connection.clone();
+    let mut request = Box::pin(async move { connection.handle(bytes).await });
+    assert!(request.as_mut().now_or_never().is_none());
+    request
+}
 
 fn registration(id: [u8; 16], destination: SocketAddr) -> Vec<u8> {
     DatagramV3::Registration {
@@ -337,7 +357,7 @@ async fn successful_duplicate_response_cannot_start_flow_before_creator_response
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn canceled_creator_retires_pending_session_after_migration_response() {
+async fn canceled_creator_retires_pending_session_without_migration_response() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let config = crate::runtime::tests::config();
@@ -360,14 +380,15 @@ async fn canceled_creator_retires_pending_session_after_migration_response() {
                 .await
                 .unwrap()
                 .unwrap();
-            migrated.send(registration(id, destination)).await;
-            assert!(matches!(
-                DatagramV3::decode(&migrated.receive().await).unwrap(),
-                DatagramV3::Response {
-                    response_type: 0,
-                    ..
-                }
-            ));
+            let mut migration = pending_migration(&mut migrated, id, destination).await;
+            assert!(
+                timeout(
+                    Duration::from_millis(30),
+                    migrated.incoming.datagrams.recv()
+                )
+                .await
+                .is_err()
+            );
             assert_eq!(state.v3.len(), 1);
             creator.scope.cancellation().cancel();
             timeout(Duration::from_secs(1), &mut worker.0)
@@ -376,6 +397,20 @@ async fn canceled_creator_retires_pending_session_after_migration_response() {
                 .unwrap()
                 .unwrap();
             assert!(release.send(Ok(())).is_err());
+            assert!(
+                timeout(Duration::from_secs(1), &mut migration)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                timeout(
+                    Duration::from_millis(30),
+                    migrated.incoming.datagrams.recv()
+                )
+                .await
+                .is_err()
+            );
             timeout(Duration::from_millis(300), drained(&state))
                 .await
                 .expect(
@@ -417,15 +452,14 @@ async fn retired_creator_cleanup_preserves_replacement_generation() {
                 .await
                 .unwrap()
                 .unwrap();
-            migrated.send(registration(id, destination)).await;
-            assert!(matches!(
-                DatagramV3::decode(&migrated.receive().await).unwrap(),
-                DatagramV3::Response {
-                    response_type: 0,
-                    ..
-                }
-            ));
-            migrated.scope.cancellation().cancel();
+            let mut migration = pending_migration(&mut migrated, id, destination).await;
+            state.v3.remove(id, None).await;
+            assert!(
+                timeout(Duration::from_secs(1), &mut migration)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
             drained(&state).await;
             replacement.send(registration(id, destination)).await;
             assert!(matches!(
