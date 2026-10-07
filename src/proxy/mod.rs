@@ -1,6 +1,8 @@
 mod body;
 mod hello;
 mod origin;
+#[cfg(test)]
+pub(crate) mod tag_test_origin;
 mod tcp;
 #[cfg(test)]
 mod tests;
@@ -34,6 +36,7 @@ struct Snapshot {
 }
 
 pub struct ProxyState {
+    tags: Vec<(HeaderName, HeaderValue)>,
     snapshot: RwLock<Snapshot>,
     normalize: bool,
     observability: Arc<crate::observability::Context>,
@@ -41,18 +44,29 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(config: &RunConfig) -> Result<Self> {
-        Self::with_context(config, crate::observability::Context::quiet()?)
+    pub fn new(config: &RunConfig, connector_id: uuid::Uuid) -> Result<Self> {
+        Self::with_context(
+            config,
+            crate::observability::Context::quiet()?,
+            connector_id,
+        )
     }
 
     pub fn with_context(
         config: &RunConfig,
         observability: Arc<crate::observability::Context>,
+        connector_id: uuid::Uuid,
     ) -> Result<Self> {
         let mut configuration = config.configuration.clone();
         configuration.ingress = config.ingress.clone();
         configuration.origin_request = config.origin_request.clone();
+        let mut tags = config.tags.clone();
+        tags.push((
+            HeaderName::from_static("cf-warp-tag-id"),
+            HeaderValue::from_str(&connector_id.to_string())?,
+        ));
         Ok(Self {
+            tags,
             snapshot: RwLock::new(Self::build(configuration)?),
             normalize: !config.disable_path_normalization,
             observability,
@@ -72,11 +86,12 @@ impl ProxyState {
             .ingress
             .iter()
             .map(|rule| {
-                Origin::new(
-                    &rule.service,
-                    configuration.origin_request.merged(&rule.origin_request),
-                )
-                .map(Arc::new)
+                let mut settings = configuration.origin_request.merged(&rule.origin_request);
+                if rule.service == "socks-proxy" {
+                    // Dedicated SOCKS access policy uses the rule's own IP rules.
+                    settings.ip_rules = rule.origin_request.ip_rules.clone();
+                }
+                Origin::new(&rule.service, settings).map(Arc::new)
             })
             .collect::<Result<Vec<_>>>()?;
         configuration.settings.clear();
@@ -395,6 +410,9 @@ async fn proxy_inner(
             sink.data(response.body).await?;
         }
         return Ok(());
+    }
+    for (name, value) in &state.tags {
+        head.headers.append(name, value.clone());
     }
     let origin = state.select(&head).await?;
     if origin

@@ -504,7 +504,16 @@ async fn run_with_shutdown(
     let pool = Arc::new(Mutex::new(pool));
     let context =
         crate::observability::Context::new(config.logging.clone(), config.known_secrets.clone())?;
-    let proxy = Arc::new(ProxyState::with_context(&config, context.clone())?);
+    let mut random = [0; 16];
+    boring::rand::rand_bytes(&mut random)?;
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let client_id = Uuid::from_bytes(random);
+    let proxy = Arc::new(ProxyState::with_context(
+        &config,
+        context.clone(),
+        client_id,
+    )?);
     let network = crate::network::NetworkState::with_context(&config, context.clone())?;
     let selector = Arc::new(features::FeatureSelector::new(
         &config.credentials.account_tag,
@@ -512,10 +521,6 @@ async fn run_with_shutdown(
         config.post_quantum,
     ));
     tokio::select! {_=shutdown.cancelled()=>return Ok(()),result=selector.refresh()=>if let Err(error)=result{eprintln!("Failed to fetch features, default to disable: {error}");}}
-    let mut random = [0; 16];
-    boring::rand::rand_bytes(&mut random)?;
-    random[6] = (random[6] & 0x0f) | 0x40;
-    random[8] = (random[8] & 0x3f) | 0x80;
     let (events, event_rx) = mpsc::unbounded_channel();
     let readiness = Arc::new(Readiness {
         slots: Mutex::new(HashMap::new()),
@@ -525,7 +530,6 @@ async fn run_with_shutdown(
     let mut configuration = config.configuration.clone();
     configuration.ingress = config.ingress.clone();
     configuration.origin_request = config.origin_request.clone();
-    let client_id = Uuid::from_bytes(random);
     let management = Arc::new(crate::observability::management::Service::new(
         context.clone(),
         client_id,

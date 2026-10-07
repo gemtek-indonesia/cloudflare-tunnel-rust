@@ -213,6 +213,15 @@ func main() {
 		panic("oracle mode argument required")
 	}
 	switch os.Args[1] {
+	case "tags":
+		var vectors [][]string
+		must(json.Unmarshal([]byte(os.Args[2]), &vectors))
+		results := make([]map[string]any, 0, len(vectors))
+		for _, vector := range vectors {
+			tags, err := cftunnel.NewTagSliceFromCLI(vector)
+			results = append(results, map[string]any{"valid": err == nil, "tags": tags})
+		}
+		must(json.NewEncoder(os.Stdout).Encode(results))
 	case "watcher":
 		watcherCorpus(os.Args[2])
 	case "access-url":

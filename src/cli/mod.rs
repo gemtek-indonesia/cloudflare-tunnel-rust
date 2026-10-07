@@ -171,6 +171,7 @@ impl Invocation {
         let mut positional: Vec<String> = Vec::new();
         let mut args = args.into_iter();
         let mut flags_done = false;
+        let mut tag_scope = None;
         while let Some(arg) = args.next() {
             if positional.len() >= 2
                 && ["access", "forward"].contains(&positional[0].as_str())
@@ -228,11 +229,30 @@ impl Invocation {
                         .with_context(|| format!("--{} requires a value", flag.name))?
                 };
                 validate_value(flag.name, kind, &value)?;
+                let next_tag_scope = if flag.name == "tag" {
+                    Some(if positional.is_empty() {
+                        0
+                    } else if positional.len() == 1 && positional[0] == "tunnel" {
+                        1
+                    } else {
+                        bail!("--tag must precede the tunnel subcommand");
+                    })
+                } else {
+                    None
+                };
                 let entry = values.entry(flag.name.to_owned()).or_default();
                 if kind != Kind::List {
                     entry.clear();
                 }
-                entry.extend(split_value(kind, &value));
+                if flag.name == "tag" {
+                    if tag_scope != next_tag_scope {
+                        entry.clear();
+                    }
+                    tag_scope = next_tag_scope;
+                    entry.push(value);
+                } else {
+                    entry.extend(split_value(kind, &value));
+                }
             } else {
                 positional.push(arg);
             }
@@ -340,6 +360,10 @@ impl Invocation {
                 flag.env
             };
             if let Some(value) = environment.iter().find_map(|key| env.get(*key)) {
+                if flag.name == "socks5" && value.is_empty() {
+                    values.insert(flag.name.to_owned(), vec!["false".into()]);
+                    continue;
+                }
                 validate_value(flag.name, flag.kind, value)?;
                 values.insert(flag.name.to_owned(), split_value(flag.kind, value));
                 specified.insert(flag.name.to_owned(), true);
@@ -347,6 +371,23 @@ impl Invocation {
                 && (!command.is_empty() || root_yaml_kind(flag.name).is_some())
                 && let Some(value) = configuration.settings.get(flag.name)
             {
+                if flag.name == "tag" {
+                    let tag_values = value
+                        .as_sequence()
+                        .context("invalid YAML type for tag")?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .context("invalid YAML type for tag")
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    values.insert(flag.name.to_owned(), tag_values);
+                    specified.insert(flag.name.to_owned(), true);
+                    source_flags_set = true;
+                    continue;
+                }
                 let value = if command.is_empty() {
                     root_yaml_value(flag.kind, value)
                 } else {
@@ -424,11 +465,7 @@ impl Invocation {
             return Ok(Action::Watch(self));
         }
         if ["", "tunnel", "tunnel run"].contains(&self.command.as_str()) {
-            for name in ["tag", "socks5"] {
-                if self.is_set(name) {
-                    bail!("--{name} forwarding is not implemented yet");
-                }
-            }
+            config::parse_tags(&self.list("tag"))?;
         }
         match self.command.as_str() {
             "tunnel ingress validate" => {
@@ -706,6 +743,7 @@ impl Invocation {
         )))
         .collect();
         Ok(RunConfig {
+            tags: config::parse_tags(&self.list("tag"))?,
             region: credentials
                 .endpoint
                 .clone()
@@ -909,6 +947,7 @@ impl Invocation {
             no_tls_verify: Some(self.bool("no-tls-verify")),
             disable_chunked_encoding: Some(self.bool("no-chunked-encoding")),
             http2_origin: Some(self.bool("http2-origin")),
+            proxy_type: self.is_set("socks5").then(|| "socks".into()),
             ..Default::default()
         })
     }
@@ -1290,10 +1329,10 @@ mod tests {
         assert!(help("").contains("may still be unimplemented"));
     }
     #[test]
-    fn unfinished_forwarding_flags_fail_before_credential_or_admin_effects() {
+    fn invalid_tags_fail_before_credential_or_admin_effects() {
         for arguments in [
-            vec!["tunnel", "run", "--tag", "key=value"],
-            vec!["tunnel", "--name", "synthetic", "--socks5=false"],
+            vec!["tunnel", "--tag", "key=", "run"],
+            vec!["tunnel", "--name", "synthetic", "--tag", "=DO-NOT-ECHO"],
         ] {
             let invocation = Invocation::parse(
                 arguments.into_iter().map(str::to_owned),
@@ -1302,7 +1341,101 @@ mod tests {
             )
             .unwrap();
             let error = invocation.action(None).err().unwrap();
-            assert!(error.to_string().contains("forwarding is not implemented"));
+            assert!(error.to_string().contains("Cannot parse tag value"));
+            assert!(!error.to_string().contains("DO-NOT-ECHO"));
         }
+    }
+
+    #[test]
+    fn tag_sources_and_socks_is_set_preserve_source_semantics() {
+        let home =
+            std::env::temp_dir().join(format!("cloudflared-tags-socks-{}", uuid::Uuid::new_v4()));
+        let directory = home.join(".cloudflared");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.yml");
+        std::fs::write(&path, "tag: ['x=y,z', 'x= ', 'ID=user']\n").unwrap();
+        let yaml = Invocation::parse(
+            ["tunnel", "run"].map(str::to_owned),
+            &BTreeMap::new(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(yaml.list("tag"), ["x=y,z", "x= ", "ID=user"]);
+        assert!(config::parse_tags(&yaml.list("tag")).is_ok());
+        let env = BTreeMap::from([("TUNNEL_TAG".into(), " x=one , ID=two ".into())]);
+        let environment =
+            Invocation::parse(["tunnel", "run"].map(str::to_owned), &env, Some(&home)).unwrap();
+        assert_eq!(environment.list("tag"), ["x=one", "ID=two"]);
+        let cli = Invocation::parse(
+            ["tunnel", "--tag", "x=one,two", "--tag", "x= ", "run"].map(str::to_owned),
+            &env,
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(cli.list("tag"), ["x=one,two", "x= "]);
+        let scopes = Invocation::parse(
+            ["--tag", "x=root", "tunnel", "--tag", "x=parent", "run"].map(str::to_owned),
+            &BTreeMap::new(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(scopes.list("tag"), ["x=parent"]);
+        assert!(
+            Invocation::parse(
+                ["tunnel", "run", "--tag", "x=late"].map(str::to_owned),
+                &BTreeMap::new(),
+                Some(&home)
+            )
+            .is_err()
+        );
+        std::fs::write(&path, "tag: []\n").unwrap();
+        assert!(
+            Invocation::parse(
+                ["tunnel", "run"].map(str::to_owned),
+                &BTreeMap::new(),
+                Some(&home)
+            )
+            .unwrap()
+            .list("tag")
+            .is_empty()
+        );
+        for (arguments, environment, yaml, expected) in [
+            (vec!["--socks5=false"], BTreeMap::new(), "", true),
+            (
+                vec![],
+                BTreeMap::from([("TUNNEL_SOCKS", "false")]),
+                "socks5: false\n",
+                true,
+            ),
+            (
+                vec![],
+                BTreeMap::from([("TUNNEL_SOCKS", "")]),
+                "socks5: true\n",
+                false,
+            ),
+            (vec![], BTreeMap::new(), "socks5: true\n", true),
+            (vec![], BTreeMap::new(), "socks5: false\n", false),
+        ] {
+            std::fs::write(&path, yaml).unwrap();
+            let environment = environment
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect();
+            let args = ["tunnel", "run"]
+                .into_iter()
+                .chain(arguments)
+                .map(str::to_owned);
+            let invocation = Invocation::parse(args, &environment, Some(&home)).unwrap();
+            assert_eq!(invocation.is_set("socks5"), expected);
+            assert_eq!(
+                invocation
+                    .single_origin_request()
+                    .unwrap()
+                    .proxy_type
+                    .as_deref(),
+                expected.then_some("socks")
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

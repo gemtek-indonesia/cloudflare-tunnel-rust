@@ -145,13 +145,14 @@ pub(super) async fn proxy(
         if socks {
             let (bridge, mut plaintext) = tokio::io::duplex(16 * 1024);
             let (read, write) = tokio::io::split(bridge);
-            let websocket_task = StreamTask(tokio::spawn(async move {
+            let mut websocket_task = StreamTask(tokio::spawn(async move {
                 crate::access::forward::pipe(websocket, read, write).await
             }));
             let result = socks_connect(&mut plaintext, socket, policy.as_deref(), &settings).await;
             drop(plaintext);
-            drop(websocket_task);
-            result
+            let completed = (&mut websocket_task.0).await?;
+            result?;
+            completed
         } else {
             let (read, write) = socket.context("TCP origin socket missing")?.into_split();
             crate::access::forward::pipe(websocket, read, write).await

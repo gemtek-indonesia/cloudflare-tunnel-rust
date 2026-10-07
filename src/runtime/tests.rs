@@ -6,6 +6,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 #[path = "control_lifetime_tests.rs"]
 mod control_lifetime;
 
+#[path = "tag_tests.rs"]
+mod tags;
+
 pub(crate) fn config() -> RunConfig {
     let configuration =
         LoadedConfig::from_json(r#"{"ingress":[{"service":"http_status:203"}]}"#).unwrap();
@@ -36,6 +39,7 @@ pub(crate) fn config() -> RunConfig {
         icmpv4_src: None,
         icmpv6_src: None,
         features: Vec::new(),
+        tags: Vec::new(),
         logging: crate::observability::logging::Options::default(),
         known_secrets: Vec::new(),
         management_hostname: "management.argotunnel.com".into(),
@@ -75,7 +79,9 @@ fn runtime(config: RunConfig) -> Arc<Runtime> {
         false,
     ));
     Arc::new(Runtime {
-        proxy: Arc::new(ProxyState::with_context(&config, context.clone()).unwrap()),
+        proxy: Arc::new(
+            ProxyState::with_context(&config, context.clone(), Uuid::from_bytes([2; 16])).unwrap(),
+        ),
         context,
         features,
         network,

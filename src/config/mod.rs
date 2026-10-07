@@ -21,6 +21,26 @@ use std::{
 pub const UPSTREAM_VERSION: &str = "2026.10.0";
 pub const UPSTREAM_COMMIT: &str = "18cdfe0a6fc7b72a0702d255a1f984e776ce0498";
 
+pub fn parse_tags(values: &[String]) -> Result<Vec<(http::HeaderName, http::HeaderValue)>> {
+    values
+        .iter()
+        .map(|value| {
+            let (name, value) = value.split_once('=').context("Cannot parse tag value")?;
+            http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow::anyhow!("Cannot parse tag value"))?;
+            if value.is_empty() || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+                bail!("Cannot parse tag value");
+            }
+            Ok((
+                http::HeaderName::from_bytes(format!("Cf-Warp-Tag-{name}").as_bytes())
+                    .map_err(|_| anyhow::anyhow!("Cannot parse tag value"))?,
+                http::HeaderValue::from_str(value)
+                    .map_err(|_| anyhow::anyhow!("Cannot parse tag value"))?,
+            ))
+        })
+        .collect()
+}
+
 pub fn socket_host(url: &url::Url) -> Result<String> {
     match url.host().context("URL requires a hostname")? {
         url::Host::Domain(host) => Ok(host.to_owned()),
@@ -215,6 +235,7 @@ impl std::str::FromStr for Protocol {
 
 #[derive(Clone)]
 pub struct RunConfig {
+    pub tags: Vec<(http::HeaderName, http::HeaderValue)>,
     pub credentials: Credentials,
     pub ingress: Vec<IngressRule>,
     pub origin_request: OriginRequest,
@@ -270,6 +291,73 @@ impl std::fmt::Debug for RunConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tags_validate_ascii_and_preserve_duplicate_values() {
+        let tags =
+            parse_tags(&["x=first=equals".into(), "x= ".into(), "ID=caller".into()]).unwrap();
+        assert_eq!(tags[0].0, "cf-warp-tag-x");
+        assert_eq!(tags[0].1, "first=equals");
+        assert_eq!(tags[1].1, " ");
+        for invalid in [
+            "x=",
+            "=y",
+            "bad name=y",
+            "x=\t",
+            "x=\r\n",
+            "x=\u{7f}",
+            "x=\u{e9}",
+        ] {
+            assert!(parse_tags(&[invalid.into()]).is_err());
+        }
+    }
+    #[test]
+    #[ignore = "requires the pinned Go source oracle"]
+    fn go_tag_header_parser_contract() {
+        let mut vectors = vec![
+            vec![],
+            vec!["x=y".to_owned()],
+            vec!["x=".into()],
+            vec!["=y".into()],
+            vec!["x=first=equals".into()],
+            vec!["x= ".into()],
+            vec!["bad name=value".into()],
+            vec!["x=one".into(), "x=two".into(), "ID=user".into()],
+            vec!["!#$%&'*+-.^_`|~=value".into()],
+            vec!["\u{e9}=value".into()],
+            vec!["x=\u{e9}".into()],
+        ];
+        vectors.extend((0..=127u8).map(|byte| vec![format!("x={}", char::from(byte))]));
+        let oracle = std::env::var_os("CLOUDFLARED_GO_ORACLE").expect("pinned Go oracle");
+        let output = std::process::Command::new(oracle)
+            .arg("tags")
+            .arg(serde_json::to_string(&vectors).unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let source: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for (vector, source) in vectors.iter().zip(source.as_array().unwrap()) {
+            let tags = parse_tags(vector);
+            assert_eq!(
+                tags.is_ok(),
+                source["valid"].as_bool().unwrap(),
+                "{vector:?}"
+            );
+            if let Ok(tags) = tags {
+                let source = source["tags"].as_array().cloned().unwrap_or_default();
+                assert_eq!(tags.len(), source.len());
+                for ((name, value), source) in tags.iter().zip(source) {
+                    assert_eq!(
+                        name.as_str(),
+                        format!(
+                            "cf-warp-tag-{}",
+                            source["Name"].as_str().unwrap().to_ascii_lowercase()
+                        )
+                    );
+                    assert_eq!(value.to_str().unwrap(), source["Value"].as_str().unwrap());
+                }
+            }
+        }
+    }
     #[test]
     fn go_duration_and_config_serialization() {
         assert_eq!(

@@ -16,6 +16,16 @@ fn state(service: &str) -> Arc<ProxyState> {
 }
 
 fn state_with_settings(service: &str, settings: config::OriginRequest) -> Arc<ProxyState> {
+    Arc::new(
+        ProxyState::new(
+            &run_config(service, settings),
+            uuid::Uuid::from_bytes([7; 16]),
+        )
+        .unwrap(),
+    )
+}
+
+fn run_config(service: &str, settings: config::OriginRequest) -> config::RunConfig {
     let token = base64::engine::general_purpose::STANDARD.encode(
         br#"{"a":"synthetic","s":"c3ludGhldGlj","t":"00000000-0000-4000-8000-000000000001"}"#,
     );
@@ -30,7 +40,222 @@ fn state_with_settings(service: &str, settings: config::OriginRequest) -> Arc<Pr
     .unwrap();
     config.origin_request = settings;
     assert_eq!(config.protocol, Protocol::Auto);
-    Arc::new(ProxyState::new(&config).unwrap())
+    config
+}
+
+#[tokio::test]
+async fn actual_http_and_websocket_tags_append_and_survive_configuration_replace() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message, protocol::Role},
+    };
+    let (address, _origin) = super::tag_test_origin::start().await;
+    for websocket in [false, true] {
+        let connector_id = uuid::Uuid::from_bytes([7; 16]);
+        let service = format!("http://{address}");
+        let mut config = run_config(&service, Default::default());
+        config.tags =
+            config::parse_tags(&["x=one".into(), "x=two".into(), "ID=user-id".into()]).unwrap();
+        let state = Arc::new(ProxyState::new(&config, connector_id).unwrap());
+        state
+            .replace(LoadedConfig {
+                ingress: vec![IngressRule {
+                    service,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut request = request("GET", websocket);
+        request.metadata.extend([
+            ("HttpHeader:Cf-Warp-Tag-X".into(), "incoming".into()),
+            ("HttpHeader:Cf-Warp-Tag-ID".into(), "incoming-id".into()),
+        ]);
+        if websocket {
+            request.metadata.extend([
+                (
+                    "HttpHeader:Sec-WebSocket-Key".into(),
+                    "c3ludGhldGljLWtleS0xMg==".into(),
+                ),
+                ("HttpHeader:Sec-WebSocket-Version".into(), "13".into()),
+            ]);
+        }
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(serve_data(server, request, state));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let response = crate::protocol::metadata::read_connect_response(&mut client)
+                .await
+                .unwrap();
+            assert!(response.metadata.contains(&(
+                "HttpStatus".into(),
+                if websocket { "101" } else { "200" }.into()
+            )));
+            let body = if websocket {
+                let mut websocket =
+                    WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+                let body = websocket.next().await.unwrap().unwrap().into_data();
+                websocket
+                    .send(Message::Binary(Bytes::from_static(b"payload")))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    websocket.next().await.unwrap().unwrap().into_data(),
+                    b"payload".as_slice()
+                );
+                websocket.close(None).await.unwrap();
+                body.to_vec()
+            } else {
+                client.shutdown().await.unwrap();
+                let mut body = Vec::new();
+                client.read_to_end(&mut body).await.unwrap();
+                body
+            };
+            let headers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(headers["x"], serde_json::json!(["incoming", "one", "two"]));
+            assert_eq!(
+                headers["id"],
+                serde_json::json!(["incoming-id", "user-id", connector_id.to_string()])
+            );
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn socks_cli_fixed_bastion_and_target_dialing_services_use_distinct_destinations() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message, protocol::Role},
+    };
+    for kind in ["fixed", "bastion", "target", "denied"] {
+        let fixed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixed_address = fixed.local_addr().unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let service = match kind {
+            "fixed" => format!("tcp://{fixed_address}"),
+            "bastion" => "bastion".into(),
+            _ => "socks-proxy".into(),
+        };
+        let base = run_config(&service, Default::default());
+        let mut arguments = vec!["--config", "/dev/null", "tunnel", "run", "--socks5=false"];
+        if kind == "fixed" {
+            arguments.extend(["--url", service.as_str()]);
+        }
+        if kind == "bastion" {
+            arguments.push("--bastion");
+        }
+        let invocation = Invocation::parse(
+            arguments.into_iter().map(str::to_owned),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        let mut config = invocation
+            .run_config_for_credentials(base.credentials, false, None)
+            .unwrap();
+        if kind == "denied" {
+            config.origin_request.ip_rules = vec![
+                serde_json::json!({"prefix":"127.0.0.0/8","ports":[target_address.port()],"allow":true}),
+            ];
+        }
+        if kind == "target" || kind == "denied" {
+            let ip_rules = if kind == "target" {
+                vec![
+                    serde_json::json!({"prefix":"127.0.0.0/8","ports":[target_address.port()],"allow":true}),
+                ]
+            } else {
+                Vec::new()
+            };
+            config.ingress = vec![IngressRule {
+                service,
+                origin_request: config::OriginRequest {
+                    ip_rules,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }];
+        }
+        let state = Arc::new(ProxyState::new(&config, uuid::Uuid::from_bytes([7; 16])).unwrap());
+        let mut head = request("GET", true);
+        if kind == "bastion" {
+            head.metadata.push((
+                "HttpHeader:Cf-Access-Jump-Destination".into(),
+                fixed_address.to_string(),
+            ));
+        }
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(serve_data(server, head, state));
+        let response = crate::protocol::metadata::read_connect_response(&mut client)
+            .await
+            .unwrap();
+        assert!(
+            response
+                .metadata
+                .contains(&("HttpStatus".into(), "101".into()))
+        );
+        let mut websocket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        websocket
+            .send(Message::Binary(Bytes::from_static(&[5, 1, 0])))
+            .await
+            .unwrap();
+        assert_eq!(
+            websocket.next().await.unwrap().unwrap().into_data(),
+            [5, 0].as_slice()
+        );
+        let mut connect = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        connect.extend(target_address.port().to_be_bytes());
+        websocket
+            .send(Message::Binary(connect.into()))
+            .await
+            .unwrap();
+        let response = websocket.next().await.unwrap().unwrap().into_data();
+        assert_eq!(response[1], if kind == "denied" { 2 } else { 0 });
+        if kind != "denied" {
+            let (mut socket, _) = if kind == "target" {
+                target.accept().await.unwrap()
+            } else {
+                fixed.accept().await.unwrap()
+            };
+            websocket
+                .send(Message::Binary(Bytes::from_static(b"ping")))
+                .await
+                .unwrap();
+            let mut bytes = [0; 4];
+            socket.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+            socket.write_all(b"pong").await.unwrap();
+            assert_eq!(
+                websocket.next().await.unwrap().unwrap().into_data(),
+                b"pong".as_slice()
+            );
+        }
+        if kind == "fixed" || kind == "bastion" || kind == "denied" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), target.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        if kind == "target" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), fixed.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        drop(websocket);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
 
 fn request(method: &str, websocket: bool) -> ConnectRequest {

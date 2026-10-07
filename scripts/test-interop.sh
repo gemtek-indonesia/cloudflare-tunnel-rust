@@ -52,13 +52,14 @@ cp "${repo_dir}/tests/interop/source_bridge/access_url.go" "${scratch}/cmd/cloud
 cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/control_lifetime_test.go"
 cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_test.go" "${scratch}/cmd/cloudflared/rust_watcher_test.go"
+cp "${repo_dir}/tests/interop/source_bridge/tags_socks_test.go" "${scratch}/cmd/cloudflared/rust_tags_socks_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_config.go" "${scratch}/config/rust_watcher_config.go"
 for schema in tunnelrpc.capnp quic_metadata_protocol.capnp go.capnp; do
     cmp "${repo_dir}/schemas/${schema}" "${scratch}/tunnelrpc/proto/${schema}"
 done
 cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
-GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRustWatcherInvocationContract$' ./cmd/cloudflared
+GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/oracle" ./tests/rust-interop-oracle
 cd "${repo_dir}"
 CLOUDFLARED_GO_ORACLE="${scratch}/oracle" cargo test --locked --test interop -- --ignored --nocapture
