@@ -1,0 +1,53 @@
+name: Manual live HTTP smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful main push CI run ID
+        required: true
+        type: string
+      cpu:
+        description: Artifact CPU tier
+        required: true
+        default: x86-64-v2
+        type: choice
+        options: [x86-64-v2, x86-64-v3]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cloudflare-live
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: cloudflare-live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pure runner checks
+        run: python3 scripts/live-test.py --self-test
+      - name: Validate and download successful CI artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          CPU_TIER: ${{ inputs.cpu }}
+        run: python3 scripts/live-test.py --download-artifact --cpu "$CPU_TIER"
+      - name: Verify binary-bound licenses
+        env:
+          CPU_TIER: ${{ inputs.cpu }}
+        run: |
+          python3 scripts/check-license-bundle.py .cache/live-artifact/cloudflared .cache/live-artifact/licenses "$CPU_TIER"
+          chmod 755 .cache/live-artifact/cloudflared
+      - name: Sequential QUIC and HTTP/2 smoke
+        env:
+          CF_TUNNEL_TEST_TOKEN: ${{ secrets.CF_TUNNEL_TEST_TOKEN }}
+          CF_TUNNEL_TEST_HOSTNAME: ${{ secrets.CF_TUNNEL_TEST_HOSTNAME }}
+        run: python3 scripts/live-test.py --run

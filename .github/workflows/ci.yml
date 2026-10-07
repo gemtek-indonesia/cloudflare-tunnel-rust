@@ -29,6 +29,8 @@ jobs:
         run: cargo clippy --all-targets --locked --offline -- -D warnings
       - name: Publication checker self-test
         run: python3 scripts/check-publication.py --self-test
+      - name: Live runner pure self-test
+        run: python3 scripts/live-test.py --self-test
       - name: Pinned oracle selector regression
         run: python3 scripts/test-interop-selector.py
       - name: Native binary
