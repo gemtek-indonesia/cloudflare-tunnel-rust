@@ -347,6 +347,289 @@ pub async fn register_connection<T: AsyncRead + AsyncWrite + Unpin + 'static>(
         timeout,
         metrics,
     };
-    registered.check_ready()?;
     Ok(registered)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use capnp_rpc::rpc_capnp as rpc_wire;
+    use std::{
+        cell::RefCell,
+        io,
+        pin::Pin,
+        rc::Rc,
+        task::{Context, Poll},
+    };
+    use tokio::io::{DuplexStream, ReadBuf};
+
+    #[derive(Default)]
+    struct WireTrace {
+        sent: Vec<u8>,
+        received: Vec<u8>,
+        question: Option<u32>,
+        acknowledged: bool,
+    }
+    impl WireTrace {
+        fn frames(&mut self, sent: bool) {
+            let bytes = if sent {
+                &mut self.sent
+            } else {
+                &mut self.received
+            };
+            loop {
+                let mut cursor = io::Cursor::new(bytes.as_slice());
+                let message = match capnp::serialize::try_read_message(
+                    &mut cursor,
+                    super::super::reader_options(),
+                ) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error)
+                        if matches!(
+                            error.kind,
+                            capnp::ErrorKind::PrematureEndOfFile
+                                | capnp::ErrorKind::FailedToFillTheWholeBuffer
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("invalid synthetic RPC frame: {error}"),
+                };
+                let root = message.get_root::<rpc_wire::message::Reader>().unwrap();
+                if sent {
+                    if let rpc_wire::message::Call(call) = root.which().unwrap() {
+                        let call = call.unwrap();
+                        if call.get_interface_id()==<wire::registration_server::Client as capnp::traits::HasTypeId>::TYPE_ID&&call.get_method_id()==0 {
+                            self.question=Some(call.get_question_id());
+                        }
+                    }
+                } else if let rpc_wire::message::Return(answer) = root.which().unwrap() {
+                    let answer = answer.unwrap();
+                    if Some(answer.get_answer_id()) == self.question
+                        && let rpc_wire::return_::Results(payload) = answer.which().unwrap()
+                    {
+                        let result=payload.unwrap().get_content().get_as::<wire::registration_server::register_connection_results::Reader>().unwrap();
+                        if let wire::connection_response::result::ConnectionDetails(details) =
+                            result.get_result().unwrap().get_result().which().unwrap()
+                        {
+                            let details = details.unwrap();
+                            assert_eq!(details.get_uuid().unwrap(), &[3; 16]);
+                            assert_eq!(
+                                details.get_location_name().unwrap().to_str().unwrap(),
+                                "ACK"
+                            );
+                            self.acknowledged = true;
+                        }
+                    }
+                }
+                bytes.drain(..cursor.position() as usize);
+            }
+        }
+    }
+    struct ObservedIo {
+        inner: DuplexStream,
+        trace: Rc<RefCell<WireTrace>>,
+        acknowledgement: Rc<tokio::sync::Notify>,
+        eof: Rc<tokio::sync::Notify>,
+    }
+    impl AsyncRead for ObservedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buffer.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+            if matches!(result, Poll::Ready(Ok(()))) {
+                if buffer.filled().len() == before {
+                    self.eof.notify_one();
+                } else {
+                    let mut trace = self.trace.borrow_mut();
+                    trace.received.extend_from_slice(&buffer.filled()[before..]);
+                    trace.frames(false);
+                    if trace.acknowledged {
+                        self.acknowledgement.notify_one();
+                    }
+                }
+            }
+            result
+        }
+    }
+    impl AsyncWrite for ObservedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if let Poll::Ready(Ok(n)) = result {
+                let mut trace = self.trace.borrow_mut();
+                trace.sent.extend_from_slice(&bytes[..n]);
+                trace.frames(true);
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    struct AckServer;
+    impl wire::registration_server::Server for AckServer {
+        async fn register_connection(
+            self: Rc<Self>,
+            params: wire::registration_server::RegisterConnectionParams,
+            mut results: wire::registration_server::RegisterConnectionResults,
+        ) -> capnp::Result<()> {
+            let request = params.get()?;
+            assert_eq!(request.get_conn_index(), 2);
+            assert_eq!(request.get_tunnel_id()?, &[1; 16]);
+            assert_eq!(
+                request.get_auth()?.get_account_tag()?.to_str().unwrap(),
+                "synthetic-account"
+            );
+            let mut details = results
+                .get()
+                .init_result()
+                .init_result()
+                .init_connection_details();
+            details.set_uuid(&[3; 16]);
+            details.set_location_name("ACK");
+            details.set_tunnel_is_remotely_managed(true);
+            Ok(())
+        }
+    }
+    fn request() -> RegistrationRequest {
+        RegistrationRequest {
+            auth: TunnelAuth {
+                account_tag: "synthetic-account".into(),
+                tunnel_secret: b"synthetic-secret".to_vec(),
+            },
+            tunnel_id: Uuid::from_bytes([1; 16]),
+            connection_index: 2,
+            client_id: Uuid::from_bytes([2; 16]),
+            features: vec!["serialized_headers".into()],
+            version: "synthetic-version".into(),
+            arch: "linux_amd64".into(),
+            origin_ip: None,
+            previous_attempts: 0,
+        }
+    }
+
+    pub(crate) async fn acknowledged_then_eof() -> (
+        Result<RegisteredConnection, RegistrationError>,
+        Arc<Metrics>,
+    ) {
+        let metrics = Metrics::new().unwrap();
+        let (client, server) = tokio::io::duplex(65536);
+        let trace = Rc::new(RefCell::new(WireTrace::default()));
+        let acknowledgement = Rc::new(tokio::sync::Notify::new());
+        let eof = Rc::new(tokio::sync::Notify::new());
+        let io = ObservedIo {
+            inner: client,
+            trace: trace.clone(),
+            acknowledgement: acknowledgement.clone(),
+            eof: eof.clone(),
+        };
+        let (read, write) = tokio::io::split(server);
+        let network = twoparty::VatNetwork::new(
+            read.compat(),
+            write.compat_write(),
+            Side::Server,
+            super::super::reader_options(),
+        );
+        let service: wire::registration_server::Client = capnp_rpc::new_client(AckServer);
+        let mut peer = crate::runtime::AbortTask(tokio::task::spawn_local(RpcSystem::new(
+            Box::new(network),
+            Some(service.client),
+        )));
+        let mut registration = Box::pin(register_connection(
+            io,
+            request(),
+            Duration::from_secs(2),
+            metrics.clone(),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        acknowledgement.notified().await;
+        assert!(trace.borrow().acknowledged);
+        peer.0.abort();
+        let _ = (&mut peer.0).await;
+        eof.notified().await;
+        let result = registration.await;
+        assert_eq!(
+            metrics
+                .rpc_client_operations
+                .with_label_values(&["registration", "register_connection"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .rpc_client_failures
+                .with_label_values(&["registration", "register_connection"])
+                .get(),
+            0,
+            "the caller must actually decode successful details before this is classified as post-admission EOF"
+        );
+        (result, metrics)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_without_decoded_ack_remains_a_registration_rpc_failure() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let metrics = Metrics::new().unwrap();
+                let (client, peer) = tokio::io::duplex(65536);
+                drop(peer);
+                let result =
+                    register_connection(client, request(), Duration::from_secs(1), metrics.clone())
+                        .await;
+                assert!(matches!(result, Err(RegistrationError::Rpc(_))));
+                assert_eq!(
+                    metrics
+                        .rpc_client_operations
+                        .with_label_values(&["registration", "register_connection"])
+                        .get(),
+                    1
+                );
+                assert_eq!(
+                    metrics
+                        .rpc_client_failures
+                        .with_label_values(&["registration", "register_connection"])
+                        .get(),
+                    1
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decoded_registration_ack_is_retained_after_control_eof_before_caller_resumes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (result, _metrics) = acknowledged_then_eof().await;
+                    let mut registered = result.expect(
+                        "decoded successful registration must not become a preregistration failure",
+                    );
+                    assert!(!registered.is_ready());
+                    assert!(!registered.liveness().is_ready());
+                    registered.disconnected().await;
+                    assert!(matches!(
+                        registered.send_local_configuration(b"{}").await,
+                        Err(RegistrationError::Disconnected)
+                    ));
+                    assert!(matches!(
+                        registered.unregister(Duration::from_secs(1)).await,
+                        Err(RegistrationError::Disconnected)
+                    ));
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+    }
 }

@@ -155,6 +155,201 @@ fn source_retry_policy_distinguishes_startup_registration_and_live_disconnect() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn decoded_ack_then_control_eof_preserves_admission_history_without_readiness() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (result,_)=registration::tests::acknowledged_then_eof().await;
+        let mut connection=result.unwrap();
+        let mut config=config();config.protocol=Protocol::Auto;
+        let mut runtime=runtime(config);let (events,mut received)=mpsc::unbounded_channel();Arc::get_mut(&mut runtime).unwrap().events=events;
+        let lease=runtime.registered(2,EdgeProtocol::Quic,"127.0.0.1:7844".parse().unwrap(),&connection).await.unwrap();
+        assert_eq!(runtime.readiness.count(),0);assert_eq!(runtime.context.metrics.ha_connections.get(),0);
+        assert_eq!(runtime.context.metrics.register_success.with_label_values(&["registerConnection"]).get(),1);
+        assert_eq!(runtime.context.metrics.register_fail.with_label_values(&["server_error","registerConnection"]).get(),0);
+        assert!(runtime.ever_quic.load(Ordering::Acquire));
+        assert!(matches!(received.recv().await,Some(Event::Connected(2,EdgeProtocol::Quic))));
+        assert_eq!(connection.identity().client_id(),runtime.client_id);assert_eq!(connection.identity().tunnel_id(),runtime.config.credentials.tunnel_id);
+        connection.disconnected().await;
+        let error=anyhow::Error::new(RegistrationError::Disconnected);
+        let retry=retry_policy(&error,true,runtime.startup_announced.load(Ordering::Acquire));
+        assert!(!retry.stop_startup);assert!(!retry.supervised);assert!(retry.allow_fallback);
+        assert!(!runtime.should_fallback(EdgeProtocol::Quic,true,true),"historical acknowledged QUIC suppresses auto fallback even when every current connection is dead");
+        drop(lease);assert!(runtime.readiness.slots.lock().unwrap().is_empty());
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acknowledged_quic_transport_close_retries_same_connector_and_index() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            fn listener(address: SocketAddr) -> Arc<tokio::net::UdpSocket> {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )
+                .unwrap();
+                socket.set_reuse_address(true).unwrap();
+                socket.set_reuse_port(true).unwrap();
+                socket.bind(&address.into()).unwrap();
+                socket.set_nonblocking(true).unwrap();
+                let socket: std::net::UdpSocket = socket.into();
+                Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap())
+            }
+            fn peer_config(
+                cert: &boring::x509::X509,
+                key: &boring::pkey::PKey<boring::pkey::Private>,
+            ) -> quiche::Config {
+                let mut ssl =
+                    boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+                ssl.set_certificate(cert).unwrap();
+                ssl.set_private_key(key).unwrap();
+                ssl.set_curves_list("X25519MLKEM768").unwrap();
+                let mut config =
+                    quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
+                        .unwrap();
+                config.set_application_protos(&[b"argotunnel"]).unwrap();
+                config.set_max_idle_timeout(5000);
+                config.set_initial_max_data(1024 * 1024);
+                config.set_initial_max_stream_data_bidi_local(65536);
+                config.set_initial_max_stream_data_bidi_remote(65536);
+                config.set_initial_max_streams_bidi(128);
+                config.enable_dgram(true, 32, 32);
+                config
+            }
+            let (cert, key) = certificate();
+            let tls =
+                EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+            let socket = listener("127.0.0.1:0".parse().unwrap());
+            let address = socket.local_addr().unwrap();
+            let mut config = config();
+            config.protocol = Protocol::Auto;
+            config.ha_connections = 1;
+            let mut runtime = runtime(config);
+            let (events, mut received) = mpsc::unbounded_channel();
+            Arc::get_mut(&mut runtime).unwrap().events = events;
+            let observed = Arc::new(Mutex::new(vec![]));
+            let attempts = observed.clone();
+            let close = Arc::new(tokio::sync::Notify::new());
+            let trigger = close.clone();
+            let shared = runtime.clone();
+            let edge = async move {
+                let mut socket = socket;
+                for attempt in 0..2 {
+                    let mut config = peer_config(&cert, &key);
+                    let mut packet = vec![0; 65527];
+                    let (n, remote) = socket.recv_from(&mut packet).await.unwrap();
+                    if attempt==1 {
+                        assert_eq!(shared.readiness.count(),0,"closed first transport must not retain readiness while retry handshakes");
+                        assert_eq!(shared.context.metrics.ha_connections.get(),0);
+                        assert!(shared.ever_quic.load(Ordering::Acquire));
+                    }
+                    let header = quiche::Header::from_slice(&mut packet[..n], 20).unwrap();
+                    let conn: tokio_quiche::quic::QuicheConnection =
+                        quiche::accept_with_buf_factory(
+                            &header.dcid,
+                            None,
+                            address,
+                            remote,
+                            &mut config,
+                        )
+                        .unwrap();
+                    let initial = tokio_quiche::quic::Incoming {
+                        peer_addr: remote,
+                        local_addr: address,
+                        rx_time: None,
+                        buf: packet[..n].to_vec(),
+                        gro: None,
+                        so_mark_data: None,
+                    };
+                    let mut peer = transport::quic::attach_server(conn, socket, initial)
+                        .await
+                        .unwrap();
+                    let control = peer.accept_bi().await.unwrap();
+                    assert_eq!(control.id(), 0);
+                    let (read, write) = tokio::io::split(control);
+                    let network = capnp_rpc::twoparty::VatNetwork::new(
+                        read.compat(),
+                        write.compat_write(),
+                        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                        crate::protocol::reader_options(),
+                    );
+                    let oracle: wire::registration_server::Client = capnp_rpc::new_client(Oracle {
+                        registered: Arc::new(tokio::sync::Notify::new()),
+                        unregistered: Arc::new(AtomicBool::new(false)),
+                        observed: attempts.clone(),
+                        local_configuration: Arc::new(AtomicBool::new(false)),
+                        origin_ip: "127.0.0.1".parse().unwrap(),
+                        reject: false,
+                        acknowledgement: None,
+                        timestamps: None,
+                        unregister_count: None,
+                    });
+                    let mut rpc = AbortTask(tokio::task::spawn_local(capnp_rpc::RpcSystem::new(
+                        Box::new(network),
+                        Some(oracle.client),
+                    )));
+                    if attempt == 0 {
+                        trigger.notified().await;
+                        socket = listener(address);
+                        peer.close();
+                    } else {
+                        let _ = (&mut rpc.0).await;
+                        assert!(shared.shutdown.is_cancelled());
+                        break;
+                    }
+                }
+            };
+            let monitor = async {
+                assert!(matches!(
+                    received.recv().await,
+                    Some(Event::Connected(0, EdgeProtocol::Quic))
+                ));
+                assert_eq!(runtime.readiness.count(), 1);
+                close.notify_one();
+                assert!(matches!(
+                    received.recv().await,
+                    Some(Event::Connected(0, EdgeProtocol::Quic))
+                ));
+                assert_eq!(runtime.readiness.count(), 1);
+                assert_eq!(
+                    runtime
+                        .context
+                        .metrics
+                        .register_success
+                        .with_label_values(&["registerConnection"])
+                        .get(),
+                    2
+                );
+                assert!(runtime.ever_quic.load(Ordering::Acquire));
+                assert!(!runtime.should_fallback(EdgeProtocol::Quic, true, true));
+                runtime.shutdown.cancel();
+            };
+            let pool = Arc::new(Mutex::new(
+                discovery::EdgePool::new(vec![vec![address]]).unwrap(),
+            ));
+            let mut worker = AbortTask(tokio::task::spawn_local(lane(
+                runtime.clone(),
+                pool,
+                tls,
+                0,
+                EdgeProtocol::Quic,
+            )));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (result, _, _) = tokio::join!(&mut worker.0, edge, monitor);
+                result.unwrap().unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.lock().unwrap().as_slice(),
+                &[(0, runtime.client_id), (0, runtime.client_id)]
+            );
+            assert_eq!(runtime.readiness.count(), 0);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn failed_first_rpc_stops_without_ready_notification_pid_or_second_dial() {
     tokio::task::LocalSet::new().run_until(async{
         let (cert,key)=certificate();let mut acceptor=boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();acceptor.set_certificate(&cert).unwrap();acceptor.set_private_key(&key).unwrap();let acceptor=acceptor.build();
