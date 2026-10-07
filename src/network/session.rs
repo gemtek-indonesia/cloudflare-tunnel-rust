@@ -39,6 +39,7 @@ struct PendingMigration {
 }
 struct Session {
     generation: u64,
+    creator_index: u8,
     socket: Arc<tokio::net::UdpSocket>,
     route: watch::Sender<Route>,
     activity: watch::Sender<Instant>,
@@ -134,7 +135,19 @@ impl Session {
     fn untrack(&self) {
         if self.version == DatagramVersion::V2 {
             self.metrics.udp_active_sessions.dec();
+        } else {
+            self.metrics
+                .udp_active_flows
+                .with_label_values(&[&self.creator_index.to_string()])
+                .dec();
         }
+    }
+    fn dropped(&self, reason: &str) {
+        let index = self.route.borrow().index;
+        self.metrics
+            .udp_dropped_datagrams
+            .with_label_values(&[&index.to_string(), reason])
+            .inc();
     }
 }
 pub(crate) struct Registry {
@@ -226,6 +239,7 @@ impl Registry {
         };
         let session = Arc::new(Session {
             generation: self.generation.fetch_add(1, Ordering::Relaxed),
+            creator_index: connection.index,
             socket,
             route,
             activity,
@@ -244,6 +258,17 @@ impl Registry {
             if session.version == DatagramVersion::V2 {
                 session.metrics.udp_total_sessions.inc();
                 session.metrics.udp_active_sessions.inc();
+            } else {
+                session
+                    .metrics
+                    .udp_total_flows
+                    .with_label_values(&[&session.creator_index.to_string()])
+                    .inc();
+                session
+                    .metrics
+                    .udp_active_flows
+                    .with_label_values(&[&session.creator_index.to_string()])
+                    .inc();
             }
             let previous = sessions.insert(id, session.clone());
             if let Some(previous) = &previous {
@@ -287,12 +312,16 @@ impl Registry {
                 }
                 .run()
                 .await;
-                if let Err(error) = result {
+                if let Err(failure) = result {
                     let _ = context.logger.log(
                         crate::observability::logging::Level::Error,
                         crate::observability::logging::Event::Udp,
                         "UDP flow closed with an error",
-                        serde_json::json!({"error": error.to_string()}),
+                        serde_json::json!({
+                            "error": failure.error.to_string(),
+                            "connIndex": failure.index,
+                            "flowID": uuid::Uuid::from_bytes(id).simple().to_string(),
+                        }),
                     );
                 }
             } else {
@@ -373,7 +402,13 @@ impl Registry {
             migration: None,
         })
     }
-    async fn response_completed(&self, id: [u8; 16], mut registration: V3Registration, sent: bool) {
+    async fn response_completed(
+        &self,
+        id: [u8; 16],
+        mut registration: V3Registration,
+        sent: bool,
+        index: u8,
+    ) {
         registration.owns_pending_creation = false;
         if !sent && registration.kind == RegistrationKind::New {
             self.remove_now(id, Some(registration.generation));
@@ -391,14 +426,28 @@ impl Registry {
                 RegistrationKind::New => session.started.notify_one(),
                 RegistrationKind::Retry => {
                     session.activity.send_replace(Instant::now());
+                    session
+                        .metrics
+                        .udp_retry_flow_responses
+                        .with_label_values(&[&index.to_string()])
+                        .inc();
                 }
                 RegistrationKind::Migration => {}
             }
         }
     }
-    async fn payload(&self, id: [u8; 16], payload: Vec<u8>) {
+    async fn payload(&self, id: [u8; 16], payload: Vec<u8>, connection: &Connection) {
         let session = self.sessions.lock().unwrap().get(&id).cloned();
         let Some(session) = session else {
+            if connection.version == DatagramVersion::V3 {
+                connection
+                    .state
+                    .context
+                    .metrics
+                    .udp_dropped_datagrams
+                    .with_label_values(&[&connection.index.to_string(), "write_flow_unknown"])
+                    .inc();
+            }
             return;
         };
         if session.version == DatagramVersion::V2 {
@@ -410,7 +459,12 @@ impl Registry {
                 eprintln!("UDP origin write deadline exceeded: {error}");
             }
         } else {
-            let _ = session.input.try_send(payload);
+            if matches!(
+                session.input.try_send(payload),
+                Err(mpsc::error::TrySendError::Full(_))
+            ) {
+                session.dropped("write_full");
+            }
         }
     }
 }
@@ -425,8 +479,12 @@ struct V3Lifecycle {
     idle: Duration,
     target: Route,
 }
+struct V3Failure {
+    index: u8,
+    error: anyhow::Error,
+}
 impl V3Lifecycle {
-    async fn run(mut self) -> Result<()> {
+    async fn run(mut self) -> Result<(), V3Failure> {
         let mut workers = tokio::task::JoinSet::new();
         workers.spawn_local(v3_read(self.id, self.session.clone()));
         workers.spawn_local(v3_write(self.session.clone(), self.input));
@@ -457,11 +515,20 @@ impl V3Lifecycle {
                     }
                     if request.accepted.send(()).is_ok() {
                         self.target = request.route;
+                        self.session.metrics.udp_migrated_flows.with_label_values(&[&self.target.index.to_string()]).inc();
                     }
                 }
             }
         };
         self.session.cancel.cancel();
+        let index = self.session.route.borrow().index;
+        if outcome.is_err() {
+            self.session
+                .metrics
+                .udp_failed_flows
+                .with_label_values(&[&index.to_string()])
+                .inc();
+        }
         drop(self.migrations);
         while workers.join_next().await.is_some() {}
         if let Some(registry) = self.registry.upgrade() {
@@ -469,7 +536,7 @@ impl V3Lifecycle {
         }
         drop(self.session);
         drop(self.permit);
-        outcome
+        outcome.map_err(|error| V3Failure { index, error })
     }
 }
 async fn v3_read(id: [u8; 16], session: Arc<Session>) -> Result<()> {
@@ -480,6 +547,7 @@ async fn v3_read(id: [u8; 16], session: Arc<Session>) -> Result<()> {
             result = session.socket.recv(&mut buffer) => result?,
         };
         if n > 1280 {
+            session.dropped("read_too_large");
             continue;
         }
         let bytes = DatagramV3::Payload {
@@ -514,7 +582,8 @@ async fn v3_write(session: Arc<Session>, mut input: mpsc::Receiver<Vec<u8>>) -> 
                 session.activity.send_replace(Instant::now());
             }
             Ok(Err(error)) => return Err(error.into()),
-            _ => {}
+            Ok(Ok(_)) => session.dropped("write_failed"),
+            Err(_) => session.dropped("write_deadline_exceeded"),
         }
     }
 }
@@ -729,7 +798,7 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
             DatagramV2::Udp {
                 session_id,
                 payload,
-            } => connection.v2.payload(session_id, payload).await,
+            } => connection.v2.payload(session_id, payload, connection).await,
             DatagramV2::Ip(packet) => {
                 connection
                     .state
@@ -789,12 +858,14 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
                     connection
                         .state
                         .v3
-                        .response_completed(id, registration, sent.is_ok())
+                        .response_completed(id, registration, sent.is_ok(), connection.index)
                         .await;
                 }
                 sent?;
             }
-            DatagramV3::Payload { id, payload } => connection.state.v3.payload(id, payload).await,
+            DatagramV3::Payload { id, payload } => {
+                connection.state.v3.payload(id, payload, connection).await
+            }
             DatagramV3::Icmp(packet) => {
                 connection
                     .state

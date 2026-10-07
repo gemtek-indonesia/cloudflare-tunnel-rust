@@ -139,6 +139,15 @@ async fn origin_write_boundary_preserves_reader_and_drop_or_fatal_outcomes() {
                             .await
                             .unwrap();
                         assert_eq!(state.v3.len(), 0);
+                        assert_eq!(
+                            state
+                                .context
+                                .metrics
+                                .udp_failed_flows
+                                .with_label_values(&["0"])
+                                .get(),
+                            1
+                        );
                         pair.client.close();
                         pair.peer.close();
                         continue;
@@ -152,6 +161,29 @@ async fn origin_write_boundary_preserves_reader_and_drop_or_fatal_outcomes() {
                     .unwrap();
                 assert_eq!(&buffer[..n], b"next packet");
                 assert_eq!(state.v3.len(), 1);
+                let reason = if outcome == "deadline" {
+                    "write_deadline_exceeded"
+                } else {
+                    "write_failed"
+                };
+                assert_eq!(
+                    state
+                        .context
+                        .metrics
+                        .udp_dropped_datagrams
+                        .with_label_values(&["0", reason])
+                        .get(),
+                    u64::from(outcome != "send")
+                );
+                assert_eq!(
+                    state
+                        .context
+                        .metrics
+                        .udp_failed_flows
+                        .with_label_values(&["0"])
+                        .get(),
+                    0
+                );
                 pair.scope.cancellation().cancel();
                 timeout(Duration::from_millis(300), drained(&state))
                     .await
@@ -421,6 +453,15 @@ async fn writer_queue_keeps_512_pending_packets_and_drops_overflow() {
                     .await
                     .unwrap();
             }
+            assert_eq!(
+                state
+                    .context
+                    .metrics
+                    .udp_dropped_datagrams
+                    .with_label_values(&["0", "write_full"])
+                    .get(),
+                1
+            );
             let receiver = origin.clone();
             let mut reads = crate::runtime::AbortTask(tokio::task::spawn_local(async move {
                 let mut buffer = [0; 8];

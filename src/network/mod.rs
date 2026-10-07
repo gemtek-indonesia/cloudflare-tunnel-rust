@@ -447,6 +447,12 @@ impl Connection {
         request: UdpRegistration,
     ) -> UdpRegistrationResult {
         if self.version == DatagramVersion::V3 {
+            self.state
+                .context
+                .metrics
+                .udp_unsupported_remote_commands
+                .with_label_values(&[&self.index.to_string(), "register_udp_session"])
+                .inc();
             return UdpRegistrationResult {
                 error: "datagram v3 does not support RegisterUdpSession RPC".into(),
                 spans: Vec::new(),
@@ -469,6 +475,12 @@ impl Connection {
     }
     pub(crate) async fn unregister_udp(&self, id: uuid::Uuid) -> Result<()> {
         if self.version == DatagramVersion::V3 {
+            self.state
+                .context
+                .metrics
+                .udp_unsupported_remote_commands
+                .with_label_values(&[&self.index.to_string(), "unregister_udp_session"])
+                .inc();
             bail!("datagram v3 does not support UnregisterUdpSession RPC");
         }
         self.v2.remove(*id.as_bytes(), None).await;

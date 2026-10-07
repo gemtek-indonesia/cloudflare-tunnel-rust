@@ -16,6 +16,9 @@ mod v3_ack;
 #[path = "v3_duplex_tests.rs"]
 mod v3_duplex;
 
+#[path = "v3_metrics_tests.rs"]
+mod v3_metrics;
+
 struct Pair {
     client: QuicConnection,
     peer: QuicConnection,

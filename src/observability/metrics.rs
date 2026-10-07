@@ -20,6 +20,13 @@ pub struct Metrics {
     pub udp_active_sessions: IntGauge,
     pub udp_total_sessions: IntCounter,
     pub packet_too_big_dropped: IntCounter,
+    pub udp_active_flows: IntGaugeVec,
+    pub udp_total_flows: IntCounterVec,
+    pub udp_failed_flows: IntCounterVec,
+    pub udp_retry_flow_responses: IntCounterVec,
+    pub udp_migrated_flows: IntCounterVec,
+    pub udp_unsupported_remote_commands: IntCounterVec,
+    pub udp_dropped_datagrams: IntCounterVec,
     pub connect_latency: Histogram,
     pub connect_errors: IntCounter,
     pub rpc_client_operations: IntCounterVec,
@@ -199,6 +206,44 @@ impl Metrics {
             "quic_client_packet_too_big_dropped",
             "Count of packets received from origin that are too big to send to the edge and are dropped as a result"
         );
+        let udp_active_flows = IntGaugeVec::new(
+            Opts::new(
+                "cloudflared_udp_active_flows",
+                "Concurrent count of UDP flows that are being proxied to any origin",
+            ),
+            &["conn_index"],
+        )?;
+        registry.register(Box::new(udp_active_flows.clone()))?;
+        let udp_total_flows = counters!(
+            "cloudflared_udp_total_flows",
+            "Total count of UDP flows that have been proxied to any origin",
+            &["conn_index"]
+        );
+        let udp_failed_flows = counters!(
+            "cloudflared_udp_failed_flows",
+            "Total count of flows that errored and closed",
+            &["conn_index"]
+        );
+        let udp_retry_flow_responses = counters!(
+            "cloudflared_udp_retry_flow_responses",
+            "Total count of UDP flows that have had to send their registration response more than once",
+            &["conn_index"]
+        );
+        let udp_migrated_flows = counters!(
+            "cloudflared_udp_migrated_flows",
+            "Total count of UDP flows have been migrated across local connections",
+            &["conn_index"]
+        );
+        let udp_unsupported_remote_commands = counters!(
+            "cloudflared_udp_unsupported_remote_command_total",
+            "Total count of unsupported remote RPC commands called",
+            &["conn_index", "command"]
+        );
+        let udp_dropped_datagrams = counters!(
+            "cloudflared_udp_dropped_datagrams",
+            "Total count of UDP dropped datagrams",
+            &["conn_index", "reason"]
+        );
         Ok(Arc::new(Self {
             registry,
             ha_connections,
@@ -214,6 +259,13 @@ impl Metrics {
             udp_active_sessions,
             udp_total_sessions,
             packet_too_big_dropped,
+            udp_active_flows,
+            udp_total_flows,
+            udp_failed_flows,
+            udp_retry_flow_responses,
+            udp_migrated_flows,
+            udp_unsupported_remote_commands,
+            udp_dropped_datagrams,
             connect_latency,
             connect_errors,
             rpc_client_operations,

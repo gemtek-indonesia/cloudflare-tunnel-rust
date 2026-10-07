@@ -25,6 +25,7 @@ import (
 
 type v3ResponseGate struct {
 	id      v3.RequestID
+	kind    byte
 	entered chan struct{}
 	release chan struct{}
 	fail    bool
@@ -40,8 +41,15 @@ func (c *v3GatedConn) SendDatagram(data []byte) error {
 	c.mutex.Lock()
 	gate := c.gate
 	c.mutex.Unlock()
-	if gate != nil && len(data) >= 20 && data[0] == 3 {
-		id, err := v3.RequestIDFromSlice(data[2:18])
+	if gate != nil && len(data) >= 17 && data[0] == gate.kind {
+		offset := 1
+		if gate.kind == 3 {
+			offset = 2
+		}
+		if len(data) < offset+16 {
+			return fmt.Errorf("short gated datagram")
+		}
+		id, err := v3.RequestIDFromSlice(data[offset : offset+16])
 		if err == nil && id == gate.id {
 			gate.once.Do(func() { close(gate.entered) })
 			select {
@@ -57,7 +65,13 @@ func (c *v3GatedConn) SendDatagram(data []byte) error {
 	return c.Conn.SendDatagram(data)
 }
 func (c *v3GatedConn) arm(id v3.RequestID, fail bool) *v3ResponseGate {
-	gate := &v3ResponseGate{id: id, entered: make(chan struct{}), release: make(chan struct{}), fail: fail}
+	return c.armKind(id, 3, fail)
+}
+func (c *v3GatedConn) armPayload(id v3.RequestID, fail bool) *v3ResponseGate {
+	return c.armKind(id, 1, fail)
+}
+func (c *v3GatedConn) armKind(id v3.RequestID, kind byte, fail bool) *v3ResponseGate {
+	gate := &v3ResponseGate{id: id, kind: kind, entered: make(chan struct{}), release: make(chan struct{}), fail: fail}
 	c.mutex.Lock()
 	c.gate = gate
 	c.mutex.Unlock()
@@ -65,11 +79,13 @@ func (c *v3GatedConn) arm(id v3.RequestID, fail bool) *v3ResponseGate {
 }
 
 type v3AckFixture struct {
-	ctx     context.Context
-	conn    *v3GatedConn
-	peer    *quic.Conn
-	manager v3.SessionManager
-	limiter *trackedV2Limiter
+	ctx      context.Context
+	conn     *v3GatedConn
+	peer     *quic.Conn
+	manager  v3.SessionManager
+	limiter  *trackedV2Limiter
+	registry *prometheus.Registry
+	handler  DatagramSessionHandler
 }
 
 func sourceV3AckFixture(t *testing.T) *v3AckFixture {
@@ -107,7 +123,8 @@ func sourceV3SharedAckFixture(t *testing.T, manager v3.SessionManager, index uin
 	conn := &v3GatedConn{Conn: client}
 	t.Cleanup(func() { _ = conn.CloseWithError(0, "done") })
 	log := zerolog.Nop()
-	metrics := v3.NewMetrics(prometheus.NewRegistry())
+	registry := prometheus.NewRegistry()
+	metrics := v3.NewMetrics(registry)
 	limiter := &trackedV2Limiter{Limiter: flow.NewLimiter(0), released: make(chan struct{}, 8)}
 	if manager == nil {
 		manager = v3.NewSessionManager(metrics, &log, ingress.NewDialer(ingress.WarpRoutingConfig{}), limiter)
@@ -117,7 +134,7 @@ func sourceV3SharedAckFixture(t *testing.T, manager v3.SessionManager, index uin
 	select {
 	case peer := <-accepted:
 		t.Cleanup(func() { _ = peer.CloseWithError(0, "done") })
-		return &v3AckFixture{ctx, conn, peer, manager, limiter}
+		return &v3AckFixture{ctx: ctx, conn: conn, peer: peer, manager: manager, limiter: limiter, registry: registry, handler: handler}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 		return nil
