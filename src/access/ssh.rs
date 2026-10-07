@@ -11,7 +11,7 @@ use boring::{
 };
 use bytes::Bytes;
 use http_body_util::Full;
-use std::{io::Write, path::Path, time::Duration};
+use std::{ffi::OsStr, io::Write, os::unix::ffi::OsStrExt, path::Path, time::Duration};
 
 pub(super) fn configuration(invocation: &crate::cli::Invocation) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -20,22 +20,24 @@ pub(super) fn configuration(invocation: &crate::cli::Invocation) -> Result<()> {
     } else {
         invocation.string("hostname")
     };
-    let executable = std::env::current_exe()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "cloudflared".into());
+    let executable = std::env::current_exe().unwrap_or_else(|_| "cloudflared".into());
     std::io::stdout().write_all(
         render_config(
             &home,
             hostname,
-            &executable,
+            executable.as_os_str(),
             invocation.bool("short-lived-cert"),
         )?
         .as_bytes(),
     )?;
     Ok(())
 }
-fn render_config(home: &str, hostname: &str, executable: &str, short: bool) -> Result<String> {
+fn render_config(
+    home: &str,
+    hostname: &str,
+    executable: impl AsRef<OsStr>,
+    short: bool,
+) -> Result<String> {
     if hostname != "[your hostname]"
         && (hostname.is_empty()
             || !hostname
@@ -44,25 +46,48 @@ fn render_config(home: &str, hostname: &str, executable: &str, short: bool) -> R
     {
         bail!("invalid OpenSSH hostname pattern");
     }
-    if executable.contains(['\r', '\n', '\0']) {
+    let executable = executable.as_ref().as_bytes();
+    if executable
+        .iter()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
         bail!("executable path cannot be represented in OpenSSH configuration");
     }
-    let executable = format!(
-        "'{}'",
-        executable.replace('%', "%%").replace('\'', "'\"'\"'")
-    );
+    let quoted = std::str::from_utf8(executable)
+        .map(|path| format!("'{}'", path.replace('%', "%%").replace('\'', "'\"'\"'")));
+    let proxy_executable = quoted
+        .clone()
+        .unwrap_or_else(|_| octal_proxy_executable(executable));
     let mut output = format!("\nAdd to your {home}/.ssh/config:\n\n");
     if short {
-        let command = format!("{executable} access ssh-gen --hostname %h")
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        output.push_str(&format!("Match host {hostname} exec \"{command}\"\n  ProxyCommand {executable} access ssh --hostname %h\n  IdentityFile ~/.cloudflared/%h-cf_key\n  CertificateFile ~/.cloudflared/%h-cf_key-cert.pub\n"));
+        // Older OpenSSH Match parsers do not recognize escaped quotes; octal bytes survive both parsers.
+        let match_executable = if executable.iter().any(|byte| b"'\"\\".contains(byte)) {
+            octal_executable(executable)
+        } else {
+            quoted.unwrap_or_else(|_| octal_executable(executable))
+        };
+        output.push_str(&format!("Match host {hostname} exec \"{match_executable} access ssh-gen --hostname %h\"\n  ProxyCommand {proxy_executable} access ssh --hostname %h\n  IdentityFile ~/.cloudflared/%h-cf_key\n  CertificateFile ~/.cloudflared/%h-cf_key-cert.pub\n"));
     } else {
         output.push_str(&format!(
-            "Host {hostname}\n  ProxyCommand {executable} access ssh --hostname %h\n\n"
+            "Host {hostname}\n  ProxyCommand {proxy_executable} access ssh --hostname %h\n\n"
         ));
     }
     Ok(output)
+}
+fn octal_executable(executable: &[u8]) -> String {
+    format!("set -f; IFS=; exec $(printf '{}')", octal_bytes(executable))
+}
+fn octal_proxy_executable(executable: &[u8]) -> String {
+    format!(
+        "/bin/sh -c 'set -f; IFS=; exec $(printf \"{}\") \"$@\"' --",
+        octal_bytes(executable)
+    )
+}
+fn octal_bytes(executable: &[u8]) -> String {
+    executable
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect()
 }
 async fn key_pair(path: &Path) -> Result<Vec<u8>> {
     let _guard =
@@ -266,7 +291,7 @@ mod tests {
         assert!(config.contains(
             "ProxyCommand '/synthetic/bin with '\"'\"'quote'\"'\"'/cloud%%flared' access ssh"
         ));
-        assert!(config.contains("exec \"'/synthetic/bin with '\\\"'\\\"'quote'\\\"'\\\"'/cloud%%flared' access ssh-gen --hostname %h\""));
+        assert!(config.contains("exec \"set -f; IFS=; exec $(printf '\\057\\163"));
         for invalid in [
             "host\nProxyCommand unwanted",
             "host with space",
@@ -277,52 +302,72 @@ mod tests {
         }
     }
 
-    #[test]
-    fn actual_openssh_parser_executes_only_owned_quoted_mock() {
-        use std::os::unix::fs::PermissionsExt;
+    #[tokio::test]
+    async fn actual_openssh_parser_executes_only_owned_quoted_mock() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
         let directory =
             std::env::temp_dir().join(format!("access-ssh-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
-        let executable = directory.join("cloudflared with 'quote'%literal");
-        std::fs::write(
-            &executable,
-            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SSH_CAPTURE\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let capture = directory.join("arguments");
-        let rendered = render_config(
-            "/synthetic/home",
-            "synthetic.invalid",
-            executable.to_str().unwrap(),
-            true,
-        )
-        .unwrap();
-        let config = directory.join("ssh_config");
-        std::fs::write(&config, &rendered[rendered.find("Match host").unwrap()..]).unwrap();
-        let output = std::process::Command::new("ssh")
-            .args(["-G", "-F"])
-            .arg(&config)
-            .arg("synthetic.invalid")
-            .env("SSH_CAPTURE", &capture)
-            .env("HOME", &directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "OpenSSH mock configuration was rejected"
-        );
-        let arguments = std::fs::read_to_string(capture).unwrap();
-        assert_eq!(
-            arguments,
-            "access\nssh-gen\n--hostname\nsynthetic.invalid\n"
-        );
-        let configuration = String::from_utf8(output.stdout).unwrap();
-        assert!(
-            configuration
-                .lines()
-                .any(|line| line.starts_with("proxycommand ") && line.contains("cloudflared with"))
-        );
+        let ssh = std::env::var_os("CLOUDFLARED_SSH_TEST_BINARY").unwrap_or_else(|| "ssh".into());
+        let libraries = std::env::var_os("CLOUDFLARED_SSH_TEST_LIBRARY_PATH");
+        let mut version_command = std::process::Command::new(&ssh);
+        version_command.arg("-V");
+        if let Some(libraries) = &libraries {
+            version_command.env("LD_LIBRARY_PATH", libraries);
+        }
+        let version = version_command.output().unwrap();
+        let version = String::from_utf8_lossy(&version.stderr);
+        for filename in [
+            "cloudflared with 'quote'%literal".as_bytes(),
+            b"cloudflared with \"double\"\\backslash$(touch unintended-dollar)`touch unintended-backtick`*?[glob]%literal",
+            b"cloudflared with $(touch unintended-dollar)`touch unintended-backtick`*?[glob]%literal",
+            "cloudflared with 'unicode-\u{3bb}'%h".as_bytes(),
+            b"cloudflared with non-UTF8-\xff",
+        ] {
+            let executable = directory.join(std::ffi::OsString::from_vec(filename.to_vec()));
+            std::fs::write(&executable, b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SSH_CAPTURE\"\nexec 0<&- 1>&-\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let capture = directory.join("arguments");
+            let rendered = render_config("/synthetic/home", "synthetic.invalid", &executable, true).unwrap();
+            let config = directory.join("ssh_config");
+            std::fs::write(&config, &rendered[rendered.find("Match host").unwrap()..]).unwrap();
+            let mut command = tokio::process::Command::new(&ssh);
+            command.kill_on_drop(true);
+            command.args(["-G", "-F"]).arg(&config).arg("synthetic.invalid").env_clear().env("PATH", "/usr/bin:/bin")
+                .env("SSH_CAPTURE", &capture).env("HOME", &directory).current_dir(&directory);
+            if let Some(libraries) = &libraries { command.env("LD_LIBRARY_PATH", libraries); }
+            let output = tokio::time::timeout(Duration::from_secs(3), command.output()).await.expect("owned SSH parser did not exit").unwrap();
+            let error = String::from_utf8_lossy(&output.stderr).replace(directory.to_string_lossy().as_ref(), "<fixture>");
+            assert!(output.status.success(), "OpenSSH mock configuration rejected ({version}): {error}");
+            let arguments = std::fs::read_to_string(&capture).unwrap();
+            assert_eq!(arguments, "access\nssh-gen\n--hostname\nsynthetic.invalid\n");
+            assert!(!directory.join("unintended-dollar").exists());
+            assert!(!directory.join("unintended-backtick").exists());
+            let configuration = String::from_utf8(output.stdout).unwrap();
+            assert!(configuration.lines().any(|line| line.starts_with("proxycommand ") && (line.contains("cloudflared with") || line.contains("/bin/sh -c 'set -f; IFS=; exec $(printf "))));
+            std::fs::remove_file(&capture).unwrap();
+
+            let rendered = render_config("/synthetic/home", "synthetic.invalid", &executable, false).unwrap();
+            std::fs::write(&config, &rendered[rendered.find("Host synthetic.invalid").unwrap()..]).unwrap();
+            let mut command = tokio::process::Command::new(&ssh);
+            command.kill_on_drop(true).arg("-F").arg(&config).args([
+                "-T", "-o", "CanonicalizeHostname=no", "-o", "CanonicalDomains=none",
+                "-o", "CheckHostIP=no", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                "-o", "IdentityAgent=none", "-o", "IdentityFile=none", "-o", "CertificateFile=none",
+                "-o", "UserKnownHostsFile=/dev/null", "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "ProxyUseFdpass=no", "-o", "ConnectTimeout=1", "-o", "ConnectionAttempts=1",
+                "synthetic.invalid",
+            ]).env_clear().env("PATH", "/usr/bin:/bin").env("SSH_CAPTURE", &capture).env("HOME", &directory).current_dir(&directory);
+            if let Some(libraries) = &libraries { command.env("LD_LIBRARY_PATH", libraries); }
+            let output = tokio::time::timeout(Duration::from_secs(3), command.output()).await.expect("owned SSH proxy did not exit").unwrap();
+            let error = String::from_utf8_lossy(&output.stderr).replace(directory.to_string_lossy().as_ref(), "<fixture>");
+            assert_eq!(output.status.code(), Some(255), "Unexpected SSH mock exit ({version}): {error}");
+            assert!(error.contains("Connection closed"), "Expected mock handshake EOF ({version}): {error}");
+            assert_eq!(std::fs::read_to_string(&capture).unwrap(), "access\nssh\n--hostname\nsynthetic.invalid\n");
+            assert!(!directory.join("unintended-dollar").exists());
+            assert!(!directory.join("unintended-backtick").exists());
+            std::fs::remove_file(capture).unwrap();
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

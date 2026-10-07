@@ -17,12 +17,15 @@ struct Pair {
 }
 impl Pair {
     async fn send(&mut self, bytes: Vec<u8>) {
-        self.peer.send_datagram(Bytes::from(bytes)).await.unwrap();
+        self.try_send(bytes).await.unwrap();
+    }
+    async fn try_send(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.peer.send_datagram(Bytes::from(bytes)).await?;
         let bytes = timeout(Duration::from_secs(2), self.received.datagrams.recv())
             .await
             .unwrap()
             .unwrap();
-        self.connection.handle(bytes).await.unwrap();
+        self.connection.handle(bytes).await
     }
     async fn receive(&mut self) -> Bytes {
         timeout(Duration::from_secs(2), self.incoming.datagrams.recv())
@@ -30,6 +33,26 @@ impl Pair {
             .unwrap()
             .unwrap()
     }
+}
+
+fn icmp_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| matches!(error.raw_os_error(), Some(1 | 13 | 97 | 99)))
+}
+async fn assert_unavailable_icmp_cleanup(
+    pair: &mut Pair,
+    state: &NetworkState,
+    error: &anyhow::Error,
+) {
+    assert!(icmp_unavailable(error));
+    assert_eq!(state.icmp.len(), 0);
+    assert!(
+        timeout(Duration::from_millis(100), pair.incoming.datagrams.recv())
+            .await
+            .is_err(),
+        "denied ping socket must emit no reply or successful tracing datagram"
+    );
 }
 async fn pair(
     state: Arc<NetworkState>,
@@ -343,7 +366,7 @@ async fn udp_v3_real_idle_expiry_releases_flow_slot() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn icmp_unprivileged_loopback_kernel_id_restore_same_index_reconnect_and_cleanup() {
+async fn icmp_loopback_kernel_translation_reconnect_or_unavailable_socket_cleanup() {
     tokio::task::LocalSet::new()
         .run_until(async {
             for ipv4 in [true, false] {
@@ -384,12 +407,10 @@ async fn icmp_unprivileged_loopback_kernel_id_restore_same_index_reconnect_and_c
                     .unwrap()
                     .unwrap();
                 if let Err(error) = first.connection.handle(bytes).await {
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| matches!(e.raw_os_error(), Some(1 | 13 | 97 | 99)))
-                    {
+                    if icmp_unavailable(&error) {
+                        assert_unavailable_icmp_cleanup(&mut first, &state, &error).await;
                         eprintln!(
-                            "ICMP{} loopback proof owed: {error}",
+                            "ICMP{} kernel proof unavailable; denial cleanup verified: {error}",
                             if ipv4 { 4 } else { 6 }
                         );
                         continue;
@@ -444,7 +465,7 @@ async fn icmp_unprivileged_loopback_kernel_id_restore_same_index_reconnect_and_c
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn icmp_v2_real_request_and_first_reply_export_correlated_otlp() {
+async fn icmp_v2_kernel_correlated_otlp_or_unavailable_socket_cleanup() {
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use prost::Message;
     tokio::task::LocalSet::new()
@@ -464,15 +485,16 @@ async fn icmp_v2_real_request_and_first_reply_export_correlated_otlp() {
             }
             .encode()
             .unwrap();
-            pair.send(
-                DatagramV2::TracedIp {
-                    identity,
-                    payload: request,
+            let encoded=DatagramV2::TracedIp{identity,payload:request}.encode().unwrap();
+            if let Err(error)=pair.try_send(encoded).await {
+                if icmp_unavailable(&error) {
+                    assert_unavailable_icmp_cleanup(&mut pair,&state,&error).await;
+                    eprintln!("ICMPv2 kernel/OTLP proof unavailable; denial cleanup and absence of replies verified: {error}");
+                    pair.scope.cancellation().cancel();pair.client.close();pair.peer.close();
+                    return;
                 }
-                .encode()
-                .unwrap(),
-            )
-            .await;
+                panic!("unexpected ICMPv2 trace error: {error}");
+            }
             let mut names = Vec::new();
             let mut replies = 0;
             for _ in 0..3 {
