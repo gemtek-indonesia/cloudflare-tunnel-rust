@@ -27,6 +27,8 @@ Offline unit/component checks, [six pinned Go interoperability tests](../tests/i
 
 Repeated UDPv2 UUID registrations retire the prior session; stale cleanup cannot remove its replacement. Negative idle hints use the 210 s default, and positive hints below 8 ns use a nonzero check interval; these inputs panic in the pinned Go implementation. [UDPv2 lifecycle tests](../src/network/v2_lifecycle_tests.rs) cover replacement and malformed hints.
 
+UDPv3 permits 16 pending registration/response tasks per connection attempt. Additional registration datagrams are dropped without a response so existing retries can recover; payload and ICMP handling continue. This bound does not limit active sessions or change max-active-flows.
+
 ## Deliberate exclusions
 
 * Linux x86_64 CPU v2/v3 only; other architectures and operating systems are out of scope.
@@ -54,6 +56,7 @@ Origin CA pools combine native, Cloudflare, Hello and custom certificates. Malfo
 
 ## Known behavioral gaps
 
+* UDPv3 acknowledges a migration while the creator's first response is pending; pinned Go delays that acknowledgment until its session loop accepts migration. A canceled creator's matching session generation is retired, while exact migration acknowledgment ordering remains incomplete.
 * Certificates encoding IPv4-mapped addresses as 16-byte IP SANs are rejected, while Go treats them as IPv4 equivalents. Ordinary and mapped references verify against standard 4-byte IPv4 SANs. [TLS name tests](../src/crypto/name_tests.rs) preserve this fail-closed difference.
 * Environment proxy routing is absent for origins and consumers that use it upstream, including Access/JWKS/login/tail. Administration and Quick provisioning use direct transports upstream.
 * HTTP request spans and `Cf-Int-Cloudflared-Tracing` responses are absent. Private-network tracing has component coverage.

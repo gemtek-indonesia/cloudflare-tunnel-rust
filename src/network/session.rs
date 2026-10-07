@@ -39,6 +39,28 @@ struct Session {
     started: tokio::sync::Notify,
     metrics: Arc<crate::observability::metrics::Metrics>,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum RegistrationKind {
+    New,
+    Retry,
+    Migration,
+}
+struct V3Registration {
+    generation: u64,
+    kind: RegistrationKind,
+    registry: Weak<Registry>,
+    id: [u8; 16],
+    owns_pending_creation: bool,
+}
+impl Drop for V3Registration {
+    fn drop(&mut self) {
+        if self.owns_pending_creation
+            && let Some(registry) = self.registry.upgrade()
+        {
+            registry.remove_now(self.id, Some(self.generation));
+        }
+    }
+}
 impl Session {
     fn untrack(&self) {
         if self.version == DatagramVersion::V2 {
@@ -72,6 +94,9 @@ impl Registry {
         })
     }
     pub(crate) async fn remove(&self, id: [u8; 16], generation: Option<u64>) -> bool {
+        self.remove_now(id, generation)
+    }
+    fn remove_now(&self, id: [u8; 16], generation: Option<u64>) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions
             .get(&id)
@@ -188,24 +213,64 @@ impl Registry {
         id: [u8; 16],
         address: std::net::SocketAddr,
         idle: Duration,
-    ) -> Result<(Arc<Session>, bool)> {
+    ) -> Result<V3Registration> {
         let _creation = self.creation.lock().await;
         let existing = self.sessions.lock().unwrap().get(&id).cloned();
         if let Some(session) = existing {
             let current = session.route.borrow().clone();
-            if current.index != connection.index || current.generation != connection.generation {
+            let kind = if current.index != connection.index
+                || current.generation != connection.generation
+            {
                 session.route.send_replace(Route {
                     index: connection.index,
                     generation: connection.generation,
                     sender: connection.sender.clone(),
                     cancel: connection.cancel.clone(),
                 });
-            }
-            session.activity.send_replace(Instant::now());
-            return Ok((session, false));
+                session.activity.send_replace(Instant::now());
+                RegistrationKind::Migration
+            } else {
+                RegistrationKind::Retry
+            };
+            return Ok(V3Registration {
+                generation: session.generation,
+                kind,
+                registry: Arc::downgrade(self),
+                id,
+                owns_pending_creation: false,
+            });
         }
         let session = self.create(connection, id, address, idle, false).await?;
-        Ok((session, true))
+        Ok(V3Registration {
+            generation: session.generation,
+            kind: RegistrationKind::New,
+            registry: Arc::downgrade(self),
+            id,
+            owns_pending_creation: true,
+        })
+    }
+    async fn response_completed(&self, id: [u8; 16], mut registration: V3Registration, sent: bool) {
+        registration.owns_pending_creation = false;
+        if !sent && registration.kind == RegistrationKind::New {
+            self.remove_now(id, Some(registration.generation));
+            return;
+        }
+        if !sent {
+            return;
+        }
+        let sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions
+            .get(&id)
+            .filter(|session| session.generation == registration.generation)
+        {
+            match registration.kind {
+                RegistrationKind::New => session.started.notify_one(),
+                RegistrationKind::Retry => {
+                    session.activity.send_replace(Instant::now());
+                }
+                RegistrationKind::Migration => {}
+            }
+        }
     }
     async fn payload(&self, id: [u8; 16], payload: Vec<u8>) {
         let session = self.sessions.lock().unwrap().get(&id).cloned();
@@ -378,7 +443,12 @@ impl IdleTimeout {
         }
     }
     fn mark_active(&mut self, at: Instant) {
-        self.deadline = at + self.duration;
+        let active_at = if self.ticks.is_some() {
+            at
+        } else {
+            Instant::now()
+        };
+        self.deadline = active_at + self.duration;
     }
     async fn expired(&mut self) {
         if let Some(ticks) = &mut self.ticks {
@@ -484,16 +554,12 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
                         .map_err(anyhow::Error::msg)?,
                     ))
                     .await;
-                if let Ok((session, new)) = result {
-                    if sent.is_ok() {
-                        session.started.notify_one();
-                    } else if new {
-                        connection
-                            .state
-                            .v3
-                            .remove(id, Some(session.generation))
-                            .await;
-                    }
+                if let Ok(registration) = result {
+                    connection
+                        .state
+                        .v3
+                        .response_completed(id, registration, sent.is_ok())
+                        .await;
                 }
                 sent?;
             }
@@ -515,6 +581,18 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn v3_idle_refresh_uses_consumed_activity_time() {
+        let mut idle = IdleTimeout::new(DatagramVersion::V3, Duration::from_millis(100));
+        let recorded = Instant::now() + Duration::from_millis(10);
+        tokio::time::advance(Duration::from_millis(70)).await;
+        idle.mark_active(recorded);
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert!(idle.expired().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(40)).await;
+        assert!(idle.expired().now_or_never().is_some());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn v2_idle_uses_strict_periodic_checks_and_source_default() {

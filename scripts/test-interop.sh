@@ -53,6 +53,8 @@ cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/c
 cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
 cp "${repo_dir}/tests/interop/udp_v2_lifecycle_test.go" "${scratch}/connection/udp_v2_lifecycle_test.go"
 cp "${repo_dir}/tests/interop/udp_v2_cadence_test.go" "${scratch}/datagramsession/udp_v2_cadence_test.go"
+cp "${repo_dir}/tests/interop/udp_v3_ack_test.go" "${scratch}/connection/udp_v3_ack_test.go"
+cp "${repo_dir}/tests/interop/udp_v3_clock_test.go" "${scratch}/quic/v3/udp_v3_clock_test.go"
 cp "${repo_dir}/tests/interop/global_shutdown_test.go" "${scratch}/connection/global_shutdown_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/shutdown.go" "${scratch}/cmd/cloudflared/tunnel/rust_shutdown_exports.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_test.go" "${scratch}/cmd/cloudflared/rust_watcher_test.go"
@@ -64,6 +66,7 @@ done
 cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV2' -count=1 -timeout=20s -v ./datagramsession
+GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV3' -count=1 -timeout=20s -v ./quic/v3
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/oracle" ./tests/rust-interop-oracle
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/trust-oracle" "${repo_dir}/tests/interop/trust.go"

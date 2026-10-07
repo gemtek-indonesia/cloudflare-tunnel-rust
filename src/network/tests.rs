@@ -10,6 +10,9 @@ use tokio::time::timeout;
 #[path = "v2_lifecycle_tests.rs"]
 mod v2_lifecycle;
 
+#[path = "v3_ack_tests.rs"]
+mod v3_ack;
+
 struct Pair {
     client: QuicConnection,
     peer: QuicConnection,

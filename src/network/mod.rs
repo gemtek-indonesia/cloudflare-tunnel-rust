@@ -349,6 +349,79 @@ pub(crate) struct Connection {
     rpc_timeout: Duration,
     write_timeout: Duration,
 }
+
+pub(crate) async fn serve_datagrams(
+    connection: Arc<Connection>,
+    mut incoming: tokio::sync::mpsc::Receiver<Bytes>,
+) -> Result<()> {
+    const MAX_REGISTRATION_TASKS: usize = 16;
+    let cancel = connection.cancel.clone();
+    let mut registrations = tokio::task::JoinSet::new();
+    let result = 'dispatch: loop {
+        while let Some(completed) = registrations.try_join_next() {
+            match completed {
+                Ok(Err(error)) => warn_datagram(&connection, &error),
+                Err(error) => break 'dispatch Err(error.into()),
+                Ok(Ok(())) => {}
+            }
+        }
+        let bytes = tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            completed = registrations.join_next(), if !registrations.is_empty() => {
+                match completed {
+                    Some(Ok(Err(error))) => warn_datagram(&connection, &error),
+                    Some(Err(error)) => break Err(error.into()),
+                    _ => {}
+                }
+                continue;
+            }
+            bytes = incoming.recv() => match bytes {
+                Some(bytes) => bytes,
+                None => break Err(anyhow::anyhow!("datagram manager closed")),
+            },
+        };
+        if connection.version == DatagramVersion::V3 && bytes.first() == Some(&0) {
+            if registrations.len() == MAX_REGISTRATION_TASKS {
+                warn_datagram(
+                    &connection,
+                    &anyhow::anyhow!(
+                        "UDPv3 registration dropped while prior responses are pending"
+                    ),
+                );
+                continue;
+            }
+            let connection = connection.clone();
+            let cancel = cancel.clone();
+            registrations.spawn_local(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Ok(()),
+                    result = connection.handle(bytes) => result,
+                }
+            });
+            continue;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            result = connection.handle(bytes) => {
+                if let Err(error) = result {
+                    warn_datagram(&connection, &error);
+                }
+            }
+        }
+    };
+    registrations.abort_all();
+    while registrations.join_next().await.is_some() {}
+    result
+}
+fn warn_datagram(connection: &Connection, error: &anyhow::Error) {
+    let _ = connection.state.context.logger.log(
+        crate::observability::logging::Level::Warn,
+        crate::observability::logging::Event::Cloudflared,
+        &format!("Failed to handle datagram: {error}"),
+        serde_json::json!({}),
+    );
+}
 impl Connection {
     pub(crate) fn new(
         state: Arc<NetworkState>,

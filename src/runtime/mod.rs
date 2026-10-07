@@ -987,23 +987,11 @@ async fn serve_quic(
     let mut registered = None::<RegisteredConnection>;
     let mut _lease = None;
     let mut incoming = conn.take_incoming()?;
-    let shared = runtime.clone();
     let datagram_connection = connection.clone();
-    let cancel = pending.cancellation();
-    let mut datagrams = AbortTask(tokio::task::spawn_local(async move {
-        loop {
-            let bytes = tokio::select! {
-                _ = cancel.cancelled() => return Ok::<_,anyhow::Error>(()),
-                bytes = incoming.datagrams.recv() => bytes.context("datagram manager closed")?,
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                result = datagram_connection.handle(bytes) => {
-                    if let Err(error)=result {shared.warn(&format!("Failed to handle datagram: {error}"));}
-                }
-            }
-        }
-    }));
+    let mut datagrams = AbortTask(tokio::task::spawn_local(crate::network::serve_datagrams(
+        datagram_connection,
+        incoming.datagrams,
+    )));
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {

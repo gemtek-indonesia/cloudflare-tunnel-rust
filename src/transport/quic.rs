@@ -156,8 +156,29 @@ pub struct QuicSender {
     commands: mpsc::Sender<Command>,
     notify: Arc<Notify>,
     cancel: CancellationToken,
+    #[cfg(test)]
+    datagram_fault: Arc<std::sync::Mutex<Option<DatagramFault>>>,
+}
+#[cfg(test)]
+struct DatagramFault {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<io::Result<()>>,
 }
 impl QuicSender {
+    #[cfg(test)]
+    pub(crate) fn gate_next_registration_datagram(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<io::Result<()>>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut fault = self.datagram_fault.lock().unwrap();
+        assert!(fault.is_none(), "datagram fault already armed");
+        *fault = Some(DatagramFault {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
     pub async fn open_bi(&self) -> io::Result<QuicStream> {
         if self.cancel.is_cancelled() {
             return Err(closed());
@@ -170,6 +191,18 @@ impl QuicSender {
     pub async fn send_datagram(&self, payload: Bytes) -> io::Result<()> {
         if payload.len() > 1350 {
             return Err(io::ErrorKind::InvalidInput.into());
+        }
+        #[cfg(test)]
+        if payload.first() == Some(&3) {
+            let fault = self.datagram_fault.lock().unwrap().take();
+            if let Some(fault) = fault {
+                let _ = fault.entered.send(());
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err(closed()),
+                    result = fault.release => result.map_err(|_| closed())??,
+                }
+            }
         }
         let (tx, rx) = oneshot::channel();
         tokio::select! {_=self.cancel.cancelled()=>return Err(closed()),result=self.commands.send(Command::Datagram(payload,tx))=>result.map_err(|_|closed())?}
@@ -233,6 +266,8 @@ impl QuicConnection {
             commands: self.commands.clone(),
             notify: self.notify.clone(),
             cancel: self.cancel.clone(),
+            #[cfg(test)]
+            datagram_fault: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     pub fn take_incoming(&mut self) -> io::Result<QuicIncoming> {
