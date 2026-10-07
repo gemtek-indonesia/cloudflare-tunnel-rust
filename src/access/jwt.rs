@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-fn crypto_provider() {
+pub(super) fn crypto_provider() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
@@ -35,6 +35,26 @@ pub struct JwtVerifier {
 }
 
 impl JwtVerifier {
+    pub(crate) fn quick_tunnel() -> Result<Arc<Self>> {
+        Self::new(
+            "https://login.trycloudflare.com/.well-known/jwks.json",
+            "https://login.trycloudflare.com",
+            vec!["cloudflared-quick-tunnel".into()],
+            Algorithm::ES256,
+            Duration::from_secs(60),
+        )
+        .map(Arc::new)
+    }
+
+    pub(crate) async fn verify_broker(&self, token: &str) -> Result<Value> {
+        if self.algorithm != Algorithm::ES256
+            || self.issuer != "https://login.trycloudflare.com"
+            || self.audience != ["cloudflared-quick-tunnel"]
+        {
+            bail!("JWT verifier is not bound to the Quick Tunnel broker");
+        }
+        self.verify_with(token, &self.validation(), true).await
+    }
     pub fn access(config: &crate::config::AccessConfig) -> Result<Arc<Self>> {
         if config.team_name.is_empty()
             || config.team_name.len() > 63
@@ -105,7 +125,11 @@ impl JwtVerifier {
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&self.audience);
         validation.validate_nbf = true;
-        validation.leeway = 0;
+        validation.leeway = if self.algorithm == Algorithm::ES256 {
+            30
+        } else {
+            0
+        };
         validation
     }
 
@@ -168,7 +192,7 @@ impl JwtVerifier {
     }
 
     #[cfg(test)]
-    fn test_endpoint(
+    pub(crate) fn test_endpoint(
         endpoint: &str,
         issuer: &str,
         audience: Vec<String>,
@@ -213,21 +237,19 @@ impl JwtVerifier {
         }
         *self.refreshed.lock().await = Some(Instant::now());
         let fetch = async {
-            let request = http::Request::builder()
-                .uri(self.endpoint.clone())
-                .header(http::header::USER_AGENT, "cloudflared-rust")
-                .body(Full::new(Bytes::new()))?;
-            let mut response = self
-                .client
-                .request(request)
-                .await
-                .context("JWKS request failed")?;
-            if response.status() != 200 {
-                bail!("JWKS endpoint did not return HTTP 200");
+            let attempts = if self.algorithm == Algorithm::ES256 {
+                3
+            } else {
+                1
+            };
+            for attempt in 0..attempts {
+                match self.fetch_keys().await {
+                    Ok(keys) => return Ok(keys),
+                    Err(error) if attempt + 1 == attempts => return Err(error),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await,
+                }
             }
-            let body = bounded_body(&mut response, 1 << 20).await?;
-            serde_json::from_slice::<JwkSet>(&body)
-                .map_err(|_| anyhow::anyhow!("invalid JWKS response"))
+            unreachable!()
         };
         let keys = tokio::time::timeout(Duration::from_secs(5), fetch)
             .await
@@ -239,6 +261,23 @@ impl JwtVerifier {
         self.cached_key(key_id)
             .await?
             .context("JWT verification key unavailable")
+    }
+
+    async fn fetch_keys(&self) -> Result<JwkSet> {
+        let request = http::Request::builder()
+            .uri(self.endpoint.clone())
+            .header(http::header::USER_AGENT, "cloudflared-rust")
+            .body(Full::new(Bytes::new()))?;
+        let mut response = self
+            .client
+            .request(request)
+            .await
+            .context("JWKS request failed")?;
+        if response.status() != 200 {
+            bail!("JWKS endpoint did not return HTTP 200");
+        }
+        let body = bounded_body(&mut response, 1 << 20).await?;
+        serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid JWKS response"))
     }
 
     async fn cached_key(&self, key_id: &str) -> Result<Option<DecodingKey>> {
@@ -275,6 +314,12 @@ impl JwtVerifier {
                 .is_some_and(|usage| usage != "sig")
         {
             bail!("JWKS key does not permit the required signature algorithm");
+        }
+        if self.algorithm == Algorithm::ES256
+            && (value.get("kty").and_then(Value::as_str) != Some("EC")
+                || value.get("crv").and_then(Value::as_str) != Some("P-256"))
+        {
+            bail!("Quick Tunnel JWKS key must be P-256");
         }
         Ok(Some(DecodingKey::from_jwk(key)?))
     }

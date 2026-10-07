@@ -17,7 +17,7 @@ pub struct AccountClient {
     client: Client<hyper_boring::HttpsConnector<HttpConnector>, Full<Bytes>>,
 }
 
-pub(crate) fn verified_connector() -> Result<hyper_boring::HttpsConnector<HttpConnector>> {
+pub(crate) fn verified_tls_connector() -> Result<boring::ssl::SslConnectorBuilder> {
     let mut ssl = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())?;
     let certs = crate::crypto::native_roots()?;
     if certs.is_empty() {
@@ -29,6 +29,10 @@ pub(crate) fn verified_connector() -> Result<hyper_boring::HttpsConnector<HttpCo
     }
     ssl.set_cert_store_builder(roots);
     ssl.set_min_proto_version(Some(boring::ssl::SslVersion::TLS1_2))?;
+    Ok(ssl)
+}
+pub(crate) fn verified_connector() -> Result<hyper_boring::HttpsConnector<HttpConnector>> {
+    let ssl = verified_tls_connector()?;
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(15)));
@@ -258,6 +262,22 @@ impl AccountClient {
             .as_str()
             .map(str::to_owned)
             .context("unexpected tunnel token response")
+    }
+    pub async fn management_token(&self, id: Uuid, resource: &str) -> Result<String> {
+        if !matches!(resource, "logs" | "admin" | "host_details") {
+            bail!("resource must be one of: logs, admin, host_details");
+        }
+        self.request(
+            http::Method::POST,
+            &self.path(&format!("cfd_tunnel/{id}/management/{resource}")),
+            &[],
+            None,
+            true,
+        )
+        .await?["result"]
+            .as_str()
+            .map(str::to_owned)
+            .context("unexpected management token response")
     }
     pub async fn connections(&self, id: Uuid) -> Result<Value> {
         Ok(self

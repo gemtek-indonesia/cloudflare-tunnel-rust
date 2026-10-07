@@ -1,4 +1,4 @@
-use super::credentials::{AccountCredentials, atomic_create};
+use super::credentials::{AccountCredentials, atomic_create, atomic_replace};
 use crate::cli::Invocation;
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE};
@@ -68,12 +68,29 @@ pub async fn execute(invocation: &Invocation) -> Result<()> {
     if fed {
         cert.endpoint = "fed".into();
     }
-    atomic_create(&path, &cert.encode()?, 0o600)?;
+    save_certificate(&path, &cert.encode()?)?;
     println!(
         "You have successfully logged in. Your credentials have been saved to {}",
         path.display()
     );
     Ok(())
+}
+
+fn save_certificate(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 0 =>
+        {
+            atomic_replace(path, body, 0o600)
+        }
+        Ok(_) => bail!(
+            "Existing certificate would be overwritten; move or delete it before running cloudflared login again."
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_create(path, body, 0o600)
+        }
+        Err(error) => Err(error).context("cannot inspect certificate destination"),
+    }
 }
 
 async fn fetch_certificate(request_url: &str) -> Result<Vec<u8>> {
@@ -108,6 +125,25 @@ async fn fetch_certificate(request_url: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_certificate_replaced_and_existing_credentials_preserved() {
+        let dir = std::env::temp_dir().join(format!(
+            "cloudflared-login-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("cert.pem");
+        atomic_create(&path, b"", 0o644).unwrap();
+        save_certificate(&path, b"synthetic-certificate").unwrap();
+        assert!(save_certificate(&path, b"must not overwrite").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"synthetic-certificate");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
     use std::{

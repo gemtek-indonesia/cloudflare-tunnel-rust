@@ -7,16 +7,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"time"
 
+	cfaccess "github.com/cloudflare/cloudflared/cmd/cloudflared/access"
+	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
+	"github.com/cloudflare/cloudflared/ingress"
 	quicwire "github.com/cloudflare/cloudflared/quic"
 	v3 "github.com/cloudflare/cloudflared/quic/v3"
 	"github.com/cloudflare/cloudflared/tunnelrpc"
@@ -204,6 +210,23 @@ func main() {
 		panic("oracle mode argument required")
 	}
 	switch os.Args[1] {
+	case "access-url":
+		accessURLCorpus(os.Args[2])
+	case "quick-mime":
+		var inputs []string
+		must(json.Unmarshal([]byte(os.Args[2]), &inputs))
+		results := make([]bool, 0, len(inputs))
+		for _, input := range inputs {
+			mediaType, _, err := mime.ParseMediaType(input)
+			results = append(results, err == nil && mediaType == "application/x-www-form-urlencoded")
+		}
+		must(json.NewEncoder(os.Stdout).Encode(results))
+	case "origins":
+		originsCorpus(os.Args[2])
+	case "regex":
+		regexCorpus(os.Args[2])
+	case "ingress":
+		ingressCorpus(os.Args[2])
 	case "fixtures":
 		fixtures(os.Args[2])
 	case "decode":
@@ -215,4 +238,77 @@ func main() {
 	default:
 		panic("unknown oracle mode")
 	}
+}
+
+func accessURLCorpus(input string) {
+	var vectors []struct {
+		Input string `json:"input"`
+		Curl  bool   `json:"curl"`
+	}
+	must(json.Unmarshal([]byte(input), &vectors))
+	results := make([]map[string]any, 0, len(vectors))
+	for _, vector := range vectors {
+		var parsed *url.URL
+		var err error
+		if vector.Curl {
+			parsed, err = cfaccess.RustInteropCurlURL(vector.Input)
+		} else {
+			parsed, err = cfaccess.RustInteropAccessURL(vector.Input)
+		}
+		result := map[string]any{"valid": err == nil}
+		if err == nil {
+			result["url"] = parsed.String()
+			result["host"] = parsed.Host
+			result["path"] = parsed.EscapedPath()
+			result["query"] = parsed.RawQuery
+			request, requestErr := http.NewRequest(http.MethodHead, parsed.String(), nil)
+			result["request_valid"] = requestErr == nil
+			if requestErr == nil {
+				result["request_uri"] = request.URL.RequestURI()
+				result["request_host"] = request.Host
+			}
+		}
+		results = append(results, result)
+	}
+	must(json.NewEncoder(os.Stdout).Encode(results))
+}
+
+func regexCorpus(input string) {
+	var vectors []struct {
+		Pattern string   `json:"pattern"`
+		Inputs  []string `json:"inputs"`
+	}
+	must(json.Unmarshal([]byte(input), &vectors))
+	results := make([]map[string]any, 0, len(vectors))
+	for _, vector := range vectors {
+		expression, err := regexp.Compile(vector.Pattern)
+		matches := make([]bool, 0, len(vector.Inputs))
+		if err == nil {
+			for _, input := range vector.Inputs {
+				matches = append(matches, expression.MatchString(input))
+			}
+		}
+		results = append(results, map[string]any{"valid": err == nil, "matches": matches})
+	}
+	must(json.NewEncoder(os.Stdout).Encode(results))
+}
+
+func ingressCorpus(input string) {
+	var vectors []struct {
+		Configuration config.Configuration `json:"configuration"`
+		Disable       bool                 `json:"disable"`
+		URL           string               `json:"url"`
+	}
+	must(json.Unmarshal([]byte(input), &vectors))
+	results := make([]int, 0, len(vectors))
+	for _, vector := range vectors {
+		parsed, err := ingress.ParseIngress(&vector.Configuration)
+		must(err)
+		parsed.DisablePathNormalization = vector.Disable
+		request, err := url.Parse(vector.URL)
+		must(err)
+		_, index := parsed.FindMatchingRule(request.Host, request.Path)
+		results = append(results, index)
+	}
+	must(json.NewEncoder(os.Stdout).Encode(results))
 }

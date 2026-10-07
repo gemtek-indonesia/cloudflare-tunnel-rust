@@ -1,8 +1,11 @@
-use crate::{administration::credentials::atomic_create, cli::Invocation};
+use crate::{
+    administration::credentials::{atomic_create, atomic_replace},
+    cli::Invocation,
+};
 use anyhow::{Context, Result, bail};
 use std::{
     fs,
-    os::unix::fs::{DirBuilderExt, symlink},
+    os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -225,6 +228,7 @@ pub fn install(
             .create(&config_dir)?;
     }
     let mut created = Vec::new();
+    let mut replaced_token = None;
     let enabled_path = match init {
         InitSystem::Systemd => Some(rooted(
             root,
@@ -246,8 +250,26 @@ pub fn install(
     let result = (|| -> Result<()> {
         if let Some(token) = token {
             let path = config_dir.join("token");
-            atomic_create(&path, token.as_bytes(), 0o600)?;
-            created.push(path);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        bail!("service token destination must be a regular file");
+                    }
+                    replaced_token = Some((
+                        path.clone(),
+                        fs::read(&path)?,
+                        metadata.permissions().mode() & 0o777,
+                    ));
+                    atomic_replace(&path, token.as_bytes(), 0o600)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    atomic_create(&path, token.as_bytes(), 0o600)?;
+                    created.push(path);
+                }
+                Err(error) => {
+                    return Err(error).context("cannot inspect service token destination");
+                }
+            }
         } else {
             let source = source.context("no configuration file found")?;
             let dest = config_dir.join("config.yml");
@@ -325,6 +347,11 @@ pub fn install(
             if let Err(error) = fs::remove_file(path) {
                 cleanup_errors.push(format!("could not remove created service file: {error}"));
             }
+        }
+        if let Some((path, body, mode)) = replaced_token
+            && let Err(error) = atomic_replace(&path, &body, mode)
+        {
+            cleanup_errors.push(format!("could not restore previous service token: {error}"));
         }
         if init == InitSystem::Systemd
             && enabled_here
@@ -417,6 +444,51 @@ pub fn uninstall(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn existing_service_token_replaced_on_success_restored_on_failed_start() {
+        for fail_start in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "cloudflared-service-token-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(rooted(&dir, "/etc/cloudflared")).unwrap();
+            let token = rooted(&dir, "/etc/cloudflared/token");
+            atomic_create(&token, b"previous", 0o400).unwrap();
+            let mut run = |_: &str, args: &[String]| {
+                if fail_start && args.first().is_some_and(|arg| arg == "start") {
+                    bail!("synthetic start failure");
+                }
+                Ok(())
+            };
+            let result = install(
+                &dir,
+                InitSystem::Systemd,
+                Path::new("/usr/bin/cloudflared"),
+                &[],
+                Some("replacement"),
+                None,
+                &mut run,
+            );
+            assert_eq!(result.is_err(), fail_start);
+            assert_eq!(
+                fs::read(&token).unwrap(),
+                if fail_start {
+                    &b"previous"[..]
+                } else {
+                    &b"replacement"[..]
+                }
+            );
+            assert_eq!(
+                fs::metadata(&token).unwrap().permissions().mode() & 0o777,
+                if fail_start { 0o400 } else { 0o600 }
+            );
+            assert_eq!(
+                rooted(&dir, "/etc/systemd/system/cloudflared.service").exists(),
+                !fail_start
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
     #[test]
     fn service_files_commands_no_secret_in_unit_and_rollback() {
         for init in [InitSystem::Systemd, InitSystem::OpenRc, InitSystem::SysV] {

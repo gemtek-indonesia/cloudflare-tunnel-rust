@@ -1,9 +1,12 @@
 mod credentials;
 mod ingress;
+mod regexp;
+pub use regexp::compile as compile_ingress_path;
 
 pub use credentials::{Credentials, credentials_from_token, resolve_credentials};
 pub use ingress::{
     AccessConfig, DurationValue, IngressRule, OriginRequest, canonical_path, validate_ingress,
+    validate_ingress_paths,
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +20,63 @@ use std::{
 
 pub const UPSTREAM_VERSION: &str = "2026.10.0";
 pub const UPSTREAM_COMMIT: &str = "18cdfe0a6fc7b72a0702d255a1f984e776ce0498";
+
+pub fn socket_host(url: &url::Url) -> Result<String> {
+    match url.host().context("URL requires a hostname")? {
+        url::Host::Domain(host) => Ok(host.to_owned()),
+        url::Host::Ipv4(address) => Ok(address.to_string()),
+        url::Host::Ipv6(address) => Ok(address.to_string()),
+    }
+}
+
+pub fn matcher_path(path: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut input = path.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = input
+                .next()
+                .and_then(|byte| (byte as char).to_digit(16))
+                .context("invalid URL path escape")?;
+            let low = input
+                .next()
+                .and_then(|byte| (byte as char).to_digit(16))
+                .context("invalid URL path escape")?;
+            bytes.push((high * 16 + low) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let mut path = String::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(valid) => {
+                path.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let prefix = error.valid_up_to();
+                path.push_str(std::str::from_utf8(&bytes[offset..offset + prefix])?);
+                path.push(char::REPLACEMENT_CHARACTER);
+                // Go utf8.DecodeRune consumes one byte for every invalid encoding.
+                offset += prefix + 1;
+            }
+        }
+    }
+    Ok(path)
+}
+
+pub fn ingress_requires_normalization(config: &LoadedConfig) -> bool {
+    config.ingress.iter().any(|rule| {
+        config
+            .origin_request
+            .merged(&rule.origin_request)
+            .access
+            .as_ref()
+            .is_some_and(|access| access.required)
+    })
+}
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct LoadedConfig {
@@ -171,7 +231,21 @@ pub struct RunConfig {
     pub connection_window: u64,
     pub stream_window: u64,
     pub edge_ca: Option<PathBuf>,
+    pub max_active_flows: Option<u64>,
+    pub dns_resolver_addrs: Vec<std::net::SocketAddr>,
+    pub icmpv4_src: Option<std::net::Ipv4Addr>,
+    pub icmpv6_src: Option<String>,
+    pub features: Vec<String>,
+    pub logging: crate::observability::logging::Options,
+    pub known_secrets: Vec<String>,
+    pub management_hostname: String,
+    pub service_op_ip: String,
+    pub diagnostic_cli_flags: BTreeMap<String, String>,
+    pub management_diagnostics: bool,
+    pub connector_label: String,
     pub token_authenticated: bool,
+    pub quick_hostname: String,
+    pub quick_authorizer: Option<std::sync::Arc<crate::quick_tunnel::auth::Authorizer>>,
     pub rpc_timeout: Duration,
     pub write_stream_timeout: Duration,
     pub dial_edge_timeout: Duration,

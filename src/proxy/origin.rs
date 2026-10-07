@@ -35,14 +35,18 @@ pub enum Service {
     Http(url::Url),
     Unix { path: PathBuf, tls: bool },
     Status(u16),
-    HelloWorld,
+    Tcp { destination: String, socks: bool },
+    Bastion { socks: bool },
+    Socks(Vec<super::tcp::Rule>),
 }
 
 pub struct Origin {
     pub service: Service,
     pub settings: OriginRequest,
+    pub verifier: Option<std::sync::Arc<crate::access::jwt::JwtVerifier>>,
     client: Option<Client<OriginConnector, ChannelBody>>,
     websocket_client: Option<Client<OriginConnector, ChannelBody>>,
+    _hello: Option<super::hello::Server>,
 }
 
 pub struct OriginResponse {
@@ -51,23 +55,14 @@ pub struct OriginResponse {
 
 impl Origin {
     pub fn new(service: &str, settings: OriginRequest) -> Result<Self> {
-        if settings
+        let verifier = settings
             .access
             .as_ref()
-            .is_some_and(|access| access.required)
-        {
-            bail!(
-                "Origin Access JWT enforcement is not implemented; refusing an unprotected proxy"
-            );
-        }
-        if settings.bastion_mode == Some(true)
-            || settings
-                .proxy_type
-                .as_ref()
-                .is_some_and(|kind| !kind.is_empty())
-        {
-            bail!("Origin bastion/SOCKS behavior is not implemented yet");
-        }
+            .filter(|access| access.required && !access.team_name.is_empty())
+            .map(crate::access::jwt::JwtVerifier::access)
+            .transpose()?;
+        let socks = settings.proxy_type.as_deref() == Some("socks");
+        let mut hello = None;
         let service = if let Some(status) = service.strip_prefix("http_status:") {
             Service::Status(status.parse()?)
         } else if let Some(path) = service.strip_prefix("unix+tls:") {
@@ -81,13 +76,32 @@ impl Origin {
                 tls: false,
             }
         } else if ["hello_world", "hello-world"].contains(&service) {
-            Service::HelloWorld
+            let (url, server) = super::hello::start()?;
+            hello = Some(server);
+            Service::Http(url)
+        } else if service == "socks-proxy" {
+            Service::Socks(super::tcp::rules(&settings.ip_rules)?)
+        } else if service == "bastion" || settings.bastion_mode == Some(true) {
+            Service::Bastion { socks }
         } else {
             let url = url::Url::parse(service).context("invalid origin URL")?;
             if !["http", "https", "ws", "wss"].contains(&url.scheme()) {
-                bail!("Non-HTTP ingress service is not implemented yet");
+                let host = crate::config::socket_host(&url)?;
+                let port = url.port().unwrap_or(match url.scheme() {
+                    "ssh" => 22,
+                    "rdp" => 3389,
+                    "smb" => 445,
+                    _ => 7864,
+                });
+                let destination = if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                Service::Tcp { destination, socks }
+            } else {
+                Service::Http(url)
             }
-            Service::Http(url)
         };
         let (client, websocket_client) =
             if matches!(service, Service::Http(_) | Service::Unix { .. }) {
@@ -104,8 +118,10 @@ impl Origin {
         Ok(Self {
             service,
             settings,
+            verifier,
             client,
             websocket_client,
+            _hello: hello,
         })
     }
 

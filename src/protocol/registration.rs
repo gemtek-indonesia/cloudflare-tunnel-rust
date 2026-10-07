@@ -1,6 +1,7 @@
 use super::tunnelrpc_capnp as wire;
+use crate::observability::metrics::Metrics;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::watch,
@@ -121,6 +122,7 @@ pub struct RegisteredConnection {
     identity: ConnectionIdentity,
     details: ConnectionDetails,
     timeout: Duration,
+    metrics: Arc<Metrics>,
 }
 impl RegisteredConnection {
     pub fn identity(&self) -> &ConnectionIdentity {
@@ -157,8 +159,15 @@ impl RegisteredConnection {
         &self,
         config: &[u8],
     ) -> futures::future::LocalBoxFuture<'static, Result<(), RegistrationError>> {
+        let mut observed = self
+            .metrics
+            .rpc_client("registration", "update_local_configuration");
         if let Err(error) = self.check_ready() {
-            return Box::pin(async move { Err(error) });
+            observed.failed();
+            return Box::pin(async move {
+                drop(observed);
+                Err(error)
+            });
         }
         let mut request = self.client.update_local_configuration_request();
         request.get().set_config(config);
@@ -166,25 +175,44 @@ impl RegisteredConnection {
         let pending = request.send().promise;
         let liveness = self.liveness();
         Box::pin(async move {
-            tokio::time::timeout(timeout, pending)
-                .await
-                .map_err(|_| RegistrationError::Timeout)??;
-            if liveness.is_ready() {
-                Ok(())
-            } else {
-                Err(RegistrationError::Disconnected)
+            let result = async {
+                tokio::time::timeout(timeout, pending)
+                    .await
+                    .map_err(|_| RegistrationError::Timeout)??;
+                if liveness.is_ready() {
+                    Ok(())
+                } else {
+                    Err(RegistrationError::Disconnected)
+                }
             }
+            .await;
+            if result.is_err() {
+                observed.failed();
+            }
+            result
         })
     }
     pub async fn unregister(mut self, grace_period: Duration) -> Result<(), RegistrationError> {
-        self.check_ready()?;
-        let deadline = tokio::time::Instant::now() + grace_period;
-        tokio::time::timeout_at(
-            deadline,
-            self.client.unregister_connection_request().send().promise,
-        )
-        .await
-        .map_err(|_| RegistrationError::Timeout)??;
+        let mut observed = self
+            .metrics
+            .rpc_client("registration", "unregister_connection");
+        let result = async {
+            self.check_ready()?;
+            let deadline = tokio::time::Instant::now() + grace_period;
+            tokio::time::timeout_at(
+                deadline,
+                self.client.unregister_connection_request().send().promise,
+            )
+            .await
+            .map_err(|_| RegistrationError::Timeout)??;
+            Ok::<_, RegistrationError>(deadline)
+        }
+        .await;
+        if result.is_err() {
+            observed.failed();
+        }
+        drop(observed);
+        let deadline = result?;
         if let Some(disconnect) = self.driver.disconnect.take() {
             tokio::time::timeout_at(deadline, disconnect)
                 .await
@@ -199,6 +227,7 @@ pub async fn register_connection<T: AsyncRead + AsyncWrite + Unpin + 'static>(
     control: T,
     request: RegistrationRequest,
     timeout: Duration,
+    metrics: Arc<Metrics>,
 ) -> Result<RegisteredConnection, RegistrationError> {
     if request.auth.account_tag.is_empty() || request.auth.tunnel_secret.is_empty() {
         return Err(RegistrationError::Invalid("empty tunnel credentials"));
@@ -229,6 +258,7 @@ pub async fn register_connection<T: AsyncRead + AsyncWrite + Unpin + 'static>(
         cancel: tokio_util::sync::CancellationToken::new(),
     };
     let mut call = client.register_connection_request();
+    let mut observed = metrics.rpc_client("registration", "register_connection");
     {
         let mut params = call.get();
         params.set_tunnel_id(request.tunnel_id.as_bytes());
@@ -260,41 +290,50 @@ pub async fn register_connection<T: AsyncRead + AsyncWrite + Unpin + 'static>(
             features.set(i as u32, feature);
         }
     }
-    let answer = tokio::time::timeout(timeout, call.send().promise)
-        .await
-        .map_err(|_| RegistrationError::Timeout)??;
-    let result = answer.get()?.get_result()?.get_result();
-    let details = match result.which().map_err(capnp::Error::from)? {
-        wire::connection_response::result::Error(error) => {
-            let error = error?;
-            let cause = error
-                .get_cause()?
-                .to_str()
-                .map_err(|e| RegistrationError::Rpc(capnp::Error::failed(e.to_string())))?
-                .to_owned();
-            return Err(if error.get_should_retry() {
-                RegistrationError::RetryAfter {
-                    cause,
-                    delay: Duration::from_nanos(error.get_retry_after().max(0) as u64),
-                }
-            } else {
-                RegistrationError::Rejected { cause }
-            });
-        }
-        wire::connection_response::result::ConnectionDetails(details) => {
-            let details = details?;
-            ConnectionDetails {
-                uuid: Uuid::from_slice(details.get_uuid()?)
-                    .map_err(|_| RegistrationError::Invalid("invalid edge connection UUID"))?,
-                location: details
-                    .get_location_name()?
+    let outcome = async {
+        let answer = tokio::time::timeout(timeout, call.send().promise)
+            .await
+            .map_err(|_| RegistrationError::Timeout)??;
+        let result = answer.get()?.get_result()?.get_result();
+        let details = match result.which().map_err(capnp::Error::from)? {
+            wire::connection_response::result::Error(error) => {
+                let error = error?;
+                let cause = error
+                    .get_cause()?
                     .to_str()
                     .map_err(|e| RegistrationError::Rpc(capnp::Error::failed(e.to_string())))?
-                    .into(),
-                remotely_managed: details.get_tunnel_is_remotely_managed(),
+                    .to_owned();
+                return Err(if error.get_should_retry() {
+                    RegistrationError::RetryAfter {
+                        cause,
+                        delay: Duration::from_nanos(error.get_retry_after().max(0) as u64),
+                    }
+                } else {
+                    RegistrationError::Rejected { cause }
+                });
             }
-        }
-    };
+            wire::connection_response::result::ConnectionDetails(details) => {
+                let details = details?;
+                ConnectionDetails {
+                    uuid: Uuid::from_slice(details.get_uuid()?)
+                        .map_err(|_| RegistrationError::Invalid("invalid edge connection UUID"))?,
+                    location: details
+                        .get_location_name()?
+                        .to_str()
+                        .map_err(|e| RegistrationError::Rpc(capnp::Error::failed(e.to_string())))?
+                        .into(),
+                    remotely_managed: details.get_tunnel_is_remotely_managed(),
+                }
+            }
+        };
+        Ok::<_, RegistrationError>(details)
+    }
+    .await;
+    if outcome.is_err() {
+        observed.failed();
+    }
+    drop(observed);
+    let details = outcome?;
     let registered = RegisteredConnection {
         client,
         driver,
@@ -306,6 +345,7 @@ pub async fn register_connection<T: AsyncRead + AsyncWrite + Unpin + 'static>(
         },
         details,
         timeout,
+        metrics,
     };
     registered.check_ready()?;
     Ok(registered)

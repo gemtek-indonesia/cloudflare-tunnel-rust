@@ -387,3 +387,143 @@ async fn h2_edge_preserves_serialized_response_headers() {
     server.abort();
     origin_task.abort();
 }
+
+#[tokio::test]
+async fn origin_access_admits_before_status_and_hello_world() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let rsa = boring::rsa::Rsa::generate(2048).unwrap();
+    let signing = EncodingKey::from_rsa_pem(&rsa.private_key_to_pem().unwrap()).unwrap();
+    let keys=Bytes::from(serde_json::to_vec(&serde_json::json!({"keys":[{"kty":"RSA","kid":"synthetic","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(rsa.n().to_vec()),"e":URL_SAFE_NO_PAD.encode(rsa.e().to_vec())}]})).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ =
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            hyper::service::service_fn(
+                                move |_: http::Request<hyper::body::Incoming>| {
+                                    let keys = keys.clone();
+                                    async move {
+                                        Ok::<_, io::Error>(http::Response::new(Full::new(keys)))
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+            });
+        }
+    });
+    let verifier = Arc::new(
+        crate::access::jwt::JwtVerifier::test_endpoint(
+            &format!("http://{address}/"),
+            "https://synthetic.cloudflareaccess.com",
+            vec!["synthetic-aud".into()],
+            Algorithm::RS256,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    );
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("synthetic".into());
+    let valid=jsonwebtoken::encode(&header,&serde_json::json!({"iss":"https://synthetic.cloudflareaccess.com","aud":"synthetic-aud","exp":jsonwebtoken::get_current_timestamp()+300}),&signing).unwrap();
+    let wrong=jsonwebtoken::encode(&header,&serde_json::json!({"iss":"https://synthetic.cloudflareaccess.com","aud":"wrong-aud","exp":jsonwebtoken::get_current_timestamp()+300}),&signing).unwrap();
+    for service in ["http_status:410", "hello_world"] {
+        let settings = config::OriginRequest {
+            access: Some(config::AccessConfig {
+                required: true,
+                team_name: "synthetic".into(),
+                aud_tag: vec!["synthetic-aud".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state = state_with_settings(service, settings.clone());
+        let mut origin = Origin::new(service, settings).unwrap();
+        origin.verifier = Some(verifier.clone());
+        state.snapshot.write().await.origins[0] = Arc::new(origin);
+        for (jwt, expected) in [
+            (None, "403"),
+            (Some(wrong.as_str()), "403"),
+            (
+                Some(valid.as_str()),
+                if service == "hello_world" {
+                    "200"
+                } else {
+                    "410"
+                },
+            ),
+        ] {
+            let mut head = request("GET", false);
+            if let Some(jwt) = jwt {
+                head.metadata
+                    .push(("HttpHeader:Cf-Access-Jwt-Assertion".into(), jwt.into()));
+            }
+            let (mut client, stream) = tokio::io::duplex(1024);
+            let task = tokio::spawn(serve_data(stream, head, state.clone()));
+            let response = crate::protocol::metadata::read_connect_response(&mut client)
+                .await
+                .unwrap();
+            assert!(
+                response
+                    .metadata
+                    .iter()
+                    .any(|(name, value)| name == "HttpStatus" && value == expected)
+            );
+            let mut body = Vec::new();
+            client.read_to_end(&mut body).await.unwrap();
+            task.await.unwrap().unwrap();
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn public_tcp_websocket_frames_reach_origin() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message, protocol::Role},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 4];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let state = state(&format!("tcp://{address}"));
+    let (mut client, stream) = tokio::io::duplex(1024);
+    let task = tokio::spawn(serve_data(stream, request("GET", true), state));
+    let response = crate::protocol::metadata::read_connect_response(&mut client)
+        .await
+        .unwrap();
+    assert!(
+        response
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "HttpStatus" && value == "101")
+    );
+    let mut websocket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    websocket
+        .send(Message::Binary(Bytes::from_static(b"ping")))
+        .await
+        .unwrap();
+    let response = websocket.next().await.unwrap().unwrap();
+    assert_eq!(response.into_data(), b"pong".as_slice());
+    drop(websocket);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    origin.await.unwrap();
+}

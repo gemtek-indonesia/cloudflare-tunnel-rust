@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::Duration;
 
@@ -129,9 +128,14 @@ pub struct IngressRule {
 }
 
 pub fn validate_ingress(rules: &[IngressRule]) -> Result<()> {
+    validate_ingress_paths(rules).map(|_| ())
+}
+
+pub fn validate_ingress_paths(rules: &[IngressRule]) -> Result<Vec<Option<regex::Regex>>> {
     if rules.is_empty() {
         bail!("The config file doesn't contain any ingress rules");
     }
+    let mut paths = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let catch_all = (rule.hostname.is_empty() || rule.hostname == "*") && rule.path.is_empty();
         if rule
@@ -162,10 +166,14 @@ pub fn validate_ingress(rules: &[IngressRule]) -> Result<()> {
                 rule.hostname
             );
         }
-        if !rule.path.is_empty() {
-            Regex::new(&rule.path)
-                .with_context(|| format!("Rule #{} has an invalid regex", index + 1))?;
-        }
+        paths.push(if rule.path.is_empty() {
+            None
+        } else {
+            Some(
+                super::compile_ingress_path(&rule.path)
+                    .with_context(|| format!("Rule #{} has an invalid regex", index + 1))?,
+            )
+        });
         if let Some(access) = &rule.origin_request.access
             && access.required
             && access.team_name.is_empty()
@@ -175,7 +183,7 @@ pub fn validate_ingress(rules: &[IngressRule]) -> Result<()> {
         }
         validate_service(&rule.service)?;
     }
-    Ok(())
+    Ok(paths)
 }
 
 fn validate_service(service: &str) -> Result<()> {
@@ -206,7 +214,18 @@ fn validate_service(service: &str) -> Result<()> {
 
 impl IngressRule {
     pub fn matches(&self, hostname: &str, path: &str, normalize: bool) -> Result<bool> {
-        let matches_host = self.hostname.is_empty()
+        let matches_host = self.matches_hostname(hostname);
+        let path = if normalize {
+            canonical_path(path)
+        } else {
+            path.to_owned()
+        };
+        Ok(matches_host
+            && (self.path.is_empty() || super::compile_ingress_path(&self.path)?.is_match(&path)))
+    }
+
+    pub fn matches_hostname(&self, hostname: &str) -> bool {
+        self.hostname.is_empty()
             || self.hostname == "*"
             || self.hostname == hostname
             || self
@@ -215,13 +234,7 @@ impl IngressRule {
                 .is_some_and(|suffix| hostname.ends_with(&format!(".{suffix}")))
             || url::Host::parse(&self.hostname)
                 .ok()
-                .is_some_and(|host| host.to_string() == hostname);
-        let path = if normalize {
-            canonical_path(path)
-        } else {
-            path.to_owned()
-        };
-        Ok(matches_host && (self.path.is_empty() || Regex::new(&self.path)?.is_match(&path)))
+                .is_some_and(|host| host.to_string() == hostname)
     }
 }
 

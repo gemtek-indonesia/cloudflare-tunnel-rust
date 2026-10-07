@@ -99,6 +99,68 @@ pub fn cert_path(explicit: &str) -> Result<PathBuf> {
 }
 
 pub fn atomic_create(path: &Path, body: &[u8], mode: u32) -> Result<()> {
+    atomic_create_with_sync(path, body, mode, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+fn atomic_create_with_sync(
+    path: &Path,
+    body: &[u8],
+    mode: u32,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = parent.join(format!(".cloudflared-{}", uuid::Uuid::new_v4()));
+    let mut linked = false;
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temporary)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        std::fs::hard_link(&temporary, path)
+            .context("credential destination already exists or cannot be created")?;
+        linked = true;
+        sync_parent(parent)?;
+        Ok(())
+    })();
+    if result.is_err() && linked {
+        use std::os::unix::fs::MetadataExt;
+        let ours = std::fs::metadata(&temporary)?;
+        if std::fs::symlink_metadata(path).is_ok_and(|destination| {
+            destination.dev() == ours.dev() && destination.ino() == ours.ino()
+        }) {
+            std::fs::remove_file(path)
+                .context("failed credential creation left a destination requiring cleanup")?;
+        }
+    }
+    let cleanup = std::fs::remove_file(&temporary);
+    if result.is_ok() {
+        cleanup?;
+    }
+    result
+}
+
+pub fn atomic_replace(path: &Path, body: &[u8], mode: u32) -> Result<()> {
+    atomic_replace_with_sync(path, body, mode, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+fn atomic_replace_with_sync(
+    path: &Path,
+    body: &[u8],
+    mode: u32,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!("credential destination must not be a symlink");
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -112,14 +174,12 @@ pub fn atomic_create(path: &Path, body: &[u8], mode: u32) -> Result<()> {
             .open(&temporary)?;
         file.write_all(body)?;
         file.sync_all()?;
-        std::fs::hard_link(&temporary, path)
-            .context("credential destination already exists or cannot be created")?;
-        std::fs::File::open(parent)?.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_parent(parent)?;
         Ok(())
     })();
-    let cleanup = std::fs::remove_file(&temporary);
-    if result.is_ok() {
-        cleanup?;
+    if temporary.exists() {
+        std::fs::remove_file(temporary)?;
     }
     result
 }
@@ -128,6 +188,47 @@ pub fn atomic_create(path: &Path, body: &[u8], mode: u32) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn atomic_replace_preserves_destination_on_failure_and_restricts_new_file() {
+        let dir =
+            std::env::temp_dir().join(format!("cloudflared-replace-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("token");
+        assert!(
+            atomic_create_with_sync(&path, b"failed-create", 0o600, |_| Err(
+                std::io::Error::other("synthetic directory sync failure")
+            ))
+            .is_err()
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        atomic_create(&path, b"previous", 0o400).unwrap();
+        atomic_replace(&path, b"replacement", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let failed_sync =
+            atomic_replace_with_sync(&path, b"applied before sync failure", 0o400, |_| {
+                Err(std::io::Error::other("synthetic directory sync failure"))
+            });
+        assert!(failed_sync.is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"applied before sync failure"
+        );
+        atomic_replace(&path, b"replacement", 0o600).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(atomic_replace(&link, b"must not overwrite", 0o600).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        let destination_dir = dir.join("directory");
+        std::fs::create_dir(&destination_dir).unwrap();
+        assert!(atomic_replace(&destination_dir, b"invalid", 0o600).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn account_pem_roundtrip_redaction_and_atomic_no_clobber() {
         let cert = AccountCredentials {

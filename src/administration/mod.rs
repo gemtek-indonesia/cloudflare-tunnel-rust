@@ -3,6 +3,7 @@ pub mod credentials;
 mod login;
 pub use client::AccountClient;
 pub(crate) use client::verified_connector;
+pub(crate) use client::verified_tls_connector;
 
 use crate::cli::Invocation;
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,7 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             if invocation.args.len() != 1 {
                 bail!("cloudflared tunnel create requires exactly one tunnel name");
             }
-            let mut secret = if invocation.string("secret").is_empty() {
+            let secret = if invocation.string("secret").is_empty() {
                 let mut data = vec![0; 32];
                 boring::rand::rand_bytes(&mut data)?;
                 data
@@ -36,34 +37,15 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             if secret.len() < 32 {
                 bail!("Decoded tunnel secret must be at least 32 bytes long");
             }
-            let tunnel = client.create(name, &secret).await?;
-            let id: Uuid = tunnel["id"]
-                .as_str()
-                .context("API returned no tunnel ID")?
-                .parse()?;
-            let path = if invocation.string("credentials-file").is_empty() {
-                cert_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(format!("{id}.json"))
-            } else {
-                expanded(invocation.string("credentials-file"))?
-            };
-            let body = serde_json::to_vec(
-                &json!({"AccountTag":client.account(),"TunnelSecret":STANDARD.encode(&secret),"TunnelID":id,"Endpoint":client.endpoint()}),
-            )?;
-            secret.fill(0);
-            if let Err(error) = credentials::atomic_create(&path, &body, 0o400) {
-                let rollback = client.delete(id, true).await;
-                bail!(
-                    "Tunnel {id} was created but credentials could not be saved: {error}. Cleanup {}.",
-                    if rollback.is_ok() {
-                        "deleted the tunnel"
-                    } else {
-                        "failed; delete the tunnel manually"
-                    }
-                );
-            }
+            let (tunnel, created, path) = create_with_credentials(
+                &client,
+                name,
+                secret,
+                invocation.string("credentials-file"),
+                &cert_path,
+            )
+            .await?;
+            let id = created.tunnel_id;
             if output_format(&invocation).is_some() {
                 render(&invocation, &tunnel)?;
             } else {
@@ -219,6 +201,135 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
         _ => bail!("unsupported administration command"),
     }
     Ok(())
+}
+
+async fn create_with_credentials(
+    client: &AccountClient,
+    name: &str,
+    secret: Vec<u8>,
+    explicit_path: &str,
+    cert_path: &std::path::Path,
+) -> Result<(Value, crate::config::Credentials, PathBuf)> {
+    let tunnel = client.create(name, &secret).await?;
+    let id: Uuid = tunnel["id"]
+        .as_str()
+        .context("API returned no tunnel ID")?
+        .parse()?;
+    let path = if explicit_path.is_empty() {
+        cert_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(format!("{id}.json"))
+    } else {
+        expanded(explicit_path)?
+    };
+    let body = serde_json::to_vec(
+        &json!({"AccountTag":client.account(),"TunnelSecret":STANDARD.encode(&secret),"TunnelID":id,"Endpoint":client.endpoint()}),
+    )?;
+    if let Err(error) = credentials::atomic_create(&path, &body, 0o400) {
+        let rollback = client.delete(id, true).await;
+        bail!(
+            "Tunnel {id} was created but credentials could not be saved: {error}. Cleanup {}.",
+            if rollback.is_ok() {
+                "deleted the tunnel"
+            } else {
+                "failed; delete the tunnel manually"
+            }
+        );
+    }
+    Ok((
+        tunnel,
+        crate::config::Credentials {
+            account_tag: client.account().to_owned(),
+            tunnel_secret: secret,
+            tunnel_id: id,
+            endpoint: Some(client.endpoint().to_owned()),
+        },
+        path,
+    ))
+}
+
+pub async fn prepare_adhoc(invocation: &Invocation) -> Result<crate::config::Credentials> {
+    let path = credentials::cert_path(invocation.string("origincert"))?;
+    let client = AccountClient::new(
+        credentials::AccountCredentials::read(&path)?,
+        invocation.string("api-url"),
+    )?;
+    prepare_adhoc_with_client(invocation, &client, &path).await
+}
+async fn prepare_adhoc_with_client(
+    invocation: &Invocation,
+    client: &AccountClient,
+    cert_path: &std::path::Path,
+) -> Result<crate::config::Credentials> {
+    let name = invocation.string("name");
+    if name.is_empty() {
+        bail!("ad-hoc named tunnel requires --name");
+    }
+    let logger = crate::observability::logging::Logger::new(
+        crate::observability::logging::Options {
+            level: crate::observability::logging::Level::parse(invocation.string("loglevel"))
+                .unwrap_or_default(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let active = client
+        .tunnels(vec![("name", name.into()), ("is_deleted", "false".into())])
+        .await;
+    let credentials = if let Ok(tunnels) = active
+        && let Some(tunnel) = tunnels.first()
+    {
+        let id: Uuid = tunnel["id"]
+            .as_str()
+            .context("API returned no tunnel ID")?
+            .parse()?;
+        let file = if invocation.string("credentials-file").is_empty() {
+            None
+        } else {
+            Some(expanded(invocation.string("credentials-file"))?)
+        };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        crate::config::resolve_credentials(
+            None,
+            None,
+            None,
+            file.as_deref(),
+            &id.to_string(),
+            Some(cert_path),
+            &crate::config::search_directories(home.as_deref()),
+        )?
+        .0
+    } else {
+        let mut secret = vec![0; 32];
+        boring::rand::rand_bytes(&mut secret)?;
+        create_with_credentials(
+            client,
+            name,
+            secret,
+            invocation.string("credentials-file"),
+            cert_path,
+        )
+        .await?
+        .1
+    };
+    let hostname = invocation.string("hostname");
+    if !hostname.is_empty() {
+        let body = if invocation.string("lb-pool").is_empty() {
+            json!({"type":"dns","user_hostname":hostname,"overwrite_existing":invocation.bool("overwrite-dns")})
+        } else {
+            json!({"type":"lb","lb_name":hostname,"lb_pool":invocation.string("lb-pool")})
+        };
+        if let Err(error) = client.hostname_route(credentials.tunnel_id, body).await {
+            let _ = logger.log(
+                crate::observability::logging::Level::Error,
+                crate::observability::logging::Event::Cloudflared,
+                "Unable to route named tunnel",
+                json!({"error":error.to_string()}),
+            );
+        }
+    }
+    Ok(credentials)
 }
 
 fn argument<'a>(invocation: &'a Invocation, index: usize, label: &str) -> Result<&'a str> {
@@ -623,3 +734,6 @@ async fn execute_routes(client: &AccountClient, invocation: &Invocation) -> Resu
         &client.routes(method, &suffix, &query, body).await?,
     )
 }
+
+#[cfg(test)]
+mod tests;

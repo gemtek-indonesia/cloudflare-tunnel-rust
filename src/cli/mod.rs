@@ -58,13 +58,20 @@ pub enum Action {
     IngressRule {
         configuration: LoadedConfig,
         url: String,
+        normalize: bool,
     },
     Run(Box<RunConfig>),
+    RunNamed(Invocation),
     Ready {
         metrics: String,
     },
     Admin(Invocation),
     Service(Invocation),
+    Access(Invocation),
+    Operations(Invocation),
+    Diagnostics(Invocation),
+    Quick(Invocation),
+    Adhoc(Invocation),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,11 +94,14 @@ impl Invocation {
         let env = flags::FLAGS
             .iter()
             .flat_map(|flag| flag.env.iter())
-            .filter_map(|key| {
-                std::env::var(key)
-                    .ok()
-                    .map(|value| ((*key).to_owned(), value))
-            })
+            .copied()
+            .chain([
+                "TUNNEL_MANAGEMENT_TOKEN",
+                "TUNNEL_MANAGEMENT_CONNECTOR",
+                "TUNNEL_SERVICE_HOSTNAME",
+                "TUNNEL_SERVICE_URL",
+            ])
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
             .collect();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         Self::parse(args, &env, home.as_deref())
@@ -103,10 +113,18 @@ impl Invocation {
         home: Option<&Path>,
     ) -> Result<Self> {
         let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut positional = Vec::new();
+        let mut positional: Vec<String> = Vec::new();
         let mut args = args.into_iter();
         let mut flags_done = false;
         while let Some(arg) = args.next() {
+            if positional.len() >= 2
+                && ["access", "forward"].contains(&positional[0].as_str())
+                && positional[1] == "curl"
+            {
+                positional.push(arg);
+                positional.extend(args);
+                break;
+            }
             if arg == "--" {
                 flags_done = true;
                 continue;
@@ -131,6 +149,11 @@ impl Invocation {
                     ("i", Some("tunnel"), Some("list")) => "id",
                     ("np", Some("tunnel"), Some("list")) => "name-prefix",
                     ("rd", Some("tunnel"), _) => "show-recently-disconnected",
+                    ("T" | "tunnel-host", Some("access" | "forward"), _) => "hostname",
+                    ("L" | "listener", Some("access" | "forward"), _) => "url",
+                    ("id", Some("access" | "forward"), _) => "service-token-id",
+                    ("secret", Some("access" | "forward"), _) => "service-token-secret",
+                    ("loglevel", Some("access" | "forward"), _) => "log-level",
                     _ => name,
                 };
                 let flag = flags::find(name).context("Unknown command-line flag; see --help")?;
@@ -214,12 +237,29 @@ impl Invocation {
             .map(|path| config::expand_home(path, home))
             .transpose()?
             .or_else(|| config::discover_config(&config::search_directories(home)));
-        let configuration = LoadedConfig::read(path.as_deref())?;
+        let access = command.starts_with("access ");
+        let configuration = if access {
+            LoadedConfig::default()
+        } else {
+            LoadedConfig::read(path.as_deref())?
+        };
         for flag in flags::FLAGS {
             if values.contains_key(flag.name) {
                 continue;
             }
-            if let Some(value) = flag.env.iter().find_map(|key| env.get(*key)) {
+            let management = ["tail", "tail token", "management token"].contains(&command.as_str());
+            let environment: &[&str] = if management && flag.name == "token" {
+                &["TUNNEL_MANAGEMENT_TOKEN"]
+            } else if management && flag.name == "connector-id" {
+                &["TUNNEL_MANAGEMENT_CONNECTOR"]
+            } else if access && flag.name == "hostname" {
+                &["TUNNEL_SERVICE_HOSTNAME"]
+            } else if access && flag.name == "url" {
+                &["TUNNEL_SERVICE_URL"]
+            } else {
+                flag.env
+            };
+            if let Some(value) = environment.iter().find_map(|key| env.get(*key)) {
                 validate_value(flag.name, flag.kind, value)?;
                 values.insert(flag.name.to_owned(), split_value(flag.kind, value));
                 specified.insert(flag.name.to_owned(), true);
@@ -235,6 +275,7 @@ impl Invocation {
                 }
             }
             if !values.contains_key(flag.name)
+                && !(access && flag.name == "url")
                 && let Some(value) = flag.default
             {
                 values.insert(flag.name.to_owned(), split_value(flag.kind, value));
@@ -280,6 +321,13 @@ impl Invocation {
                 short: self.bool("short"),
             });
         }
+        if ["", "tunnel", "tunnel run"].contains(&self.command.as_str()) {
+            for name in ["tag", "socks5"] {
+                if self.is_set(name) {
+                    bail!("--{name} forwarding is not implemented yet");
+                }
+            }
+        }
         match self.command.as_str() {
             "tunnel ingress validate" => {
                 if self.is_set("url") {
@@ -303,11 +351,13 @@ impl Invocation {
                     .context("Request must be a URL with a scheme and hostname")?;
                 config::validate_ingress(&self.configuration.ingress)?;
                 Ok(Action::IngressRule {
+                    normalize: !self.bool("disable-path-normalization")
+                        && config::ingress_requires_normalization(&self.configuration),
                     configuration: self.configuration,
                     url,
                 })
             }
-            "tunnel run" => Ok(Action::Run(Box::new(self.run_config(home)?))),
+            "tunnel run" => self.run_action(home),
             "tunnel ready" => {
                 if !self.is_set("metrics") {
                     bail!("--metrics has to be provided");
@@ -327,6 +377,9 @@ impl Invocation {
             .into()),
             command if command.starts_with("service ") => Ok(Action::Service(self)),
             "login" => Ok(Action::Admin(self)),
+            command if command.starts_with("access ") => Ok(Action::Access(self)),
+            "tail" | "tail token" | "management token" => Ok(Action::Operations(self)),
+            "tunnel diag" => Ok(Action::Diagnostics(self)),
             command
                 if command.starts_with("tunnel ")
                     && !["tunnel diag", "tunnel proxy-dns", "tunnel db-connect"]
@@ -334,14 +387,28 @@ impl Invocation {
             {
                 Ok(Action::Admin(self))
             }
-            "" | "tunnel" if !self.string("hostname").is_empty() => {
-                bail!("Classic tunnels have been deprecated, please use Named Tunnels.")
+            "" | "tunnel" if !self.string("name").is_empty() => {
+                if !self.list("allowed-mail").is_empty() {
+                    bail!("--allowed-mail is only supported for Quick Tunnels");
+                }
+                if !self.string("hostname").is_empty()
+                    && self.string("hostname") == self.string("url")
+                {
+                    bail!("hostname and url shouldn't match. See --help for more information");
+                }
+                Ok(Action::Adhoc(self))
             }
-            "" | "tunnel" if self.is_set("url") || self.is_set("hello-world") => {
-                bail!("Quick Tunnel provisioning is not implemented yet")
+            "" | "tunnel"
+                if !self.string("quick-service").is_empty()
+                    && (self.is_set("url") || self.is_set("hello-world")) =>
+            {
+                Ok(Action::Quick(self))
             }
             "" | "tunnel" if !self.configuration.tunnel.is_empty() => {
                 bail!("use `cloudflared tunnel run` to start tunnel configured in YAML")
+            }
+            "" | "tunnel" if !self.string("hostname").is_empty() => {
+                bail!("Classic tunnels have been deprecated, please use Named Tunnels.")
             }
             "" => bail!("Configuration watcher service mode is not implemented yet"),
             "tunnel" => {
@@ -351,6 +418,78 @@ impl Invocation {
                 bail!("Capability '{command}' is not implemented yet; see docs/compatibility.md")
             }
         }
+    }
+
+    fn run_action(self, home: Option<&Path>) -> Result<Action> {
+        let reference = self
+            .args
+            .first()
+            .map_or(self.configuration.tunnel.as_str(), String::as_str);
+        if !reference.is_empty()
+            && uuid::Uuid::parse_str(reference).is_err()
+            && self.string("token").is_empty()
+        {
+            Ok(Action::RunNamed(self))
+        } else {
+            Ok(Action::Run(Box::new(self.run_config(home)?)))
+        }
+    }
+
+    pub async fn named_config(mut self, home: Option<&Path>) -> Result<RunConfig> {
+        if self.args.len() > 1 {
+            bail!(
+                "\"cloudflared tunnel run\" accepts only one argument, the ID or name of the tunnel to run."
+            );
+        }
+        if !self.list("allowed-mail").is_empty() {
+            bail!("--allowed-mail is only supported for Quick Tunnels");
+        }
+        if !self.string("token-file").is_empty() {
+            let token =
+                std::fs::read_to_string(config::expand_home(self.string("token-file"), home)?)
+                    .context("Failed to read token file")?;
+            if !token.trim().is_empty() {
+                return self.run_config(home);
+            }
+        }
+        let reference = self
+            .args
+            .first()
+            .map_or(self.configuration.tunnel.as_str(), String::as_str)
+            .to_owned();
+        // The source first accepts a real non-nil UUID from explicit credentials.
+        let contents = if !self.string("credentials-contents").is_empty() {
+            Some(self.string("credentials-contents").to_owned())
+        } else if !self.string("credentials-file").is_empty() {
+            std::fs::read_to_string(config::expand_home(self.string("credentials-file"), home)?)
+                .ok()
+        } else {
+            None
+        };
+        let id = if let Some(id) = contents
+            .as_deref()
+            .and_then(|contents| serde_json::from_str::<config::Credentials>(contents).ok())
+            .map(|credentials| credentials.tunnel_id)
+            .filter(|id| !id.is_nil())
+        {
+            id
+        } else {
+            let explicit = if self.string("origincert").is_empty() {
+                String::new()
+            } else {
+                config::expand_home(self.string("origincert"), home)?
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let credentials = crate::administration::credentials::AccountCredentials::read(
+                &crate::administration::credentials::cert_path(&explicit)?,
+            )?;
+            crate::administration::AccountClient::new(credentials, self.string("api-url"))?
+                .resolve_tunnel(&reference)
+                .await?
+        };
+        self.args = vec![id.to_string()];
+        self.run_config(home)
     }
 
     pub fn run_config(&self, home: Option<&Path>) -> Result<RunConfig> {
@@ -384,6 +523,15 @@ impl Invocation {
             origin_cert.as_deref(),
             &config::search_directories(home),
         )?;
+        self.run_config_for_credentials(credentials, token_authenticated, home)
+    }
+
+    pub fn run_config_for_credentials(
+        &self,
+        credentials: config::Credentials,
+        token_authenticated: bool,
+        home: Option<&Path>,
+    ) -> Result<RunConfig> {
         let mut ingress = self.configuration.ingress.clone();
         let origin_request = if ingress.is_empty() {
             self.single_origin_request()?
@@ -437,6 +585,22 @@ impl Invocation {
         if ha_connections == 0 {
             bail!("ha-connections must be positive");
         }
+        let known_secrets = [
+            "token",
+            "credentials-contents",
+            "api-key",
+            "api-ca-key",
+            "secret",
+            "service-token-secret",
+        ]
+        .iter()
+        .filter(|name| !self.string(name).is_empty())
+        .map(|name| self.string(name).to_owned())
+        .chain(std::iter::once(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &credentials.tunnel_secret,
+        )))
+        .collect();
         Ok(RunConfig {
             region: credentials
                 .endpoint
@@ -463,7 +627,59 @@ impl Invocation {
             edge_ca: (!self.string("cacert").is_empty())
                 .then(|| config::expand_home(self.string("cacert"), home))
                 .transpose()?,
+            max_active_flows: self
+                .is_set("max-active-flows")
+                .then(|| self.string("max-active-flows").parse())
+                .transpose()
+                .context("invalid max-active-flows")?,
+            dns_resolver_addrs: self
+                .list("dns-resolver-addrs")
+                .iter()
+                .map(|address| address.parse().context("invalid DNS resolver address:port"))
+                .collect::<Result<Vec<_>>>()?,
+            icmpv4_src: (!self.string("icmpv4-src").is_empty())
+                .then(|| self.string("icmpv4-src").parse())
+                .transpose()
+                .context("invalid icmpv4-src")?,
+            icmpv6_src: if self.string("icmpv6-src").is_empty() {
+                None
+            } else {
+                let value = self.string("icmpv6-src");
+                let (address, interface) = value
+                    .split_once('%')
+                    .map_or((value, None), |(address, interface)| {
+                        (address, Some(interface))
+                    });
+                address
+                    .parse::<std::net::Ipv6Addr>()
+                    .context("invalid icmpv6-src")?;
+                if interface.is_some_and(str::is_empty) {
+                    bail!("icmpv6-src interface cannot be empty");
+                }
+                Some(value.to_owned())
+            },
+            features: self.list("features"),
+            logging: crate::observability::logging::Options {
+                level: crate::observability::logging::Level::parse(self.string("loglevel"))
+                    .unwrap_or_default(),
+                json: self.string("output") == "json",
+                file: (!self.string("logfile").is_empty())
+                    .then(|| config::expand_home(self.string("logfile"), home))
+                    .transpose()?,
+                directory: (!self.string("log-directory").is_empty())
+                    .then(|| config::expand_home(self.string("log-directory"), home))
+                    .transpose()?,
+                disable_terminal: false,
+            },
+            known_secrets,
+            management_hostname: self.string("management-hostname").to_owned(),
+            service_op_ip: self.string("service-op-ip").to_owned(),
+            diagnostic_cli_flags: self.diagnostic_flags(home)?,
+            management_diagnostics: self.bool("management-diagnostics"),
+            connector_label: self.string("label").to_owned(),
             token_authenticated,
+            quick_hostname: String::new(),
+            quick_authorizer: None,
             rpc_timeout: self.duration("rpc-timeout")?,
             write_stream_timeout: self.duration("write-stream-timeout")?,
             dial_edge_timeout: self.duration("dial-edge-timeout")?,
@@ -481,6 +697,91 @@ impl Invocation {
             disable_path_normalization: self.bool("disable-path-normalization"),
             configuration: self.configuration.clone(),
         })
+    }
+
+    fn diagnostic_flags(&self, home: Option<&Path>) -> Result<BTreeMap<String, String>> {
+        const INCLUDED: &[&str] = &[
+            "config",
+            "autoupdate-freq",
+            "no-autoupdate",
+            "no-prechecks",
+            "metrics",
+            "pidfile",
+            "url",
+            "hello-world",
+            "socks5",
+            "proxy-connect-timeout",
+            "proxy-tls-timeout",
+            "proxy-tcp-keepalive",
+            "proxy-no-happy-eyeballs",
+            "proxy-keepalive-connections",
+            "proxy-keepalive-timeout",
+            "proxy-connection-timeout",
+            "proxy-expect-continue-timeout",
+            "http-host-header",
+            "origin-server-name",
+            "unix-socket",
+            "origin-ca-pool",
+            "no-tls-verify",
+            "no-chunked-encoding",
+            "http2-origin",
+            "management-hostname",
+            "service-op-ip",
+            "local-ssh-port",
+            "ssh-idle-timeout",
+            "ssh-max-timeout",
+            "ssh-server",
+            "bastion",
+            "proxy-address",
+            "proxy-port",
+            "loglevel",
+            "logfile",
+            "log-directory",
+            "trace-output",
+            "edge",
+            "region",
+            "edge-ip-version",
+            "edge-bind-address",
+            "cacert",
+            "hostname",
+            "id",
+            "lb-pool",
+            "api-url",
+            "tag",
+            "max-edge-addr-retries",
+            "retries",
+            "ha-connections",
+            "rpc-timeout",
+            "write-stream-timeout",
+            "quic-disable-pmtu-discovery",
+            "quic-connection-level-flow-control-limit",
+            "quic-stream-level-flow-control-limit",
+            "label",
+            "grace-period",
+            "dial-edge-timeout",
+            "name",
+            "quick-service",
+        ];
+        self.specified
+            .keys()
+            .filter(|name| INCLUDED.contains(&name.as_str()))
+            .filter(|name| !self.string(name).is_empty())
+            .map(|name| {
+                let value = if ["logfile", "log-directory"].contains(&name.as_str()) {
+                    let path = config::expand_home(self.string(name), home)?;
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    }
+                    .to_string_lossy()
+                    .into_owned()
+                } else {
+                    self.string(name).to_owned()
+                };
+                Ok((name.clone(), value))
+            })
+            .collect()
     }
 
     fn single_origin_request(&self) -> Result<OriginRequest> {
@@ -527,6 +828,7 @@ fn validate_value(name: &str, kind: Kind, value: &str) -> Result<()> {
         ]
         .contains(&value),
         Kind::Integer => value.parse::<i64>().is_ok(),
+        Kind::Float => value.parse::<f64>().is_ok_and(|value| value.is_finite()),
         Kind::Duration => config::parse_duration(value).is_ok(),
         _ => true,
     };
@@ -651,5 +953,21 @@ mod tests {
         .unwrap();
         assert!(matches!(cli.action(None).unwrap(), Action::Help(_)));
         assert!(help("").contains("may still be unimplemented"));
+    }
+    #[test]
+    fn unfinished_forwarding_flags_fail_before_credential_or_admin_effects() {
+        for arguments in [
+            vec!["tunnel", "run", "--tag", "key=value"],
+            vec!["tunnel", "--name", "synthetic", "--socks5=false"],
+        ] {
+            let invocation = Invocation::parse(
+                arguments.into_iter().map(str::to_owned),
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+            let error = invocation.action(None).err().unwrap();
+            assert!(error.to_string().contains("forwarding is not implemented"));
+        }
     }
 }

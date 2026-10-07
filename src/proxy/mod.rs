@@ -1,10 +1,12 @@
 mod body;
+mod hello;
 mod origin;
+mod tcp;
 #[cfg(test)]
 mod tests;
 
 use crate::{
-    config::{IngressRule, LoadedConfig, RunConfig, validate_ingress},
+    config::{IngressRule, LoadedConfig, RunConfig, validate_ingress_paths},
     protocol::{
         headers,
         metadata::{ConnectRequest, ConnectResponse, ConnectionType, write_connect_response},
@@ -27,21 +29,34 @@ struct Snapshot {
     rules: Vec<IngressRule>,
     origins: Vec<Arc<Origin>>,
     configuration: LoadedConfig,
+    normalize: bool,
+    paths: Vec<Option<regex::Regex>>,
 }
 
 pub struct ProxyState {
     snapshot: RwLock<Snapshot>,
     normalize: bool,
+    observability: Arc<crate::observability::Context>,
+    quick_authorizer: Option<Arc<crate::quick_tunnel::auth::Authorizer>>,
 }
 
 impl ProxyState {
     pub fn new(config: &RunConfig) -> Result<Self> {
+        Self::with_context(config, crate::observability::Context::quiet()?)
+    }
+
+    pub fn with_context(
+        config: &RunConfig,
+        observability: Arc<crate::observability::Context>,
+    ) -> Result<Self> {
         let mut configuration = config.configuration.clone();
         configuration.ingress = config.ingress.clone();
         configuration.origin_request = config.origin_request.clone();
         Ok(Self {
             snapshot: RwLock::new(Self::build(configuration)?),
             normalize: !config.disable_path_normalization,
+            observability,
+            quick_authorizer: config.quick_authorizer.clone(),
         })
     }
 
@@ -52,7 +67,7 @@ impl ProxyState {
                 ..Default::default()
             });
         }
-        validate_ingress(&configuration.ingress)?;
+        let paths = validate_ingress_paths(&configuration.ingress)?;
         let origins = configuration
             .ingress
             .iter()
@@ -68,6 +83,8 @@ impl ProxyState {
         configuration.tunnel.clear();
         configuration.source = None;
         Ok(Snapshot {
+            paths,
+            normalize: crate::config::ingress_requires_normalization(&configuration),
             rules: configuration.ingress.clone(),
             origins,
             configuration,
@@ -86,8 +103,17 @@ impl ProxyState {
 
     async fn select(&self, head: &RequestHead) -> Result<Arc<Origin>> {
         let snapshot = self.snapshot.read().await;
+        let path = if self.normalize && snapshot.normalize {
+            crate::config::canonical_path(&head.path)
+        } else {
+            head.path.clone()
+        };
         for (index, rule) in snapshot.rules.iter().enumerate() {
-            if rule.matches(&head.hostname, &head.path, self.normalize)? {
+            if rule.matches_hostname(&head.hostname)
+                && snapshot.paths[index]
+                    .as_ref()
+                    .is_none_or(|expression| expression.is_match(&path))
+            {
                 return Ok(snapshot.origins[index].clone());
             }
         }
@@ -175,7 +201,7 @@ impl RequestHead {
                 .host()
                 .to_owned()
         };
-        let path = decoded_path(uri.path())?;
+        let path = crate::config::matcher_path(uri.path())?;
         let length = headers
             .get(http::header::CONTENT_LENGTH)
             .map(|value| {
@@ -246,6 +272,7 @@ where
     let mut sink = EdgeSink::Quic {
         writer: Box::new(writer),
         started: false,
+        protected: state.quick_authorizer.is_some(),
     };
     let result = match RequestHead::from_quic(&request) {
         Ok(head) => proxy(head, Box::new(reader), &mut sink, &state).await,
@@ -264,6 +291,7 @@ pub async fn serve_h2(
         responder: Some(response),
         stream: None,
         ended: false,
+        protected: state.quick_authorizer.is_some(),
     };
     let result: Result<()> = async {
         let websocket = parts
@@ -330,25 +358,89 @@ async fn proxy(
     sink: &mut EdgeSink,
     state: &ProxyState,
 ) -> Result<()> {
+    let mut request = state.observability.metrics.begin_request(false);
+    let result = proxy_inner(head, reader, sink, state).await;
+    if result.is_err() {
+        request.failed();
+        state.observability.logger.log(
+            crate::observability::logging::Level::Error,
+            crate::observability::logging::Event::Http,
+            "Unable to proxy request to the origin service",
+            serde_json::json!({}),
+        )?;
+    }
+    result
+}
+
+async fn proxy_inner(
+    mut head: RequestHead,
+    mut reader: BoxReader,
+    sink: &mut EdgeSink,
+    state: &ProxyState,
+) -> Result<()> {
+    if let Some(authorizer) = &state.quick_authorizer
+        && let Some(response) = authorizer
+            .authorize(
+                &head.method,
+                &head.uri,
+                &head.authority,
+                &mut head.headers,
+                &mut *reader,
+            )
+            .await?
+    {
+        state.observability.metrics.response(response.status);
+        sink.head(response.status, &response.headers).await?;
+        if head.method != Method::HEAD {
+            sink.data(response.body).await?;
+        }
+        return Ok(());
+    }
     let origin = state.select(&head).await?;
+    if origin
+        .settings
+        .access
+        .as_ref()
+        .is_some_and(|access| access.required)
+    {
+        let token = head
+            .headers
+            .get("cf-access-jwt-assertion")
+            .and_then(|value| value.to_str().ok());
+        let Some((verifier, token)) = origin
+            .verifier
+            .as_ref()
+            .zip(token)
+            .filter(|(_, token)| !token.is_empty())
+        else {
+            sink.head(403, &HeaderMap::new()).await?;
+            state.observability.metrics.response(403);
+            return Ok(());
+        };
+        if let Err(error) = verifier.verify(token).await {
+            if error
+                .downcast_ref::<jsonwebtoken::errors::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        jsonwebtoken::errors::ErrorKind::InvalidAudience
+                    )
+                })
+            {
+                sink.head(403, &HeaderMap::new()).await?;
+                state.observability.metrics.response(403);
+                return Ok(());
+            }
+            bail!("Access JWT verification failed");
+        }
+    }
     match &origin.service {
+        Service::Tcp { .. } | Service::Bastion { .. } | Service::Socks(_) => {
+            return tcp::proxy(origin, head, reader, sink, state).await;
+        }
         Service::Status(status) => {
             sink.head(*status, &HeaderMap::new()).await?;
-            return Ok(());
-        }
-        Service::HelloWorld => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            );
-            sink.head(200, &headers).await?;
-            if head.method != Method::HEAD {
-                sink.data(Bytes::from_static(
-                    b"<!doctype html><title>Hello World</title><h1>Hello World</h1>\n",
-                ))
-                .await?;
-            }
+            state.observability.metrics.response(*status);
             return Ok(());
         }
         _ => {}
@@ -361,8 +453,12 @@ async fn proxy(
     if head.websocket {
         let mut origin_response = origin.request(&head, ChannelBody::empty()).await?;
         let status = origin_response.response.status();
-        sink.head(status.as_u16(), origin_response.response.headers())
-            .await?;
+        let response_headers = state.quick_authorizer.as_ref().map_or_else(
+            || origin_response.response.headers().clone(),
+            |authorizer| authorizer.response_headers(origin_response.response.headers()),
+        );
+        sink.head(status.as_u16(), &response_headers).await?;
+        state.observability.metrics.response(status.as_u16());
         if status == StatusCode::SWITCHING_PROTOCOLS {
             let upgraded = hyper::upgrade::on(&mut origin_response.response).await?;
             let (origin_read, origin_write) = tokio::io::split(TokioIoAdapter::new(upgraded));
@@ -392,9 +488,16 @@ async fn proxy(
         let mut origin_response = origin.request(&head, body).await?;
         sink.head(
             origin_response.response.status().as_u16(),
-            origin_response.response.headers(),
+            &state.quick_authorizer.as_ref().map_or_else(
+                || origin_response.response.headers().clone(),
+                |authorizer| authorizer.response_headers(origin_response.response.headers()),
+            ),
         )
         .await?;
+        state
+            .observability
+            .metrics
+            .response(origin_response.response.status().as_u16());
         stream_response(&mut origin_response.response, sink).await?;
     }
     Ok(())
@@ -438,11 +541,13 @@ enum EdgeSink {
     Quic {
         writer: BoxWriter,
         started: bool,
+        protected: bool,
     },
     H2 {
         responder: Option<h2::server::SendResponse<Bytes>>,
         stream: Option<h2::SendStream<Bytes>>,
         ended: bool,
+        protected: bool,
     },
 }
 
@@ -466,8 +571,16 @@ impl EdgeSink {
     }
 
     async fn head(&mut self, status: u16, headers: &HeaderMap) -> Result<()> {
+        let mut headers = headers.clone();
+        if match self {
+            Self::Quic { protected, .. } | Self::H2 { protected, .. } => *protected,
+        } {
+            crate::quick_tunnel::auth::protect(&mut headers);
+        }
         match self {
-            Self::Quic { writer, started } => {
+            Self::Quic {
+                writer, started, ..
+            } => {
                 let mut metadata = vec![("HttpStatus".into(), status.to_string())];
                 metadata.extend(headers.iter().map(|(name, value)| {
                     (
@@ -527,7 +640,9 @@ impl EdgeSink {
 
     async fn error(&mut self) -> Result<()> {
         match self {
-            Self::Quic { writer, started } => {
+            Self::Quic {
+                writer, started, ..
+            } => {
                 write_connect_response(
                     writer,
                     &ConnectResponse {
@@ -620,25 +735,4 @@ fn canonical_header(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
-}
-
-fn decoded_path(path: &str) -> Result<String> {
-    let mut bytes = Vec::new();
-    let mut chars = path.as_bytes().iter().copied();
-    while let Some(byte) = chars.next() {
-        if byte == b'%' {
-            let high = chars
-                .next()
-                .and_then(|byte| (byte as char).to_digit(16))
-                .context("invalid URL path escape")?;
-            let low = chars
-                .next()
-                .and_then(|byte| (byte as char).to_digit(16))
-                .context("invalid URL path escape")?;
-            bytes.push((high * 16 + low) as u8);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    String::from_utf8(bytes).context("URL path is not UTF-8")
 }

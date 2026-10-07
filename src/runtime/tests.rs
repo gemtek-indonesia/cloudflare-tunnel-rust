@@ -3,7 +3,7 @@ use crate::config::{Credentials, OriginRequest};
 use crate::protocol::tunnelrpc_capnp as wire;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-fn config() -> RunConfig {
+pub(crate) fn config() -> RunConfig {
     let configuration =
         LoadedConfig::from_json(r#"{"ingress":[{"service":"http_status:203"}]}"#).unwrap();
     RunConfig {
@@ -28,7 +28,21 @@ fn config() -> RunConfig {
         connection_window: 30 * 1024 * 1024,
         stream_window: 6 * 1024 * 1024,
         edge_ca: None,
+        max_active_flows: None,
+        dns_resolver_addrs: Vec::new(),
+        icmpv4_src: None,
+        icmpv6_src: None,
+        features: Vec::new(),
+        logging: crate::observability::logging::Options::default(),
+        known_secrets: Vec::new(),
+        management_hostname: "management.argotunnel.com".into(),
+        management_diagnostics: false,
+        connector_label: String::new(),
+        service_op_ip: String::new(),
+        diagnostic_cli_flags: Default::default(),
         token_authenticated: false,
+        quick_hostname: String::new(),
+        quick_authorizer: None,
         rpc_timeout: Duration::from_secs(2),
         write_stream_timeout: Duration::ZERO,
         dial_edge_timeout: Duration::from_secs(3),
@@ -43,8 +57,26 @@ fn config() -> RunConfig {
 }
 fn runtime(config: RunConfig) -> Arc<Runtime> {
     let (events, _) = mpsc::unbounded_channel();
+    let context = crate::observability::Context::quiet().unwrap();
+    let features = Arc::new(super::features::FeatureSelector::new(
+        &config.credentials.account_tag,
+        config.features.clone(),
+        config.post_quantum,
+    ));
+    let network = crate::network::NetworkState::with_context(&config, context.clone()).unwrap();
+    let management = Arc::new(crate::observability::management::Service::new(
+        context.clone(),
+        Uuid::from_bytes([2; 16]),
+        "",
+        None,
+        false,
+    ));
     Arc::new(Runtime {
-        proxy: Arc::new(ProxyState::new(&config).unwrap()),
+        proxy: Arc::new(ProxyState::with_context(&config, context.clone()).unwrap()),
+        context,
+        features,
+        network,
+        management,
         configuration: tokio::sync::Mutex::new(ConfigurationState {
             version: -1,
             current: config.configuration.clone(),
@@ -182,6 +214,7 @@ async fn remote_versions_keep_prior_valid_configuration_and_redact_local_payload
     assert!(!runtime.readiness.ready());
 }
 
+type RegistrationTimes = Arc<Mutex<Vec<(u8, Instant)>>>;
 struct Oracle {
     registered: Arc<tokio::sync::Notify>,
     unregistered: Arc<AtomicBool>,
@@ -189,6 +222,9 @@ struct Oracle {
     local_configuration: Arc<AtomicBool>,
     origin_ip: std::net::Ipv4Addr,
     reject: bool,
+    acknowledgement: Option<Arc<tokio::sync::Notify>>,
+    timestamps: Option<RegistrationTimes>,
+    unregister_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl wire::registration_server::Server for Oracle {
     async fn register_connection(
@@ -212,6 +248,16 @@ impl wire::registration_server::Server for Oracle {
             p.get_conn_index(),
             Uuid::from_slice(opts.get_client()?.get_client_id()?).unwrap(),
         ));
+        if let Some(times) = &self.timestamps {
+            times
+                .lock()
+                .unwrap()
+                .push((p.get_conn_index(), Instant::now()));
+        }
+        self.registered.notify_one();
+        if let Some(acknowledgement) = &self.acknowledgement {
+            acknowledgement.notified().await;
+        }
         if self.reject {
             let mut error = results.get().init_result().init_result().init_error();
             error.set_cause("synthetic permanent rejection");
@@ -223,10 +269,11 @@ impl wire::registration_server::Server for Oracle {
             .init_result()
             .init_result()
             .init_connection_details();
-        details.set_uuid(&[3; 16]);
+        let mut connection_id = [3; 16];
+        connection_id[15] = p.get_conn_index();
+        details.set_uuid(&connection_id);
         details.set_location_name("TST");
         details.set_tunnel_is_remotely_managed(false);
-        self.registered.notify_one();
         Ok(())
     }
     async fn unregister_connection(
@@ -235,6 +282,9 @@ impl wire::registration_server::Server for Oracle {
         _: wire::registration_server::UnregisterConnectionResults,
     ) -> capnp::Result<()> {
         self.unregistered.store(true, Ordering::Release);
+        if let Some(count) = &self.unregister_count {
+            count.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
     async fn update_local_configuration(
@@ -250,7 +300,7 @@ impl wire::registration_server::Server for Oracle {
     }
 }
 
-fn certificate() -> (
+pub(crate) fn certificate() -> (
     boring::x509::X509,
     boring::pkey::PKey<boring::pkey::Private>,
 ) {
@@ -280,6 +330,70 @@ fn certificate() -> (
     cert.sign(&key, boring::hash::MessageDigest::sha256())
         .unwrap();
     (cert.build(), key)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn diagnostic_http_real_metrics_snapshot_and_cancel_owned_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut config = config();
+            config.quick_hostname = "synthetic.trycloudflare.com".into();
+            let runtime = runtime(config);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut server =
+                health_server_on(listener, runtime.clone(), runtime.shutdown.clone()).unwrap();
+            for (path, status, needle) in [
+                ("/ready", 503, "\"readyConnections\":0"),
+                ("/metrics", 200, "cloudflared_tunnel_ha_connections"),
+                ("/config", 200, "\"version\":-1"),
+                ("/quicktunnel", 200, "synthetic.trycloudflare.com"),
+                ("/diag/tunnel", 200, "\"icmp_sources\""),
+                ("/debug/pprof/cmdline", 403, "forbidden"),
+                ("/debug/pprof/heap", 501, "unavailable"),
+                ("/logs", 404, "404 page not found"),
+            ] {
+                let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                socket
+                    .write_all(
+                        format!(
+                            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut bytes = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response = String::from_utf8(bytes).unwrap();
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{response}"
+                );
+                assert!(response.contains(needle), "{response}");
+            }
+            let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+            tokio::task::yield_now().await;
+            runtime.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(2), &mut server.0)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        })
+        .await;
 }
 
 async fn update_request(
@@ -321,12 +435,128 @@ async fn update_request(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn ha_four_actual_tls_registrations_share_connector_uuid_and_stagger_followers() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (cert, key) = certificate();
+            let mut acceptor =
+                boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                    .unwrap();
+            acceptor.set_certificate(&cert).unwrap();
+            acceptor.set_private_key(&key).unwrap();
+            let acceptor = Arc::new(acceptor.build());
+            let tls =
+                EdgeTls::new(TlsPolicy::PreferPostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+            let config = config();
+            let mut runtime = runtime(config);
+            let (events, event_rx) = mpsc::unbounded_channel();
+            Arc::get_mut(&mut runtime).unwrap().events = events;
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let times = Arc::new(Mutex::new(Vec::new()));
+            let unregister_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut peers = Vec::new();
+            let mut addresses = Vec::new();
+            for _ in 0..4 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addresses.push(listener.local_addr().unwrap());
+                let acceptor = acceptor.clone();
+                let observed = observed.clone();
+                let times = times.clone();
+                let unregister_count = unregister_count.clone();
+                peers.push(AbortTask(tokio::task::spawn_local(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                    let (mut client, driver) = h2::client::handshake(tls).await.unwrap();
+                    let _driver = AbortTask(tokio::task::spawn_local(driver));
+                    let (answer, send) = client
+                        .send_request(
+                            http::Request::builder()
+                                .method("POST")
+                                .uri("https://example.invalid/control")
+                                .header("cf-cloudflared-proxy-connection-upgrade", "control-stream")
+                                .body(())
+                                .unwrap(),
+                            false,
+                        )
+                        .unwrap();
+                    let response = answer.await.unwrap();
+                    let (control, pump) = h2_control::bridge(response.into_body(), send);
+                    let _pump = AbortTask(pump);
+                    let (read, write) = tokio::io::split(control);
+                    let network = capnp_rpc::twoparty::VatNetwork::new(
+                        read.compat(),
+                        write.compat_write(),
+                        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                        crate::protocol::reader_options(),
+                    );
+                    let oracle: wire::registration_server::Client = capnp_rpc::new_client(Oracle {
+                        registered: Arc::new(tokio::sync::Notify::new()),
+                        unregistered: Arc::new(AtomicBool::new(false)),
+                        observed,
+                        local_configuration: Arc::new(AtomicBool::new(false)),
+                        origin_ip: "127.0.0.2".parse().unwrap(),
+                        reject: false,
+                        acknowledgement: None,
+                        timestamps: Some(times),
+                        unregister_count: Some(unregister_count),
+                    });
+                    let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(oracle.client));
+                    let _ = rpc.await;
+                })));
+            }
+            let pool = Arc::new(Mutex::new(
+                discovery::EdgePool::new(vec![addresses]).unwrap(),
+            ));
+            let monitor = async {
+                while runtime.readiness.count() != 4 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert_eq!(runtime.context.metrics.ha_connections.get(), 4);
+                assert_eq!(
+                    runtime
+                        .context
+                        .metrics
+                        .register_success
+                        .with_label_values(&["registerConnection"])
+                        .get(),
+                    4
+                );
+                let mut observed = observed.lock().unwrap().clone();
+                observed.sort_by_key(|(index, _)| *index);
+                assert_eq!(
+                    observed,
+                    (0..4)
+                        .map(|index| (index, runtime.client_id))
+                        .collect::<Vec<_>>()
+                );
+                let mut times = times.lock().unwrap().clone();
+                times.sort_by_key(|(index, _)| *index);
+                assert!(times[2].1.duration_since(times[1].1) >= Duration::from_millis(900));
+                assert!(times[3].1.duration_since(times[2].1) >= Duration::from_millis(900));
+                runtime.shutdown.cancel();
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (result, _) =
+                    tokio::join!(supervise(runtime.clone(), pool, tls, 4, event_rx), monitor);
+                result.unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(runtime.readiness.count(), 0);
+            assert_eq!(runtime.context.metrics.ha_connections.get(), 0);
+            assert_eq!(unregister_count.load(Ordering::Acquire), 4);
+            drop(peers);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn named_h2_real_tls_rpc_http_remote_updates_and_graceful_unregister() {
     tokio::task::LocalSet::new().run_until(async{
         let (cert,key)=certificate();let mut acceptor=boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();acceptor.set_certificate(&cert).unwrap();acceptor.set_private_key(&key).unwrap();let acceptor=acceptor.build();
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();let temp=std::env::temp_dir().join(format!("cloudflared-ca-{}.pem",Uuid::new_v4()));std::fs::write(&temp,cert.to_pem().unwrap()).unwrap();
         let pid_path=std::env::temp_dir().join(format!("cloudflared-pid-{}",Uuid::new_v4()));let notify_path=std::env::temp_dir().join(format!("cloudflared-notify-{}",Uuid::new_v4()));let notify=std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();notify.set_nonblocking(true).unwrap();
-        let mut config=config();config.pidfile=Some(pid_path.clone());config.edge_ca=Some(temp.clone());let edge_tls=tls(&config).unwrap();std::fs::remove_file(temp).unwrap();let mut runtime=runtime(config);Arc::get_mut(&mut runtime).unwrap().notify_socket=Some(notify_path.clone().into_os_string());
+        let mut config=config();config.management_hostname="127.0.0.1".into();config.pidfile=Some(pid_path.clone());config.edge_ca=Some(temp.clone());let edge_tls=tls(&config).unwrap();std::fs::remove_file(temp).unwrap();let mut runtime=runtime(config);Arc::get_mut(&mut runtime).unwrap().notify_socket=Some(notify_path.clone().into_os_string());
         assert!(!pid_path.exists());let mut notify_bytes=[0;32];assert!(notify.recv(&mut notify_bytes).is_err());assert_eq!(runtime.readiness.response(runtime.client_id).0,503);
         let registered=Arc::new(tokio::sync::Notify::new());let unregistered=Arc::new(AtomicBool::new(false));let observed=Arc::new(Mutex::new(Vec::new()));
         let local_configuration=Arc::new(AtomicBool::new(false));let configured=local_configuration.clone();let ready=registered.clone();let closed=unregistered.clone();let seen=observed.clone();let shared=runtime.clone();
@@ -336,7 +566,7 @@ async fn named_h2_real_tls_rpc_http_remote_updates_and_graceful_unregister() {
             let (answer,send)=client.send_request(http::Request::builder().method("POST").uri("https://example.invalid/control").header("cf-cloudflared-proxy-connection-upgrade","control-stream").body(()).unwrap(),false).unwrap();
             let response=answer.await.unwrap();let (control,pump)=h2_control::bridge(response.into_body(),send);let _pump=AbortTask(pump);let (read,write)=tokio::io::split(control);
             let network=capnp_rpc::twoparty::VatNetwork::new(read.compat(),write.compat_write(),capnp_rpc::rpc_twoparty_capnp::Side::Server,crate::protocol::reader_options());
-            let server:wire::registration_server::Client=capnp_rpc::new_client(Oracle{registered:ready.clone(),unregistered:closed.clone(),observed:seen,local_configuration:configured.clone(),origin_ip:"127.0.0.2".parse().unwrap(),reject:false});let rpc=capnp_rpc::RpcSystem::new(Box::new(network),Some(server.client));let mut rpc_task=AbortTask(tokio::task::spawn_local(rpc));
+            let server:wire::registration_server::Client=capnp_rpc::new_client(Oracle{registered:ready.clone(),unregistered:closed.clone(),observed:seen,local_configuration:configured.clone(),origin_ip:"127.0.0.2".parse().unwrap(),reject:false,acknowledgement:None,timestamps:None,unregister_count:None});let rpc=capnp_rpc::RpcSystem::new(Box::new(network),Some(server.client));let mut rpc_task=AbortTask(tokio::task::spawn_local(rpc));
             ready.notified().await;
             tokio::time::timeout(Duration::from_secs(2),async{while !shared.readiness.ready(){tokio::time::sleep(Duration::from_millis(1)).await}}).await.unwrap();
             let (response,_)=client.send_request(http::Request::builder().uri("https://example.invalid/path").body(()).unwrap(),true).unwrap();assert_eq!(response.await.unwrap().status(),203);
@@ -344,6 +574,14 @@ async fn named_h2_real_tls_rpc_http_remote_updates_and_graceful_unregister() {
             let stale=update_request(&mut client,6,serde_json::json!({"ingress":[{"service":"http_status:205"}]})).await;assert_eq!(stale["lastAppliedVersion"],7);
             let invalid=update_request(&mut client,8,serde_json::json!({"ingress":[{"hostname":"example.invalid","service":"http_status:205"}]})).await;assert_eq!(invalid["lastAppliedVersion"],7);assert_eq!(invalid["err"],serde_json::json!({}));
             let (response,_)=client.send_request(http::Request::builder().uri("https://example.invalid/path").body(()).unwrap(),true).unwrap();assert_eq!(response.await.unwrap().status(),204);
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let destination=listener.local_addr().unwrap();
+            let origin=tokio::task::spawn_local(async move {
+                use tokio::io::{AsyncReadExt,AsyncWriteExt};
+                let (mut socket,_)=listener.accept().await.unwrap();let mut bytes=Vec::new();socket.read_to_end(&mut bytes).await.unwrap();socket.write_all(&bytes).await.unwrap();socket.shutdown().await.unwrap();
+            });
+            let (response,mut send)=client.send_request(http::Request::builder().method("POST").uri(format!("https://{destination}/ping")).header("cf-cloudflared-proxy-src","tcp").body(()).unwrap(),false).unwrap();
+            let response=response.await.unwrap();assert_eq!(response.status(),200,"private TCP URI authority matching management hostname must bypass management token admission");
+            let mut body=response.into_body();send.send_data(Bytes::from_static(b"private-h2"),true).unwrap();let mut returned=Vec::new();while let Some(data)=body.data().await {let data=data.unwrap();returned.extend_from_slice(&data);body.flow_control().release_capacity(data.len()).unwrap();}assert_eq!(returned,b"private-h2");origin.await.unwrap();
             assert!(configured.load(Ordering::Acquire));shared.shutdown.cancel();let _=(&mut rpc_task.0).await;assert!(closed.load(Ordering::Acquire));
         });
         let mut reset=None;let connector=serve_h2(runtime.clone(),&edge_tls,0,address,0,&mut reset);
@@ -354,6 +592,20 @@ async fn named_h2_real_tls_rpc_http_remote_updates_and_graceful_unregister() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
+    quic_preack_fixture(false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_quic_registration_cleans_preack_udp_and_never_becomes_ready() {
+    quic_preack_fixture(false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistent_preack_rpc_with_later_streams_keeps_runtime_progressing() {
+    quic_preack_fixture(true, false).await;
+}
+
+async fn quic_preack_fixture(keep_callback_open: bool, reject: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -379,7 +631,7 @@ async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
             let path = std::env::temp_dir().join(format!("cloudflared-ca-{}.pem", Uuid::new_v4()));
             std::fs::write(&path, cert.to_pem().unwrap()).unwrap();
             let mut config = config();
-            config.protocol = Protocol::Quic;
+            config.protocol = Protocol::Auto;
             config.post_quantum = true;
             config.edge_ca = Some(path.clone());
             let edge_tls = tls(&config).unwrap();
@@ -429,18 +681,165 @@ async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
                     crate::protocol::reader_options(),
                 );
                 let ready = Arc::new(tokio::sync::Notify::new());
+                let acknowledgement = Arc::new(tokio::sync::Notify::new());
                 let server: wire::registration_server::Client = capnp_rpc::new_client(Oracle {
                     registered: ready.clone(),
                     unregistered: closed.clone(),
                     observed,
                     local_configuration: local_configuration.clone(),
                     origin_ip: "127.0.0.1".parse().unwrap(),
-                    reject: false,
+                    reject,
+                    acknowledgement: Some(acknowledgement.clone()),
+                    timestamps: None,
+                    unregister_count: None,
                 });
                 let mut registration_rpc = AbortTask(tokio::task::spawn_local(
                     capnp_rpc::RpcSystem::new(Box::new(network), Some(server.client)),
                 ));
                 ready.notified().await;
+                assert_eq!(shared.readiness.count(), 0);
+                let mut config_stream = conn.open_bi().await.unwrap();
+                config_stream
+                    .write_all(&metadata::RPC_SIGNATURE)
+                    .await
+                    .unwrap();
+                let (read, write) = tokio::io::split(config_stream);
+                let network = capnp_rpc::twoparty::VatNetwork::new(
+                    read.compat(),
+                    write.compat_write(),
+                    capnp_rpc::rpc_twoparty_capnp::Side::Client,
+                    crate::protocol::reader_options(),
+                );
+                let mut rpc = capnp_rpc::RpcSystem::new(Box::new(network), None);
+                let client: wire::configuration_manager::Client =
+                    rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+                let udp: wire::session_manager::Client =
+                    rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+                let _preack_driver = AbortTask(tokio::task::spawn_local(rpc));
+                let mut call = client.update_configuration_request();
+                call.get().set_version(6);
+                call.get()
+                    .set_config(br#"{"ingress":[{"service":"http_status:203"}]}"#);
+                let answer = call.send().promise.await.unwrap();
+                assert_eq!(
+                    answer
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .get_latest_applied_version(),
+                    6
+                );
+                let origin = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let destination = origin.local_addr().unwrap();
+                let _origin = AbortTask(tokio::task::spawn_local(async move {
+                    let mut bytes = [0; 1500];
+                    loop {
+                        let (n, peer) = origin.recv_from(&mut bytes).await.unwrap();
+                        origin.send_to(&bytes[..n], peer).await.unwrap();
+                    }
+                }));
+                let session_id = [7; 16];
+                let mut call = udp.register_udp_session_request();
+                call.get().set_session_id(&session_id);
+                call.get().set_dst_ip(&[127, 0, 0, 1]);
+                call.get().set_dst_port(destination.port());
+                call.get().set_close_after_idle_hint(5_000_000_000);
+                call.get().set_trace_context("");
+                let answer = call.send().promise.await.unwrap();
+                assert!(
+                    answer
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .get_err()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .is_empty()
+                );
+                let packet = crate::protocol::datagram::DatagramV2::Udp {
+                    session_id,
+                    payload: b"preack-udp".to_vec(),
+                };
+                conn.send_datagram(Bytes::from(packet.encode().unwrap()))
+                    .await
+                    .unwrap();
+                let reply = conn.recv_datagram().await.unwrap();
+                assert_eq!(
+                    crate::protocol::datagram::DatagramV2::decode(&reply).unwrap(),
+                    packet
+                );
+                assert_eq!(shared.network.active_flows(), 1);
+                let mut preack_data = conn.open_bi().await.unwrap();
+                metadata::write_connect_request(
+                    &mut preack_data,
+                    &metadata::ConnectRequest {
+                        destination: "https://example.invalid/preack".into(),
+                        connection_type: metadata::ConnectionType::Http,
+                        metadata: vec![
+                            ("HttpMethod".into(), "GET".into()),
+                            ("HttpHost".into(), "example.invalid".into()),
+                        ],
+                    },
+                )
+                .await
+                .unwrap();
+                preack_data.shutdown().await.unwrap();
+                let response = metadata::read_connect_response(&mut preack_data)
+                    .await
+                    .unwrap();
+                assert!(
+                    response
+                        .metadata
+                        .iter()
+                        .any(|(key, value)| key == "HttpStatus" && value == "203")
+                );
+                let mut body = Vec::new();
+                preack_data.read_to_end(&mut body).await.unwrap();
+                drop(preack_data);
+                use base64::Engine;
+                let token=format!("{}.{}.{}",base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256"}"#),base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({"tun":{"id":shared.config.credentials.tunnel_id,"account_tag":"synthetic-account"},"actor":{"id":"synthetic-actor"}})).unwrap()),base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8;64]));
+                let mut ping=conn.open_bi().await.unwrap();
+                metadata::write_connect_request(&mut ping,&metadata::ConnectRequest{destination:format!("https://destination.invalid/ping?access_token={token}"),connection_type:metadata::ConnectionType::Http,metadata:vec![("HttpMethod".into(),"GET".into()),("HttpHost".into(),"management.argotunnel.com".into()),("HttpHeader:Host".into(),"caller.invalid".into())]}).await.unwrap();
+                ping.shutdown().await.unwrap();
+                let response=metadata::read_connect_response(&mut ping).await.unwrap();
+                assert!(response.metadata.iter().any(|(key,value)|key=="HttpStatus"&&value=="200"));
+                ping.read_to_end(&mut Vec::new()).await.unwrap();drop(ping);
+                let mut logs=conn.open_bi().await.unwrap();
+                metadata::write_connect_request(&mut logs,&metadata::ConnectRequest{destination:format!("https://destination.invalid/logs?access_token={token}"),connection_type:metadata::ConnectionType::Websocket,metadata:vec![("HttpMethod".into(),"GET".into()),("HttpHost".into(),"management.argotunnel.com".into()),("HttpHeader:Host".into(),"caller.invalid".into()),("HttpHeader:Origin".into(),"https://management.argotunnel.com".into()),("HttpHeader:Connection".into(),"Upgrade".into()),("HttpHeader:Upgrade".into(),"websocket".into()),("HttpHeader:Sec-WebSocket-Version".into(),"13".into()),("HttpHeader:Sec-WebSocket-Key".into(),base64::engine::general_purpose::STANDARD.encode([4u8;16]))]}).await.unwrap();
+                let response=metadata::read_connect_response(&mut logs).await.unwrap();
+                assert!(response.metadata.iter().any(|(key,value)|key=="HttpStatus"&&value=="101"),"authoritative management HttpHost must allow same-origin despite conflicting ordinary Host/destination");
+                use futures::StreamExt;
+                let mut websocket=tokio_tungstenite::WebSocketStream::from_raw_socket(logs,tokio_tungstenite::tungstenite::protocol::Role::Client,None).await;
+                websocket.close(None).await.unwrap();let _=websocket.next().await;drop(websocket);
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let destination=listener.local_addr().unwrap();
+                let origin=tokio::task::spawn_local(async move{let (mut socket,_)=listener.accept().await.unwrap();let mut bytes=Vec::new();socket.read_to_end(&mut bytes).await.unwrap();socket.write_all(&bytes).await.unwrap();socket.shutdown().await.unwrap();});
+                let mut private=conn.open_bi().await.unwrap();
+                metadata::write_connect_request(&mut private,&metadata::ConnectRequest{destination:destination.to_string(),connection_type:metadata::ConnectionType::Tcp,metadata:vec![("HttpHost".into(),"management.argotunnel.com".into()),("HttpHeader:Host".into(),"caller.invalid".into())]}).await.unwrap();
+                let response=metadata::read_connect_response(&mut private).await.unwrap();assert!(response.error.is_empty());assert!(!response.metadata.iter().any(|(key,_)|key=="HttpStatus"),"private TCP must bypass HTTP management interception");private.write_all(b"private-tcp").await.unwrap();private.shutdown().await.unwrap();let mut returned=Vec::new();private.read_to_end(&mut returned).await.unwrap();assert_eq!(returned,b"private-tcp");origin.await.unwrap();drop(private);
+                let _persistent_callback = if keep_callback_open {
+                    Some(_preack_driver)
+                } else {
+                    drop(_preack_driver);
+                    None
+                };
+                assert_eq!(
+                    shared.readiness.count(),
+                    0,
+                    "pre-ack traffic cannot fabricate registration readiness"
+                );
+                acknowledgement.notify_one();
+                if reject {
+                    let _ = (&mut registration_rpc.0).await;
+                    assert_eq!(shared.readiness.count(), 0);
+                    assert!(!shared.startup_announced.load(Ordering::Acquire));
+                    assert!(!closed.load(Ordering::Acquire));
+                    conn.close();
+                    return;
+                }
                 tokio::time::timeout(Duration::from_secs(2), async {
                     while !shared.readiness.ready() || !local_configuration.load(Ordering::Acquire)
                     {
@@ -449,8 +848,22 @@ async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
                 })
                 .await
                 .unwrap();
+                if let Some(callback) = &_persistent_callback {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while !callback.0.is_finished() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        shared.readiness.count(),
+                        1,
+                        "expired callback RPC must not invalidate live control registration"
+                    );
+                }
                 let mut stream = conn.open_bi().await.unwrap();
-                assert_eq!(stream.id(), 1);
+                assert_eq!(stream.id(), 21);
                 metadata::write_connect_request(
                     &mut stream,
                     &metadata::ConnectRequest {
@@ -476,7 +889,7 @@ async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
                 let mut body = Vec::new();
                 stream.read_to_end(&mut body).await.unwrap();
                 let mut stream = conn.open_bi().await.unwrap();
-                assert_eq!(stream.id(), 5);
+                assert_eq!(stream.id(), 25);
                 stream.write_all(&metadata::RPC_SIGNATURE).await.unwrap();
                 let (read, write) = tokio::io::split(stream);
                 let network = capnp_rpc::twoparty::VatNetwork::new(
@@ -507,15 +920,35 @@ async fn named_quic_real_tls_first_stream_rpc_http_config_and_unregister() {
             let connector = serve_quic(runtime.clone(), &edge_tls, 0, address, 0, &mut reset);
             tokio::time::timeout(Duration::from_secs(10), async {
                 let (a, b) = tokio::join!(connector, edge);
-                a.unwrap();
+                if reject {
+                    assert!(
+                        a.unwrap_err()
+                            .downcast_ref::<RegistrationFailure>()
+                            .is_some()
+                    );
+                } else {
+                    a.unwrap();
+                }
                 b.unwrap();
             })
             .await
             .unwrap();
             assert!(!runtime.readiness.ready());
-            assert!(runtime.ever_quic.load(Ordering::Acquire));
+            assert_eq!(runtime.ever_quic.load(Ordering::Acquire), !reject);
+            assert_eq!(
+                runtime.should_fallback(EdgeProtocol::Quic, true, true),
+                reject,
+                "successful historical QUIC suppresses fallback after every connection disconnects"
+            );
             assert_eq!(seen.lock().unwrap().as_slice(), &[(0, runtime.client_id)]);
-            assert!(configured.load(Ordering::Acquire));
+            assert_eq!(configured.load(Ordering::Acquire), !reject);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while runtime.network.active_flows() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         })
         .await;
 }

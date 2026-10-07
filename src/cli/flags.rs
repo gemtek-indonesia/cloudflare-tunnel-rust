@@ -5,6 +5,7 @@ pub enum Kind {
     Integer,
     Duration,
     List,
+    Float,
 }
 
 pub struct FlagSpec {
@@ -149,6 +150,22 @@ flags! {
     ("filter-network-is-superset-of", String, None, ["nsup"], [], false),
     ("filter-comment-is", String, None, [], [], false),
     ("filter-vnet-id", String, None, [], [], false),
+    ("app", String, None, [], [], false),
+    ("quiet", Bool, None, ["q"], [], false),
+    ("no-verbose", Bool, None, [], [], false),
+    ("auto-close", Bool, None, [], [], false),
+    ("destination", String, None, [], ["TUNNEL_SERVICE_DESTINATION"], false),
+    ("header", List, None, ["H"], [], false),
+    ("service-token-id", String, None, [], ["TUNNEL_SERVICE_TOKEN_ID"], false),
+    ("service-token-secret", String, None, [], ["TUNNEL_SERVICE_TOKEN_SECRET"], false),
+    ("short-lived-cert", Bool, None, [], [], false),
+    ("connect-to", String, None, [], [], false),
+    ("debug-stream", Integer, None, [], [], false),
+    ("log-level", String, Some("info"), [], [], false),
+    ("event", List, None, [], ["TUNNEL_MANAGEMENT_FILTER_EVENTS"], false),
+    ("level", String, Some("debug"), [], ["TUNNEL_MANAGEMENT_FILTER_LEVEL"], false),
+    ("sample", Float, Some("1.0"), [], ["TUNNEL_MANAGEMENT_FILTER_SAMPLE"], false),
+    ("trace", String, None, [], [], false),
 }
 
 pub fn find(name: &str) -> Option<&'static FlagSpec> {

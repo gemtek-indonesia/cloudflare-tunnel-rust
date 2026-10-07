@@ -40,6 +40,24 @@ pub async fn dial_with_options_and_addr(
     tls: &EdgeTls,
     options: &super::EdgeDialOptions,
 ) -> io::Result<(H2Connection, SocketAddr)> {
+    let (stream, local_addr) = dial_tls_with_options(address, server_name, tls, options).await?;
+    let connection = tokio::time::timeout(
+        Duration::from_secs(5),
+        h2::server::Builder::new()
+            .max_concurrent_streams(u32::MAX)
+            .handshake(stream),
+    )
+    .await?
+    .map_err(io::Error::other)?;
+    Ok((connection, local_addr))
+}
+
+pub async fn dial_tls_with_options(
+    address: SocketAddr,
+    server_name: &str,
+    tls: &EdgeTls,
+    options: &super::EdgeDialOptions,
+) -> io::Result<(SslStream<TcpStream>, SocketAddr)> {
     let socket = if address.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
@@ -61,15 +79,7 @@ pub async fn dial_with_options_and_addr(
     )
     .await?
     .map_err(io::Error::other)?;
-    let connection = tokio::time::timeout(
-        Duration::from_secs(5),
-        h2::server::Builder::new()
-            .max_concurrent_streams(u32::MAX)
-            .handshake(stream),
-    )
-    .await?
-    .map_err(io::Error::other)?;
-    Ok((connection, local_addr))
+    Ok((stream, local_addr))
 }
 
 #[cfg(test)]

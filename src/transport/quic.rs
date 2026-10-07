@@ -151,10 +151,54 @@ enum Command {
     Datagram(Bytes, oneshot::Sender<io::Result<()>>),
 }
 
+#[derive(Clone)]
+pub struct QuicSender {
+    commands: mpsc::Sender<Command>,
+    notify: Arc<Notify>,
+    cancel: CancellationToken,
+}
+impl QuicSender {
+    pub async fn open_bi(&self) -> io::Result<QuicStream> {
+        if self.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        let (tx, rx) = oneshot::channel();
+        tokio::select! { _=self.cancel.cancelled()=>return Err(closed()), result=self.commands.send(Command::Open(tx))=>result.map_err(|_|closed())? }
+        self.notify.notify_one();
+        tokio::select! { _=self.cancel.cancelled()=>Err(closed()), result=rx=>result.map_err(|_|closed())? }
+    }
+    pub async fn send_datagram(&self, payload: Bytes) -> io::Result<()> {
+        if payload.len() > 1350 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let (tx, rx) = oneshot::channel();
+        tokio::select! {_=self.cancel.cancelled()=>return Err(closed()),result=self.commands.send(Command::Datagram(payload,tx))=>result.map_err(|_|closed())?}
+        self.notify.notify_one();
+        tokio::select! {_=self.cancel.cancelled()=>Err(closed()),result=rx=>result.map_err(|_|closed())?}
+    }
+    pub fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+pub struct IncomingStreams {
+    receiver: mpsc::Receiver<QuicStream>,
+    notify: Arc<Notify>,
+}
+impl IncomingStreams {
+    pub async fn recv(&mut self) -> Option<QuicStream> {
+        let stream = self.receiver.recv().await;
+        self.notify.notify_one();
+        stream
+    }
+}
+pub struct QuicIncoming {
+    pub streams: IncomingStreams,
+    pub datagrams: mpsc::Receiver<Bytes>,
+}
+
 pub struct QuicConnection {
     commands: mpsc::Sender<Command>,
-    incoming: mpsc::Receiver<QuicStream>,
-    datagrams: mpsc::Receiver<Bytes>,
+    incoming: Option<QuicIncoming>,
     notify: Arc<Notify>,
     cancel: CancellationToken,
     local_addr: SocketAddr,
@@ -163,34 +207,54 @@ pub struct QuicConnection {
 }
 
 impl QuicConnection {
+    pub fn sender(&self) -> QuicSender {
+        QuicSender {
+            commands: self.commands.clone(),
+            notify: self.notify.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+    pub fn take_incoming(&mut self) -> io::Result<QuicIncoming> {
+        self.incoming.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "incoming receivers already taken",
+            )
+        })
+    }
     pub async fn open_bi(&self) -> io::Result<QuicStream> {
-        let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(Command::Open(tx))
-            .await
-            .map_err(|_| closed())?;
-        self.notify.notify_one();
-        rx.await.map_err(|_| closed())?
+        self.sender().open_bi().await
     }
     pub async fn accept_bi(&mut self) -> io::Result<QuicStream> {
-        let result = self.incoming.recv().await.ok_or_else(closed);
-        self.notify.notify_one();
-        result
+        self.incoming
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "incoming receivers already taken",
+                )
+            })?
+            .streams
+            .recv()
+            .await
+            .ok_or_else(closed)
     }
     pub async fn send_datagram(&self, payload: Bytes) -> io::Result<()> {
-        if payload.len() > 1350 {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-        let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(Command::Datagram(payload, tx))
-            .await
-            .map_err(|_| closed())?;
-        self.notify.notify_one();
-        rx.await.map_err(|_| closed())?
+        self.sender().send_datagram(payload).await
     }
     pub async fn recv_datagram(&mut self) -> io::Result<Bytes> {
-        self.datagrams.recv().await.ok_or_else(closed)
+        self.incoming
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "incoming receivers already taken",
+                )
+            })?
+            .datagrams
+            .recv()
+            .await
+            .ok_or_else(closed)
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -368,8 +432,13 @@ async fn attach_connection(
     guard.0 = None;
     Ok(QuicConnection {
         commands: commands_tx,
-        incoming,
-        datagrams,
+        incoming: Some(QuicIncoming {
+            streams: IncomingStreams {
+                receiver: incoming,
+                notify: notify.clone(),
+            },
+            datagrams,
+        }),
         notify,
         cancel,
         local_addr,
@@ -439,7 +508,7 @@ impl Driver {
     fn drive(&mut self, conn: &mut QuicheConnection) -> QuicResult<()> {
         if self.cancel.is_cancelled() {
             let _ = conn.close(true, 0, b"");
-            return Ok(());
+            return Err(closed().into());
         }
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
@@ -587,8 +656,15 @@ impl ApplicationOverQuic for Driver {
     fn should_act(&self) -> bool {
         true
     }
-    async fn wait_for_data(&mut self, _conn: &mut QuicheConnection) -> QuicResult<()> {
-        tokio::select! { _ = self.notify.notified() => {}, _ = self.cancel.cancelled() => {}, _ = tokio::time::sleep_until(self.next_ping) => {} }
+    async fn wait_for_data(&mut self, conn: &mut QuicheConnection) -> QuicResult<()> {
+        tokio::select! {
+            _ = self.notify.notified() => {},
+            _ = self.cancel.cancelled() => {
+                let _=conn.close(true,0,b"");
+                return Err(closed().into());
+            },
+            _ = tokio::time::sleep_until(self.next_ping) => {}
+        }
         Ok(())
     }
     fn process_reads(&mut self, conn: &mut QuicheConnection) -> QuicResult<()> {
@@ -615,7 +691,12 @@ mod tests {
     use crate::crypto::{TlsPolicy, tests::certificate};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn echo_peer(socket: UdpSocket, mut config: quiche::Config) {
+    async fn echo_peer(
+        socket: UdpSocket,
+        mut config: quiche::Config,
+        initial_streams: usize,
+        reset_first: bool,
+    ) -> Option<(bool, u64)> {
         let local = socket.local_addr().unwrap();
         let mut packet = [0; 65527];
         let (n, remote) = socket.recv_from(&mut packet).await.unwrap();
@@ -643,7 +724,15 @@ mod tests {
         let _original_destination = header.dcid;
         loop {
             if conn.is_established() && !edge_stream_sent {
-                edge_stream_sent = conn.stream_send(1, b"edge", false).is_ok();
+                for index in 0..initial_streams {
+                    let id = 1 + 4 * index as u64;
+                    conn.stream_send(id, b"edge", initial_streams > 1).unwrap();
+                    if reset_first && index == 0 {
+                        conn.stream_shutdown(id, quiche::Shutdown::Write, 77)
+                            .unwrap();
+                    }
+                }
+                edge_stream_sent = true;
             }
             for id in conn.readable() {
                 if pending.contains_key(&id) {
@@ -671,7 +760,9 @@ mod tests {
                 socket.send_to(&out[..n], info.to).await.unwrap();
             }
             if conn.is_closed() {
-                break;
+                return conn
+                    .peer_error()
+                    .map(|error| (error.is_app, error.error_code));
             }
             let deadline = conn.timeout().unwrap_or(Duration::from_millis(50));
             tokio::select! {
@@ -684,12 +775,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn raw_loopback_stream_backpressure_half_close_and_datagram() {
-        let (cert, key) = certificate();
+    fn peer_config(
+        cert: &boring::x509::X509,
+        key: &boring::pkey::PKey<boring::pkey::Private>,
+    ) -> quiche::Config {
         let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
-        ssl.set_certificate(&cert).unwrap();
-        ssl.set_private_key(&key).unwrap();
+        ssl.set_certificate(cert).unwrap();
+        ssl.set_private_key(key).unwrap();
         ssl.set_curves_list("X25519MLKEM768").unwrap();
         let mut config =
             quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
@@ -700,13 +792,25 @@ mod tests {
         config.set_initial_max_stream_data_bidi_local(64 * 1024);
         config.set_initial_max_streams_bidi(128);
         config.enable_dgram(true, 32, 32);
+        config
+    }
+
+    #[tokio::test]
+    async fn raw_loopback_stream_backpressure_half_close_and_datagram() {
+        let (cert, key) = certificate();
+        let config = peer_config(&cert, &key);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        let peer = tokio::spawn(echo_peer(socket, config));
+        let peer = tokio::spawn(echo_peer(socket, config, 1, false));
         let tls =
             EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
         let mut conn = dial(addr, "edge.test", &tls).await.unwrap();
-        let mut inbound = conn.accept_bi().await.unwrap();
+        let sender = conn.sender();
+        let mut incoming = conn.take_incoming().unwrap();
+        assert!(
+            matches!(conn.take_incoming(),Err(error) if error.kind()==io::ErrorKind::AlreadyExists)
+        );
+        let mut inbound = incoming.streams.recv().await.unwrap();
         assert_eq!(inbound.id(), 1);
         let mut edge_payload = [0; 4];
         inbound.read_exact(&mut edge_payload).await.unwrap();
@@ -716,7 +820,7 @@ mod tests {
         let mut returned = Vec::new();
         inbound.read_to_end(&mut returned).await.unwrap();
         assert_eq!(&returned, b"return");
-        let stream = conn.open_bi().await.unwrap();
+        let stream = sender.open_bi().await.unwrap();
         assert_eq!(stream.id(), 0);
         let (mut read, mut write) = tokio::io::split(stream);
         let payload = vec![0x5a; 512 * 1024];
@@ -739,21 +843,110 @@ mod tests {
             !conn.is_closed(),
             "keepalive must prevent five-second idle expiry"
         );
-        conn.send_datagram(Bytes::from_static(b"datagram"))
+        sender
+            .send_datagram(Bytes::from_static(b"datagram"))
             .await
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), conn.recv_datagram())
+            tokio::time::timeout(Duration::from_secs(2), incoming.datagrams.recv())
                 .await
                 .unwrap()
                 .unwrap(),
             "datagram"
         );
-        conn.close();
-        tokio::time::timeout(Duration::from_secs(5), peer)
-            .await
-            .unwrap()
-            .unwrap();
+        let source = conn.local_addr();
+        drop(conn);
+        assert!(sender.is_closed());
+        assert!(sender.open_bi().await.is_err());
+        assert!(
+            sender
+                .send_datagram(Bytes::from_static(b"after close"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some((true, 0)),
+            "peer must observe application close code zero"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(socket) = UdpSocket::bind(source).await {
+                    drop(socket);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn incoming_queue_saturation_reset_and_later_streams_preserve_progress() {
+        let (cert, key) = certificate();
+        let config = peer_config(&cert, &key);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let peer = tokio::spawn(echo_peer(socket, config, QUEUE + 8, true));
+        let tls =
+            EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+        let mut connection = dial(address, "edge.test", &tls).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            connection.incoming.as_ref().unwrap().streams.receiver.len(),
+            QUEUE
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..QUEUE + 8 {
+            let mut stream = tokio::time::timeout(Duration::from_secs(1), connection.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(seen.insert(stream.id()), "peer stream admitted only once");
+            let mut body = Vec::new();
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut body))
+                    .await
+                    .unwrap();
+            if stream.id() == 1 {
+                assert!(result.is_err(), "peer reset must close its read side");
+            } else {
+                result.unwrap();
+                assert_eq!(body, b"edge");
+                stream.shutdown().await.unwrap();
+            }
+        }
+        assert_eq!(seen.len(), QUEUE + 8);
+        let mut later = connection.open_bi().await.unwrap();
+        later.write_all(b"later").await.unwrap();
+        later.shutdown().await.unwrap();
+        let mut body = Vec::new();
+        later.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"later");
+        drop(connection);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some((true, 0))
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

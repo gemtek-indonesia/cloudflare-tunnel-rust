@@ -142,35 +142,7 @@ pub(crate) async fn resolve(config: &RunConfig) -> Result<EdgePool> {
         }
         groups.extend([a, b]);
     } else {
-        let service = if region.is_empty() {
-            "v2-origintunneld".into()
-        } else {
-            format!("{region}-v2-origintunneld")
-        };
-        let name = format!("_{service}._tcp.argotunnel.com.");
-        let resolver = Resolver::builder_tokio()?.build()?;
-        let records = match resolver.srv_lookup(name.clone()).await {
-            Ok(records) => records
-                .answers()
-                .iter()
-                .filter_map(|r| match &r.data {
-                    RData::SRV(record) => Some(record.clone()),
-                    _ => None,
-                })
-                .collect(),
-            Err(_) => srv_over_tls(&name).await?,
-        };
-        let records = ordered_srv(records)?;
-        if records.len() < 2 {
-            bail!("expected at least 2 Cloudflare Regions; SRV returned fewer");
-        }
-        for record in records.into_iter().take(2) {
-            groups.push(
-                tokio::net::lookup_host((record.target.to_ascii().as_str(), record.port))
-                    .await?
-                    .collect(),
-            );
-        }
+        groups = resolve_groups(region).await?;
     }
     let family = match config.edge_bind_address {
         Some(ip) => {
@@ -196,6 +168,40 @@ pub(crate) async fn resolve(config: &RunConfig) -> Result<EdgePool> {
         })
         .collect();
     EdgePool::new(groups)
+}
+
+pub(super) async fn resolve_groups(region: &str) -> Result<Vec<Vec<SocketAddr>>> {
+    let service = if region.is_empty() {
+        "v2-origintunneld".into()
+    } else {
+        format!("{region}-v2-origintunneld")
+    };
+    let name = format!("_{service}._tcp.argotunnel.com.");
+    let resolver = Resolver::builder_tokio()?.build()?;
+    let records = match resolver.srv_lookup(name.clone()).await {
+        Ok(records) => records
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::SRV(record) => Some(record.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => srv_over_tls(&name).await?,
+    };
+    let records = ordered_srv(records)?;
+    if records.len() < 2 {
+        bail!("expected at least 2 Cloudflare Regions; SRV returned fewer");
+    }
+    let mut groups = Vec::new();
+    for record in records.into_iter().take(2) {
+        groups.push(
+            tokio::net::lookup_host((record.target.to_ascii().as_str(), record.port))
+                .await?
+                .collect(),
+        );
+    }
+    Ok(groups)
 }
 
 struct Region {

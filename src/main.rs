@@ -41,16 +41,20 @@ async fn dispatch() -> Result<()> {
             }
             println!("OK");
         }
-        Action::IngressRule { configuration, url } => {
+        Action::IngressRule {
+            configuration,
+            url,
+            normalize,
+        } => {
             let request = url::Url::parse(&url)?;
             let raw_uri: http::Uri = url.parse()?;
-            let path = decoded_path(raw_uri.path())?;
+            let path = config::matcher_path(raw_uri.path())?;
             let (index, rule) = configuration
                 .ingress
                 .iter()
                 .enumerate()
                 .find(|(_, rule)| {
-                    rule.matches(request.host_str().unwrap_or(""), &path, false)
+                    rule.matches(request.host_str().unwrap_or(""), &path, normalize)
                         .unwrap_or(false)
                 })
                 .context("No matching ingress rule")?;
@@ -69,15 +73,13 @@ async fn dispatch() -> Result<()> {
             if !endpoint.username().is_empty() || endpoint.password().is_some() {
                 anyhow::bail!("metrics address must not include credentials");
             }
-            let hostname = endpoint
-                .host_str()
-                .context("metrics address requires a hostname")?;
+            let hostname = config::socket_host(&endpoint)?;
             let port = endpoint
                 .port_or_known_default()
                 .context("metrics address requires a port")?;
             let mut connection = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                tokio::net::TcpStream::connect((hostname, port)),
+                tokio::net::TcpStream::connect((hostname.as_str(), port)),
             )
             .await??;
             connection
@@ -97,31 +99,35 @@ async fn dispatch() -> Result<()> {
             }
         }
         Action::Run(configuration) => cloudflare_tunnel_rust::runtime::run(*configuration).await?,
+        Action::RunNamed(invocation) => {
+            cloudflare_tunnel_rust::runtime::run(invocation.named_config(home.as_deref()).await?)
+                .await?
+        }
         Action::Admin(invocation) => {
             cloudflare_tunnel_rust::administration::execute(invocation).await?
         }
         Action::Service(invocation) => cloudflare_tunnel_rust::service::execute(invocation).await?,
-    }
-    Ok(())
-}
-
-fn decoded_path(path: &str) -> Result<String> {
-    let mut bytes = Vec::new();
-    let mut chars = path.as_bytes().iter().copied();
-    while let Some(byte) = chars.next() {
-        if byte == b'%' {
-            let high = chars
-                .next()
-                .and_then(|byte| (byte as char).to_digit(16))
-                .context("invalid URL path escape")?;
-            let low = chars
-                .next()
-                .and_then(|byte| (byte as char).to_digit(16))
-                .context("invalid URL path escape")?;
-            bytes.push((high * 16 + low) as u8);
-        } else {
-            bytes.push(byte);
+        Action::Access(invocation) => cloudflare_tunnel_rust::access::execute(invocation).await?,
+        Action::Operations(invocation) => {
+            cloudflare_tunnel_rust::observability::tail::execute(invocation).await?
+        }
+        Action::Diagnostics(invocation) => {
+            cloudflare_tunnel_rust::observability::bundle::execute(invocation).await?
+        }
+        Action::Quick(invocation) => {
+            let config = cloudflare_tunnel_rust::quick_tunnel::prepare(&invocation).await?;
+            cloudflare_tunnel_rust::runtime::run(config).await?;
+        }
+        Action::Adhoc(invocation) => {
+            let credentials =
+                cloudflare_tunnel_rust::administration::prepare_adhoc(&invocation).await?;
+            cloudflare_tunnel_rust::runtime::run(invocation.run_config_for_credentials(
+                credentials,
+                false,
+                home.as_deref(),
+            )?)
+            .await?;
         }
     }
-    String::from_utf8(bytes).context("URL path is not UTF-8")
+    Ok(())
 }
