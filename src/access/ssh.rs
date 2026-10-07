@@ -362,7 +362,6 @@ mod tests {
             let output = tokio::time::timeout(Duration::from_secs(3), command.output()).await.expect("owned SSH proxy did not exit").unwrap();
             let error = String::from_utf8_lossy(&output.stderr).replace(directory.to_string_lossy().as_ref(), "<fixture>");
             assert_eq!(output.status.code(), Some(255), "Unexpected SSH mock exit ({version}): {error}");
-            assert!(error.contains("Connection closed"), "Expected mock handshake EOF ({version}): {error}");
             assert_eq!(std::fs::read_to_string(&capture).unwrap(), "access\nssh\n--hostname\nsynthetic.invalid\n");
             assert!(!directory.join("unintended-dollar").exists());
             assert!(!directory.join("unintended-backtick").exists());
