@@ -27,6 +27,7 @@ pub struct Metrics {
     pub udp_migrated_flows: IntCounterVec,
     pub udp_unsupported_remote_commands: IntCounterVec,
     pub udp_dropped_datagrams: IntCounterVec,
+    pub icmp_dropped_packets: IntCounterVec,
     pub connect_latency: Histogram,
     pub connect_errors: IntCounter,
     pub rpc_client_operations: IntCounterVec,
@@ -244,6 +245,11 @@ impl Metrics {
             "Total count of UDP dropped datagrams",
             &["conn_index", "reason"]
         );
+        let icmp_dropped_packets = counters!(
+            "cloudflared_icmp_dropped_packets",
+            "Total count of ICMP dropped datagrams",
+            &["conn_index", "reason"]
+        );
         Ok(Arc::new(Self {
             registry,
             ha_connections,
@@ -266,6 +272,7 @@ impl Metrics {
             udp_migrated_flows,
             udp_unsupported_remote_commands,
             udp_dropped_datagrams,
+            icmp_dropped_packets,
             connect_latency,
             connect_errors,
             rpc_client_operations,

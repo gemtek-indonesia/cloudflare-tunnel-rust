@@ -294,7 +294,7 @@ impl Invocation {
                 {
                     match kind {
                         Kind::Integer => {
-                            root_integer(value).with_context(|| {
+                            parse_go_integer(value).with_context(|| {
                                 format!("invalid environment value for --{name}")
                             })?;
                         }
@@ -447,6 +447,9 @@ impl Invocation {
     }
     pub fn is_set(&self, name: &str) -> bool {
         self.specified.contains_key(name)
+    }
+    pub fn integer(&self, name: &str) -> Result<i64> {
+        parse_go_integer(self.string(name)).with_context(|| format!("invalid --{name}"))
     }
     pub fn duration(&self, name: &str) -> Result<Duration> {
         config::parse_duration(self.string(name)).with_context(|| format!("invalid --{name}"))
@@ -970,6 +973,7 @@ fn validate_value(name: &str, kind: Kind, value: &str) -> Result<()> {
             "1", "0", "true", "false", "TRUE", "FALSE", "True", "False", "t", "f", "T", "F",
         ]
         .contains(&value),
+        Kind::Integer if name == "max-fetch-size" => parse_go_integer(value).is_ok(),
         Kind::Integer => value.parse::<i64>().is_ok(),
         Kind::Float => value.parse::<f64>().is_ok_and(|value| value.is_finite()),
         Kind::Duration => config::parse_duration(value).is_ok(),
@@ -1024,7 +1028,7 @@ fn root_duration(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn root_integer(value: &str) -> Result<()> {
+pub(crate) fn parse_go_integer(value: &str) -> Result<i64> {
     let negative = value.starts_with('-');
     let unsigned = value
         .strip_prefix('-')
@@ -1068,7 +1072,15 @@ fn root_integer(value: &str) -> Result<()> {
     if magnitude > i64::MAX as u64 + u64::from(negative) {
         bail!("integer outside supported range");
     }
-    Ok(())
+    Ok(if negative {
+        if magnitude == (1u64 << 63) {
+            i64::MIN
+        } else {
+            -(magnitude as i64)
+        }
+    } else {
+        magnitude as i64
+    })
 }
 
 fn yaml_value(kind: Kind, value: &serde_yaml_ng::Value) -> Result<Option<String>> {
@@ -1120,6 +1132,45 @@ pub fn help(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_fetch_base_zero_uses_shared_signed_integer_parser() {
+        for (input, expected) in [
+            ("0x7", 7),
+            ("0b111", 7),
+            ("0o7", 7),
+            ("0_7", 7),
+            ("+7", 7),
+            ("-0x7", -7),
+            ("-0x8000000000000000", i64::MIN),
+        ] {
+            assert_eq!(super::parse_go_integer(input).unwrap(), expected);
+            let invocation = super::Invocation::parse(
+                [
+                    "--config",
+                    "/dev/null",
+                    "tunnel",
+                    "--max-fetch-size",
+                    input,
+                    "list",
+                ]
+                .map(str::to_owned),
+                &std::collections::BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(invocation.integer("max-fetch-size").unwrap(), expected);
+        }
+        for input in [
+            "08",
+            "0x__7",
+            "7_",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            assert!(super::parse_go_integer(input).is_err());
+        }
+    }
+
     use super::*;
     use base64::Engine;
 

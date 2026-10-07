@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use boring::ssl::{SslConnector, SslRef};
 use http::{HeaderValue, Uri};
-use hyper::body::{Body, Incoming};
+use hyper::body::Body;
 use hyper_util::{
     client::legacy::{
         Client,
@@ -542,7 +542,7 @@ where
     pub fn new(connector: Connector) -> Self {
         Self {
             client: Client::builder(TokioExecutor::new())
-                .proxy_target_from_host(true)
+                .request_target_from_host(true)
                 .pool_timer(TokioTimer::new())
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .pool_max_idle_per_host(2)
@@ -550,19 +550,26 @@ where
             connector,
         }
     }
-    pub async fn get(&self, uri: Uri) -> Result<http::Response<Incoming>>
+    pub async fn get(&self, uri: Uri) -> Result<http::Response<crate::http_body::ResponseBody>>
     where
         B: Default,
     {
         self.request(http::Request::builder().uri(uri).body(B::default())?)
             .await
     }
-    pub async fn request(&self, mut request: http::Request<B>) -> Result<http::Response<Incoming>> {
+    pub async fn request(
+        &self,
+        mut request: http::Request<B>,
+    ) -> Result<http::Response<crate::http_body::ResponseBody>> {
         self.connector.prepare_request(&mut request)?;
-        self.client
+        let method = request.method().clone();
+        let gzip = crate::http_body::prepare_gzip(&method, request.headers_mut());
+        let response = self
+            .client
             .request(request)
             .await
-            .context("HTTP request failed")
+            .context("HTTP request failed")?;
+        Ok(crate::http_body::response(response, gzip))
     }
 }
 

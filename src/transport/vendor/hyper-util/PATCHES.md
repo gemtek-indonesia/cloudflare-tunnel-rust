@@ -14,4 +14,4 @@ Changes are confined to `src/client/legacy/client.rs`, `src/client/legacy/connec
 
 The existing IPv6 encoding is unchanged. Authentication selection follows the consumed Go 1.26 `net/http` SOCKS behavior; the original strict mode remains available.
 
-The client builder adds opt-in `proxy_target_from_host`. Proxied HTTP/1 absolute-form targets use the validated Host authority after pool checkout, preserving original route selection, dialing and pool keys. Invalid Host values fail without sending a request. Direct requests and CONNECT serialization are unchanged; the default remains URI-derived targets.
+The client builder adds opt-in `request_target_from_host`. Proxied HTTP/1 absolute-form targets and HTTP/2 authority use the validated Host authority after pool checkout, preserving original route selection, dialing and pool keys. Unstarted retries restore the physical URI and original Host before checkout. Invalid Host values fail without sending a request. Direct HTTP/1 requests and CONNECT serialization are unchanged; the default remains URI-derived targets.

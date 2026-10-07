@@ -11,6 +11,9 @@ use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod pagination_tests;
+
 pub struct AccountClient {
     credentials: AccountCredentials,
     base: Url,
@@ -96,8 +99,11 @@ impl AccountClient {
     ) -> Result<Value> {
         let mut url = self.base.join(path)?;
         if !query.is_empty() {
-            url.query_pairs_mut()
-                .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+            let query = query
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            url.query_pairs_mut().extend_pairs(query);
         }
         let mut request = http::Request::builder()
             .method(method)
@@ -117,11 +123,12 @@ impl AccountClient {
         } else {
             Vec::new()
         };
+        let mut request = request.body(Full::new(Bytes::from(bytes)))?;
+        let method = request.method().clone();
+        let gzip = crate::http_body::prepare_gzip(&method, request.headers_mut());
         let response = tokio::time::timeout(Duration::from_secs(15), async {
-            let response = self
-                .client
-                .request(request.body(Full::new(Bytes::from(bytes)))?)
-                .await?;
+            let response = self.client.request(request).await?;
+            let response = crate::http_body::response(response, gzip);
             let status = response.status();
             let body = response.into_body().collect().await?.to_bytes();
             Ok::<_, anyhow::Error>((status, body))
@@ -188,14 +195,25 @@ impl AccountClient {
             let value = self
                 .request(http::Method::GET, path, query, None, true)
                 .await?;
-            let rows = value["result"]
-                .as_array()
-                .context("unexpected tunnel list response")?;
-            all.extend(rows.iter().cloned());
-            let p = &value["result_info"];
-            if p["count"].as_u64().unwrap_or(0) < p["per_page"].as_u64().unwrap_or(0)
-                || all.len() as u64 >= p["total_count"].as_u64().unwrap_or(0)
-            {
+            if !value["result_info"].is_null() && !value["result_info"].is_object() {
+                bail!("invalid API pagination metadata");
+            }
+            let super::models::Pagination {
+                count,
+                page: _,
+                per_page,
+                total_count,
+            } = serde_json::from_value::<Option<super::models::Pagination>>(
+                value["result_info"].clone(),
+            )
+            .context("invalid API pagination metadata")?
+            .unwrap_or_default();
+            let result = value.get("result").context("missing API list result")?;
+            if !result.is_null() {
+                let rows = result.as_array().context("unexpected API list response")?;
+                all.extend(rows.iter().cloned());
+            }
+            if count < per_page || all.len() as i64 >= total_count {
                 return Ok(all);
             }
         }

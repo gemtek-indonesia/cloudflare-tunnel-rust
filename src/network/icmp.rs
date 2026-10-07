@@ -114,6 +114,22 @@ fn interfaces() -> Result<Vec<Interface>> {
     }
     Ok(interfaces.into_values().collect())
 }
+fn ping_group(raw: &[u8], gid: u32) -> Result<()> {
+    let mut numbers = raw
+        .split(|byte| !byte.is_ascii_digit())
+        .filter(|part| !part.is_empty());
+    let low: u32 = std::str::from_utf8(numbers.next().context("did not find ping group range")?)?
+        .parse()
+        .context("failed to determine minimum ping group ID")?;
+    let high: u32 = std::str::from_utf8(numbers.next().context("did not find ping group range")?)?
+        .parse()
+        .context("failed to determine maximum ping group ID")?;
+    anyhow::ensure!(
+        gid >= low && gid <= high,
+        "Group ID {gid} is not between ping group {low} to {high}"
+    );
+    Ok(())
+}
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct Key(IpAddr, IpAddr, u16);
 struct Flow {
@@ -124,11 +140,21 @@ struct Flow {
     echo_id: u16,
     activity: tokio::sync::watch::Sender<tokio::time::Instant>,
 }
+#[cfg(test)]
+struct RequestGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
 pub(crate) struct IcmpRouter {
     v4: Ipv4Addr,
     v6: Ipv6Addr,
     zone: u32,
+    available: [bool; 2],
     flows: Mutex<HashMap<Key, Arc<Flow>>>,
+    #[cfg(test)]
+    request_gate: Mutex<Option<RequestGate>>,
+    #[cfg(test)]
+    write_gate: Mutex<Option<RequestGate>>,
 }
 impl Drop for IcmpRouter {
     fn drop(&mut self) {
@@ -138,6 +164,76 @@ impl Drop for IcmpRouter {
     }
 }
 impl IcmpRouter {
+    #[cfg(test)]
+    pub(super) fn fixture(config: &crate::config::RunConfig, available: [bool; 2]) -> Arc<Self> {
+        let mut router = Self::configured(config).unwrap();
+        router.available = available;
+        Arc::new(router)
+    }
+    pub(super) fn enabled(&self) -> bool {
+        self.available.iter().any(|available| *available)
+    }
+    pub(super) fn supports(&self, ipv4: bool) -> bool {
+        self.available[usize::from(!ipv4)]
+    }
+    #[cfg(test)]
+    pub(super) fn gate_next_request(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        assert!(
+            self.request_gate
+                .lock()
+                .unwrap()
+                .replace(RequestGate {
+                    entered,
+                    release: wait
+                })
+                .is_none()
+        );
+        (observed, release)
+    }
+    #[cfg(test)]
+    pub(super) async fn gate_existing_origin_write(
+        &self,
+        connection: &Connection,
+        packet: &IcmpPacket,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_id = socket.local_addr().unwrap().port();
+        let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        self.flows.lock().unwrap().insert(
+            Key(packet.source, packet.destination, packet.echo_id().unwrap()),
+            Arc::new(Flow {
+                index: connection.index,
+                generation: connection.generation,
+                cancel: CancellationToken::new(),
+                socket: Arc::new(socket),
+                echo_id,
+                activity,
+            }),
+        );
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        assert!(
+            self.write_gate
+                .lock()
+                .unwrap()
+                .replace(RequestGate {
+                    entered,
+                    release: wait
+                })
+                .is_none()
+        );
+        (observed, release)
+    }
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.flows.lock().unwrap().len()
@@ -161,7 +257,47 @@ impl IcmpRouter {
             },
         ]
     }
-    pub(crate) fn new(config: &crate::config::RunConfig) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        config: &crate::config::RunConfig,
+        logger: &crate::observability::logging::Logger,
+    ) -> Arc<Self> {
+        use crate::observability::logging::{Event, Level};
+        let mut router = match Self::configured(config) {
+            Ok(router) => router,
+            Err(error) => {
+                let _ = logger.log(
+                    Level::Warn,
+                    Event::Cloudflared,
+                    "ICMP proxy feature is disabled",
+                    serde_json::json!({"error":error.to_string()}),
+                );
+                return Arc::new(Self {
+                    v4: Ipv4Addr::UNSPECIFIED,
+                    v6: Ipv6Addr::UNSPECIFIED,
+                    zone: 0,
+                    available: [false; 2],
+                    flows: Mutex::new(HashMap::new()),
+                    #[cfg(test)]
+                    request_gate: Mutex::new(None),
+                    #[cfg(test)]
+                    write_gate: Mutex::new(None),
+                });
+            }
+        };
+        if config.quick_hostname.is_empty() {
+            let probes = [router.probe(true), router.probe(false)];
+            router.available = [probes[0].is_ok(), probes[1].is_ok()];
+            for (index, probe) in probes.into_iter().enumerate() {
+                if let Err(error) = probe {
+                    let _ = logger.log(if router.enabled() { Level::Debug } else { Level::Warn }, Event::Cloudflared,
+                        if router.enabled() { "ICMP address family is unavailable" } else { "ICMP proxy feature is disabled" },
+                        serde_json::json!({"family":if index == 0 {"IPv4"} else {"IPv6"},"error":error.to_string()}));
+                }
+            }
+        }
+        Arc::new(router)
+    }
+    fn configured(config: &crate::config::RunConfig) -> Result<Self> {
         let (v6, zone) = if let Some(source) = &config.icmpv6_src {
             let (ip, zone) = source.split_once('%').unwrap_or((source, ""));
             let zone = if zone.is_empty() {
@@ -182,14 +318,28 @@ impl IcmpRouter {
         } else {
             (Ipv6Addr::UNSPECIFIED, 0)
         };
-        Ok(Arc::new(Self {
+        Ok(Self {
             v4: config.icmpv4_src.unwrap_or(Ipv4Addr::UNSPECIFIED),
             v6,
             zone,
+            available: [false; 2],
             flows: Mutex::new(HashMap::new()),
-        }))
+            #[cfg(test)]
+            request_gate: Mutex::new(None),
+            #[cfg(test)]
+            write_gate: Mutex::new(None),
+        })
     }
-    fn open(&self, ipv4: bool) -> Result<(tokio::net::UdpSocket, u16)> {
+    fn probe(&self, ipv4: bool) -> Result<()> {
+        if ipv4 {
+            let range = std::fs::read("/proc/sys/net/ipv4/ping_group_range")?;
+            // SAFETY: getegid has no preconditions and does not change process credentials.
+            ping_group(&range, unsafe { libc::getegid() })?;
+        }
+        self.bind_socket(ipv4)?;
+        Ok(())
+    }
+    fn bind_socket(&self, ipv4: bool) -> Result<Socket> {
         let socket = Socket::new(
             if ipv4 { Domain::IPV4 } else { Domain::IPV6 },
             Type::DGRAM,
@@ -199,13 +349,17 @@ impl IcmpRouter {
                 Protocol::ICMPV6
             }),
         )?;
-        socket.set_nonblocking(true)?;
         let address = if ipv4 {
             SocketAddr::new(IpAddr::V4(self.v4), 0)
         } else {
             SocketAddr::V6(SocketAddrV6::new(self.v6, 0, 0, self.zone))
         };
         socket.bind(&address.into())?;
+        Ok(socket)
+    }
+    fn open(&self, ipv4: bool) -> Result<(tokio::net::UdpSocket, u16)> {
+        let socket = self.bind_socket(ipv4)?;
+        socket.set_nonblocking(true)?;
         let echo_id = socket
             .local_addr()?
             .as_socket()
@@ -220,10 +374,17 @@ impl IcmpRouter {
         raw: Vec<u8>,
         identity: Option<[u8; 25]>,
     ) -> Result<()> {
-        anyhow::ensure!(
-            connection.state.icmp_enabled,
-            "ICMP is unavailable for quick tunnels"
-        );
+        if !connection.state.icmp_enabled || !self.enabled() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            let gate = self.request_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.await;
+            }
+        }
         let packet = IcmpPacket::decode(&raw).map_err(anyhow::Error::msg)?;
         if packet.ttl <= 1 {
             let source = if packet.destination.is_ipv4() {
@@ -239,7 +400,57 @@ impl IcmpRouter {
             )
             .await;
         }
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        anyhow::ensure!(
+            self.supports(packet.destination.is_ipv4()),
+            "ICMP{} proxy was not instantiated",
+            if packet.destination.is_ipv4() {
+                "v4"
+            } else {
+                "v6"
+            }
+        );
+        let mut trace = identity.map(|identity| {
+            Trace::with_identity(Identity(identity), "icmp-echo-request")
+                .attribute("src", Value::StringValue(packet.source.to_string()))
+                .attribute("dst", Value::StringValue(packet.destination.to_string()))
+        });
+        let result = self
+            .echo_request(connection.clone(), packet, identity, &mut trace)
+            .await;
+        if let (Some(trace), Some(identity)) = (trace, identity) {
+            let spans = trace.finish(result.as_ref().err().map(|e| e.to_string()).as_deref());
+            if !spans.is_empty() {
+                let bytes = DatagramV2::TraceSpans {
+                    identity,
+                    payload: spans,
+                }
+                .encode()
+                .map_err(anyhow::Error::msg)?;
+                let _ = connection.sender.send_datagram(Bytes::from(bytes)).await;
+            }
+        }
+        result
+    }
+    async fn echo_request(
+        self: &Arc<Self>,
+        connection: Arc<Connection>,
+        packet: IcmpPacket,
+        identity: Option<[u8; 25]>,
+        trace: &mut Option<Trace>,
+    ) -> Result<()> {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
         let echo = packet.echo_id().map_err(anyhow::Error::msg)?;
+        *trace = trace.take().map(|trace| {
+            trace
+                .attribute("originalEchoID", Value::IntValue(i64::from(echo)))
+                .attribute(
+                    "seq",
+                    Value::IntValue(i64::from(u16::from_be_bytes(
+                        packet.message[6..8].try_into().unwrap(),
+                    ))),
+                )
+        });
         let key = Key(packet.source, packet.destination, echo);
         let existing = self.flows.lock().unwrap().get(&key).cloned();
         let flow = if let Some(flow) = existing.filter(|f| {
@@ -313,20 +524,9 @@ impl IcmpRouter {
             });
             flow
         };
-        use opentelemetry_proto::tonic::common::v1::any_value::Value;
-        let trace = identity.map(|identity| {
-            Trace::with_identity(Identity(identity), "icmp-echo-request")
-                .attribute("src", Value::StringValue(packet.source.to_string()))
-                .attribute("dst", Value::StringValue(packet.destination.to_string()))
-                .attribute("originalEchoID", Value::IntValue(i64::from(echo)))
-                .attribute(
-                    "seq",
-                    Value::IntValue(i64::from(u16::from_be_bytes(
-                        packet.message[6..8].try_into().unwrap(),
-                    ))),
-                )
-                .attribute("port", Value::IntValue(i64::from(flow.echo_id)))
-        });
+        *trace = trace
+            .take()
+            .map(|trace| trace.attribute("port", Value::IntValue(i64::from(flow.echo_id))));
         let mut message = packet.message.clone();
         message[4..6].copy_from_slice(&flow.echo_id.to_be_bytes());
         message[2..4].fill(0);
@@ -336,21 +536,18 @@ impl IcmpRouter {
         }
         flow.activity.send_replace(tokio::time::Instant::now());
         let result = tokio::select! {
-            _ = connection.cancel.cancelled() => return Ok(()),
-            result = flow.socket.send_to(&message, SocketAddr::new(packet.destination, 0)) => result,
-        };
-        if let (Some(trace), Some(identity)) = (trace, identity) {
-            let spans = trace.finish(result.as_ref().err().map(|e| e.to_string()).as_deref());
-            if !spans.is_empty() {
-                let bytes = DatagramV2::TraceSpans {
-                    identity,
-                    payload: spans,
-                }
-                .encode()
-                .map_err(anyhow::Error::msg)?;
-                let _ = connection.sender.send_datagram(Bytes::from(bytes)).await;
+            _ = connection.cancel.cancelled() => {
+                *trace = None;
+                return Ok(());
             }
-        }
+            result = async {
+                #[cfg(test)] {
+                    let gate = self.write_gate.lock().unwrap().take();
+                    if let Some(gate) = gate { let _ = gate.entered.send(()); let _ = gate.release.await; }
+                }
+                flow.socket.send_to(&message, SocketAddr::new(packet.destination, 0)).await
+            } => result,
+        };
         result?;
         Ok(())
     }
@@ -368,6 +565,22 @@ async fn send_packet(connection: &Connection, packet: Vec<u8>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn effective_ping_group_uses_first_two_decimal_numbers_and_inclusive_range() {
+        for (raw, gid, accepted) in [
+            (&b"10\t20"[..], 10, true),
+            (&b"10\t20"[..], 20, true),
+            (&b"10 20"[..], 9, false),
+            (&b"10 20"[..], 21, false),
+            (&b"20 10"[..], 15, false),
+            (&b"0 4294967295"[..], u32::MAX, true),
+            (&b"-10 / 20 30"[..], 15, true),
+            (&b"10"[..], 10, false),
+            (&b"4294967296 4294967296"[..], 0, false),
+        ] {
+            assert_eq!(ping_group(raw, gid).is_ok(), accepted);
+        }
+    }
     #[test]
     fn ipv6_source_prefers_ipv4_interface_then_first_ipv6_then_unspecified() {
         let interfaces = vec![

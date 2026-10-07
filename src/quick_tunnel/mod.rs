@@ -42,7 +42,7 @@ pub async fn prepare(invocation: &Invocation) -> Result<RunConfig> {
         bail!("invalid Quick Tunnel provisioning endpoint");
     }
     endpoint.set_path(&format!("{}/tunnel", endpoint.path().trim_end_matches('/')));
-    let request = http::Request::builder()
+    let mut request = http::Request::builder()
         .method("POST")
         .uri(endpoint.as_str())
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -55,11 +55,14 @@ pub async fn prepare(invocation: &Invocation) -> Result<RunConfig> {
         } else {
             br#"{"auth_mode":"otp"}"#
         })))?;
+    let method = request.method().clone();
+    let gzip = crate::http_body::prepare_gzip(&method, request.headers_mut());
     let fetch = async {
-        let mut response = crate::access::direct_http_client()?
+        let response = crate::access::direct_http_client()?
             .request(request)
             .await
             .context("Quick Tunnel provisioning request failed")?;
+        let mut response = crate::http_body::response(response, gzip);
         let status = response.status();
         let bytes = crate::access::bounded_body(&mut response, 1 << 20).await?;
         if !status.is_success() {

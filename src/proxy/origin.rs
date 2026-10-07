@@ -5,7 +5,7 @@ use boring::{
     ssl::{SslConnector, SslMethod, SslVerifyMode},
     x509::{X509, store::X509StoreBuilder},
 };
-use hyper::{Response, body::Incoming};
+use hyper::Response;
 use hyper_util::{
     client::legacy::{
         Client,
@@ -53,7 +53,7 @@ pub struct Origin {
 }
 
 pub struct OriginResponse {
-    pub response: Response<Incoming>,
+    pub response: Response<crate::http_body::ResponseBody>,
 }
 
 impl Origin {
@@ -264,10 +264,14 @@ impl Origin {
                 .unwrap_or_else(|| request.uri().clone());
             routed.prepare_headers_for(&physical, request.headers_mut())?;
         }
+        let method = request.method().clone();
+        let gzip = crate::http_body::prepare_gzip(&method, request.headers_mut());
         let response = client.request(request).await.map_err(|_| {
             anyhow::anyhow!("Unable to reach the origin service or complete its HTTP/TLS request")
         })?;
-        Ok(OriginResponse { response })
+        Ok(OriginResponse {
+            response: crate::http_body::response(response, gzip),
+        })
     }
 }
 
@@ -281,7 +285,7 @@ fn build_client(
     settings: &OriginRequest,
 ) -> Client<OriginConnector, ChannelBody> {
     let mut builder = Client::builder(TokioExecutor::new());
-    builder.proxy_target_from_host(true);
+    builder.request_target_from_host(true);
     let idle = settings
         .keep_alive_timeout
         .map_or(Duration::from_secs(90), |value| value.0);

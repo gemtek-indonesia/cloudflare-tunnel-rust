@@ -867,11 +867,15 @@ pub(crate) async fn handle(connection: &Arc<Connection>, bytes: Bytes) -> Result
                 connection.state.v3.payload(id, payload, connection).await
             }
             DatagramV3::Icmp(packet) => {
-                connection
+                if let Err(error) = connection
                     .state
                     .icmp
                     .handle(connection.clone(), packet, None)
-                    .await?
+                    .await
+                {
+                    super::icmp_drop(connection, "write_failed");
+                    return Err(error);
+                }
             }
             DatagramV3::Response { .. } => {}
         },

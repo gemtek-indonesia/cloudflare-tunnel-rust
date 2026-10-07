@@ -134,6 +134,9 @@ func TestRustOriginProxyEnvironmentContract(t *testing.T) {
 		}
 	}
 	direct := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "request.invalid" {
+			t.Errorf("effective source authority %q", r.Host)
+		}
 		_, _ = io.WriteString(w, "owned")
 	}))
 	direct.EnableHTTP2 = true

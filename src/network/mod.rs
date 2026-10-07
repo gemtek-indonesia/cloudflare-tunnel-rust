@@ -112,13 +112,14 @@ impl NetworkState {
         context: Arc<crate::observability::Context>,
     ) -> Result<Arc<Self>> {
         let settings = PrivateConfig::parse(&config.configuration, config.max_active_flows)?;
+        let icmp = icmp::IcmpRouter::new(config, &context.logger);
         Ok(Arc::new(Self {
             context,
             limiter: Limiter::new(settings.max_flows),
             config: RwLock::new(settings),
             dns: Arc::new(dns::DnsService::new(config.dns_resolver_addrs.clone())),
             v3: session::Registry::new(),
-            icmp: icmp::IcmpRouter::new(config)?,
+            icmp,
             override_limit: config.max_active_flows,
             write_timeout: config.write_stream_timeout,
             icmp_enabled: config.quick_hostname.is_empty(),
@@ -135,7 +136,7 @@ impl NetworkState {
         self.dns.refresh_loop(cancel).await
     }
     pub(crate) fn icmp_sources(&self) -> Vec<String> {
-        if self.icmp_enabled {
+        if self.icmp_enabled && self.icmp.enabled() {
             self.icmp.sources()
         } else {
             vec![]
@@ -357,6 +358,27 @@ pub(crate) async fn serve_datagrams(
     const MAX_REGISTRATION_TASKS: usize = 16;
     let cancel = connection.cancel.clone();
     let mut registrations = tokio::task::JoinSet::new();
+    let (icmp_input, mut icmp_packets) = tokio::sync::mpsc::channel(128);
+    let mut icmp_worker = tokio::task::JoinSet::new();
+    if connection.version == DatagramVersion::V3
+        && connection.state.icmp_enabled
+        && connection.state.icmp.enabled()
+    {
+        let connection = connection.clone();
+        icmp_worker.spawn_local(async move {
+            while let Some(packet) = icmp_packets.recv().await {
+                if let Err(error) = connection
+                    .state
+                    .icmp
+                    .handle(connection.clone(), packet, None)
+                    .await
+                {
+                    icmp_drop(&connection, "write_failed");
+                    warn_datagram(&connection, &error);
+                }
+            }
+        });
+    }
     let result = 'dispatch: loop {
         while let Some(completed) = registrations.try_join_next() {
             match completed {
@@ -367,6 +389,9 @@ pub(crate) async fn serve_datagrams(
         }
         let bytes = tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
+            _ = icmp_worker.join_next(), if !icmp_worker.is_empty() => {
+                break Err(anyhow::anyhow!("ICMP worker closed"));
+            }
             completed = registrations.join_next(), if !registrations.is_empty() => {
                 match completed {
                     Some(Ok(Err(error))) => warn_datagram(&connection, &error),
@@ -380,6 +405,30 @@ pub(crate) async fn serve_datagrams(
                 None => break Err(anyhow::anyhow!("datagram manager closed")),
             },
         };
+        if connection.version == DatagramVersion::V3 && bytes.first() == Some(&2) {
+            match crate::protocol::datagram::DatagramV3::decode(&bytes) {
+                Ok(crate::protocol::datagram::DatagramV3::Icmp(packet)) => {
+                    if connection.state.icmp_enabled
+                        && connection.state.icmp.enabled()
+                        && matches!(
+                            icmp_input.try_send(packet),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                        )
+                    {
+                        icmp_drop(&connection, "write_full");
+                        let _ = connection.state.context.logger.log(
+                            crate::observability::logging::Level::Warn,
+                            crate::observability::logging::Event::Cloudflared,
+                            "failed to write icmp packet to origin: dropped",
+                            serde_json::json!({"connIndex": connection.index}),
+                        );
+                    }
+                }
+                Err(error) => warn_datagram(&connection, &anyhow::anyhow!(error)),
+                _ => unreachable!(),
+            }
+            continue;
+        }
         if connection.version == DatagramVersion::V3 && bytes.first() == Some(&0) {
             if registrations.len() == MAX_REGISTRATION_TASKS {
                 warn_datagram(
@@ -412,7 +461,18 @@ pub(crate) async fn serve_datagrams(
     };
     registrations.abort_all();
     while registrations.join_next().await.is_some() {}
+    icmp_worker.abort_all();
+    while icmp_worker.join_next().await.is_some() {}
     result
+}
+fn icmp_drop(connection: &Connection, reason: &str) {
+    connection
+        .state
+        .context
+        .metrics
+        .icmp_dropped_packets
+        .with_label_values(&[&connection.index.to_string(), reason])
+        .inc();
 }
 fn warn_datagram(connection: &Connection, error: &anyhow::Error) {
     let _ = connection.state.context.logger.log(

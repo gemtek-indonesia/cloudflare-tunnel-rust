@@ -529,7 +529,7 @@ async fn proxy_inner(
 type TokioIoAdapter<T> = hyper_util::rt::TokioIo<T>;
 
 async fn stream_response(
-    response: &mut http::Response<hyper::body::Incoming>,
+    response: &mut http::Response<crate::http_body::ResponseBody>,
     sink: &mut EdgeSink,
 ) -> Result<()> {
     while let Some(frame) = response.body_mut().frame().await {

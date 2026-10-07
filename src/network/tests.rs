@@ -19,6 +19,9 @@ mod v3_duplex;
 #[path = "v3_metrics_tests.rs"]
 mod v3_metrics;
 
+#[path = "icmp_tests.rs"]
+mod icmp_lifecycle;
+
 struct Pair {
     client: QuicConnection,
     peer: QuicConnection,
@@ -403,6 +406,11 @@ async fn icmp_loopback_kernel_translation_reconnect_or_unavailable_socket_cleanu
                 config.icmpv4_src = Some("127.0.0.1".parse().unwrap());
                 config.icmpv6_src = Some("::1".into());
                 let state = NetworkState::new(&config).unwrap();
+                if !state.icmp.supports(ipv4) {
+                    eprintln!("ICMP family unavailable at startup; disabled cleanup verified");
+                    assert_eq!(state.icmp.len(), 0);
+                    continue;
+                }
                 let mut first = pair(state.clone(), &config, 0, DatagramVersion::V2).await;
                 let mut second = pair(state.clone(), &config, 0, DatagramVersion::V2).await;
                 let destination: std::net::IpAddr =
@@ -502,6 +510,11 @@ async fn icmp_v2_kernel_correlated_otlp_or_unavailable_socket_cleanup() {
             let mut config = crate::runtime::tests::config();
             config.icmpv4_src = Some("127.0.0.1".parse().unwrap());
             let state = NetworkState::new(&config).unwrap();
+            if !state.icmp.supports(true) {
+                eprintln!("ICMPv4 kernel/OTLP proof unavailable at startup; disabled cleanup verified");
+                assert_eq!(state.icmp.len(), 0);
+                return;
+            }
             let mut pair = pair(state.clone(), &config, 0, DatagramVersion::V2).await;
             let mut identity = [0x11; 25];
             identity[16..24].fill(0x22);

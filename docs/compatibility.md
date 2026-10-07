@@ -58,12 +58,14 @@ Environment routes use the physical origin authority independently of request Ho
 
 Default HTTP clients use source connect, TLS and idle-timeout settings, with two idle connections per host. The aggregate idle-cache limit differs from Go's implementation. HTTP/2 dispatch follows actual target TLS negotiation; WebSocket upgrades retain HTTP/1. `matchSNIToHost` applies to the first TLS hop, while post-proxy target TLS retains the configured origin name. Custom `matchSNIToHost` first hops omit ALPN and use request cancellation instead of the configured TLS handshake deadline. Direct connections therefore use HTTP/1 even when `http2Origin` is enabled; post-proxy target TLS retains its configured deadline. HTTP CONNECT has a one-minute timeout. [Origin TLS tests](../src/proxy/origin/proxy_name_tests.rs) cover these combinations.
 
+HTTP origins, environment-aware HTTP clients, direct account requests and Quick provisioning negotiate gzip when the first Accept-Encoding and Range values are empty and the method is not HEAD. Automatically requested gzip responses decode lazily, remove Content-Encoding and Content-Length, and enforce existing consumer limits on decoded bytes. Explicit encoding requests retain their wire bodies. Concatenated members are supported; corrupt, truncated and trailing-garbage bodies fail during reading. Origin trailers follow successful decoder EOF. HTTP/2 Host overrides populate the effective `:authority` after physical pool checkout. [HTTP body tests](../src/http_body/tests.rs), the [Go gzip corpus](../tests/interop/http_policy.go) and [origin forwarding tests](../src/proxy/tests.rs) cover these behaviors.
+
 ## Known behavioral gaps
 
 * Certificates encoding IPv4-mapped addresses as 16-byte IP SANs are rejected, while Go treats them as IPv4 equivalents. Ordinary and mapped references verify against standard 4-byte IPv4 SANs. [TLS name tests](../src/crypto/name_tests.rs) preserve this fail-closed difference.
-* Automatic redirects remain incomplete for login/Access transfer polling and `tunnel ready`. Access/JWKS discovery and broker requests retain their source-specific redirect restrictions.
-* Automatic gzip negotiation and decoding are incomplete.
-* HTTP/2 Host overrides are not yet applied to the effective `:authority` field; Host Unicode/IDNA and malformed-value normalization need expanded source comparison.
+* Automatic redirects remain incomplete for login/Access transfer polling, `tunnel ready` and tail. Tail also adds separate 15 s connection and WebSocket handshake deadlines absent from the source client. Access/JWKS discovery and broker requests retain their source-specific redirect restrictions.
+* Host Unicode/IDNA and malformed-value normalization need expanded source comparison.
 * HTTP request spans and `Cf-Int-Cloudflared-Tracing` responses are absent. Private-network tracing has component coverage.
-* Access URLs preserve source HTTPS upgrades, explicit ports, userinfo, IDNA and raw path semantics. Raw spaces in query strings are rejected by the Rust HTTP URI carrier, while Go accepts them for Access and curl requests.
+* Initial Access URL parsing preserves source HTTPS upgrades, explicit ports, userinfo, IDNA and raw path semantics. Relative URL joins differ from Go for explicit default ports such as `:080`, escaped dot segments and backslashes. Raw spaces in query strings are rejected by the Rust HTTP URI carrier, while Go accepts them for Access and curl requests.
+* Administration rejects null row entries that the pinned Go JSON output preserves; null collection responses retain source behavior.
 * Full CLI help/placement/stdout/stderr/exit-code coverage, administration formatting and the complete Go regexp acceptance corpus remain incomplete.

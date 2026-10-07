@@ -1,6 +1,10 @@
 mod client;
 pub mod credentials;
+mod filters;
 mod login;
+mod models;
+mod output;
+mod yaml;
 pub use client::AccountClient;
 pub(crate) use client::verified_connector;
 pub(crate) use client::verified_tls_connector;
@@ -18,6 +22,20 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
     }
     let cert_path = credentials::cert_path(invocation.string("origincert"))?;
     let cert = credentials::AccountCredentials::read(&cert_path)?;
+    let logger = crate::observability::logging::Logger::new(
+        crate::observability::logging::Options {
+            level: crate::observability::logging::Level::parse(invocation.string("loglevel"))
+                .unwrap_or_default(),
+            file: (!invocation.string("logfile").is_empty())
+                .then(|| expanded(invocation.string("logfile")))
+                .transpose()?,
+            directory: (!invocation.string("log-directory").is_empty())
+                .then(|| expanded(invocation.string("log-directory")))
+                .transpose()?,
+            ..Default::default()
+        },
+        vec![cert.api_token.clone()],
+    )?;
     let client = AccountClient::new(cert, invocation.string("api-url"))?;
     match invocation.command.as_str() {
         "tunnel create" => {
@@ -56,71 +74,39 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             }
         }
         "tunnel list" => {
-            let mut query = Vec::new();
-            if !invocation.bool("show-deleted") {
-                query.push(("is_deleted", "false".into()));
-            }
-            for (flag, key) in [
-                ("name", "name"),
-                ("name-prefix", "name_prefix"),
-                ("exclude-name-prefix", "exclude_prefix"),
-                ("id", "uuid"),
-                ("when", "existed_at"),
-            ] {
-                if !invocation.string(flag).is_empty() {
-                    query.push((key, invocation.string(flag).into()));
-                }
-            }
-            let mut values = client.tunnels(query).await?;
-            let sort = match invocation.string("sort-by") {
-                "" => "name",
-                "name" => "name",
-                "id" => "id",
-                "createdAt" => "created_at",
-                "deletedAt" => "deleted_at",
-                "numConnections" => "connections",
-                _ => bail!("invalid tunnel sort field"),
-            };
-            values.sort_by_key(|v| {
-                if sort == "connections" {
-                    format!("{:020}", v[sort].as_array().map_or(0, Vec::len))
-                } else {
-                    v[sort].as_str().unwrap_or("").to_owned()
-                }
-            });
-            if invocation.bool("invert-sort") {
-                values.reverse();
-            }
-            render(&invocation, &Value::Array(values))?;
+            let query = filters::tunnels(&invocation)?;
+            let values = output::tunnel_rows(client.tunnels(query).await?)?;
+            print!("{}", output::tunnels(&invocation, values, &logger)?);
         }
         "tunnel info" => {
             let id = client
                 .resolve_tunnel(argument(&invocation, 0, "tunnel ID or name")?)
                 .await?;
-            let tunnel = client.tunnel(id).await?;
-            let mut clients = client.connections(id).await?;
-            if let Some(rows) = clients.as_array_mut() {
-                let field = match invocation.string("sort-by") {
-                    "id" => "id",
-                    "version" => "version",
-                    "numConnections" => "conns",
-                    _ => "run_at",
-                };
-                rows.sort_by_key(|value| {
-                    if field == "conns" {
-                        format!("{:020}", value[field].as_array().map_or(0, Vec::len))
-                    } else {
-                        text(value, field)
-                    }
-                });
-                if invocation.bool("invert-sort") {
-                    rows.reverse();
-                }
+            let mut clients = output::client_rows(client.connections(id).await?)?;
+            if let Some(clients) = &mut clients {
+                output::sort_clients(&invocation, clients, &logger);
             }
-            render(
-                &invocation,
-                &json!({"id":id,"name":tunnel["name"],"createdAt":tunnel["created_at"],"conns":clients}),
-            )?;
+            let mut tunnels =
+                output::tunnel_rows(client.tunnels(vec![("uuid", id.to_string())]).await?)?;
+            if tunnels.len() != 1 {
+                bail!(
+                    "Expected to find a single tunnel with uuid {id} but found {} tunnels.",
+                    tunnels.len()
+                );
+            }
+            let tunnel = tunnels.remove(0);
+            print!(
+                "{}",
+                output::info(
+                    &invocation,
+                    &models::Info {
+                        id: tunnel.id,
+                        name: tunnel.name,
+                        created_at: tunnel.created_at,
+                        conns: clients
+                    },
+                )?
+            );
         }
         "tunnel token" => {
             let id = client
@@ -348,12 +334,23 @@ fn expanded(path: &str) -> Result<PathBuf> {
     )
 }
 fn output_format(invocation: &Invocation) -> Option<&str> {
-    match invocation.string("output") {
-        "" | "default" => None,
+    match output::format(invocation) {
+        "" => None,
         value => Some(value),
     }
 }
 fn render(invocation: &Invocation, value: &Value) -> Result<()> {
+    match invocation.command.as_str() {
+        "tunnel vnet list" => {
+            print!("{}", output::vnets(invocation, value)?);
+            return Ok(());
+        }
+        "tunnel route ip list" | "tunnel route ip show" => {
+            print!("{}", output::routes(invocation, value)?);
+            return Ok(());
+        }
+        _ => {}
+    }
     match output_format(invocation) {
         Some("json") => println!("{}", serde_json::to_string_pretty(value)?),
         Some("yaml") => print!("{}", serde_yaml_ng::to_string(value)?),
@@ -602,15 +599,7 @@ async fn execute_vnets(client: &AccountClient, invocation: &Invocation) -> Resul
             ),
         ),
         "tunnel vnet list" => {
-            for flag in ["name", "id"] {
-                if !invocation.string(flag).is_empty() {
-                    query.push((flag, invocation.string(flag).into()));
-                }
-            }
-            query.push(("is_deleted", invocation.bool("show-deleted").to_string()));
-            if invocation.is_set("is-default") {
-                query.push(("is_default", invocation.bool("is-default").to_string()));
-            }
+            query = filters::vnets(invocation)?;
             (http::Method::GET, String::new(), None)
         }
         "tunnel vnet delete" => {
@@ -662,7 +651,18 @@ async fn execute_vnets(client: &AccountClient, invocation: &Invocation) -> Resul
 }
 
 async fn execute_routes(client: &AccountClient, invocation: &Invocation) -> Result<()> {
-    let mut query = vnet_query(client, invocation).await?;
+    let listing = matches!(
+        invocation.command.as_str(),
+        "tunnel route ip show" | "tunnel route ip list"
+    );
+    if listing && invocation.is_set("vnet") {
+        bail!("--vnet does not apply to route listing; use --filter-vnet-id");
+    }
+    let mut query = if listing {
+        Vec::new()
+    } else {
+        vnet_query(client, invocation).await?
+    };
     let (method, suffix, body) = match invocation.command.as_str() {
         "tunnel route ip add" => {
             let network = argument(invocation, 0, "network CIDR")?
@@ -680,22 +680,7 @@ async fn execute_routes(client: &AccountClient, invocation: &Invocation) -> Resu
             (http::Method::POST, String::new(), Some(body))
         }
         "tunnel route ip show" | "tunnel route ip list" => {
-            query.push(("tun_types", "cfd_tunnel".into()));
-            query.push((
-                "is_deleted",
-                invocation.bool("filter-is-deleted").to_string(),
-            ));
-            for (flag, key) in [
-                ("filter-tunnel-id", "tunnel_id"),
-                ("filter-comment-is", "comment"),
-                ("filter-vnet-id", "virtual_network_id"),
-                ("filter-network-is-subset-of", "network_superset"),
-                ("filter-network-is-superset-of", "network_superset"),
-            ] {
-                if !invocation.string(flag).is_empty() {
-                    query.push((key, invocation.string(flag).into()));
-                }
-            }
+            query = filters::routes(invocation)?;
             (http::Method::GET, String::new(), None)
         }
         "tunnel route ip get" => {

@@ -123,17 +123,11 @@ async fn native_factory_modes_keep_admin_quick_and_diagnostics_direct() {
     )
     .await;
     let api_body = serde_json::to_vec(&serde_json::json!({"success":true,"result":[],"result_info":{"count":0,"per_page":10,"total_count":0}})).unwrap();
-    let mut api = crate::proxy_environment::fixtures::HttpPeer::start(
-        http::StatusCode::OK,
-        Bytes::from(api_body),
-    )
-    .await;
+    let mut api =
+        crate::proxy_environment::fixtures::HttpPeer::start_gzip(Bytes::from(api_body)).await;
     let quick_body = serde_json::to_vec(&serde_json::json!({"success":true,"result":{"id":"00000000-0000-4000-8000-000000000001","hostname":"synthetic.invalid","account_tag":"synthetic-account","secret":STANDARD.encode(b"synthetic-secret")}})).unwrap();
-    let mut quick = crate::proxy_environment::fixtures::HttpPeer::start(
-        http::StatusCode::OK,
-        Bytes::from(quick_body),
-    )
-    .await;
+    let mut quick =
+        crate::proxy_environment::fixtures::HttpPeer::start_gzip(Bytes::from(quick_body)).await;
     let mut diagnostic =
         crate::proxy_environment::fixtures::HttpPeer::start(http::StatusCode::OK, Bytes::new())
             .await;
@@ -145,21 +139,58 @@ async fn native_factory_modes_keep_admin_quick_and_diagnostics_direct() {
         .args(["--exact","proxy_environment::client::tests::native_factory_modes_keep_admin_quick_and_diagnostics_direct","--nocapture"])
         .output().await.unwrap();
     assert!(output.status.success(), "owned factory-mode child failed");
-    assert!(
-        api.requests
-            .recv()
-            .await
-            .unwrap()
-            .uri
-            .path()
-            .contains("/cfd_tunnel")
-    );
-    assert_eq!(quick.requests.recv().await.unwrap().uri.path(), "/tunnel");
+    let api_request = api.requests.recv().await.unwrap();
+    assert!(api_request.uri.path().contains("/cfd_tunnel"));
+    assert_eq!(api_request.headers[http::header::ACCEPT_ENCODING], "gzip");
+    let quick_request = quick.requests.recv().await.unwrap();
+    assert_eq!(quick_request.uri.path(), "/tunnel");
+    assert_eq!(quick_request.headers[http::header::ACCEPT_ENCODING], "gzip");
     assert_eq!(
         diagnostic.requests.recv().await.unwrap().uri.path(),
         "/diag/tunnel"
     );
     assert!(proxy.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn native_access_factory_decodes_gzip_through_environment_proxy() {
+    const CHILD: &str = "CLOUDFLARED_GZIP_ENVIRONMENT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let response = crate::access::http_client()
+            .unwrap()
+            .get("http://synthetic.invalid/owned-gzip".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING)
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            b"owned-environment".as_slice()
+        );
+        return;
+    }
+    let mut proxy = crate::proxy_environment::fixtures::HttpPeer::start_gzip(Bytes::from_static(
+        b"owned-environment",
+    ))
+    .await;
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .env_clear().env(CHILD, "1").env("HTTP_PROXY", format!("http://{}", proxy.address))
+        .args(["--exact", "proxy_environment::client::tests::native_access_factory_decodes_gzip_through_environment_proxy", "--nocapture"])
+        .output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "owned environment gzip child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = proxy.requests.recv().await.unwrap();
+    assert_eq!(
+        request.uri.to_string(),
+        "http://synthetic.invalid/owned-gzip"
+    );
+    assert_eq!(request.headers[http::header::ACCEPT_ENCODING], "gzip");
 }
 
 #[tokio::test]

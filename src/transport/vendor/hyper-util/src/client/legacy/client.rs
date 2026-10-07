@@ -49,7 +49,7 @@ pub struct Client<C, B> {
 struct Config {
     retry_canceled_requests: bool,
     set_host: bool,
-    proxy_target_from_host: bool,
+    request_target_from_host: bool,
     ver: Ver,
 }
 
@@ -69,7 +69,7 @@ enum ErrorKind {
     UserUnsupportedRequestMethod,
     UserUnsupportedVersion,
     UserAbsoluteUriRequired,
-    UserInvalidProxyHost,
+    UserInvalidRequestHost,
     SendRequest,
 }
 
@@ -246,6 +246,11 @@ where
         pool_key: PoolKey,
     ) -> Result<Response<hyper::body::Incoming>, Error> {
         let uri = req.uri().clone();
+        let host = if self.config.request_target_from_host {
+            req.headers().get(HOST).cloned()
+        } else {
+            None
+        };
 
         loop {
             req = match self.try_send_request(req, pool_key.clone()).await {
@@ -266,7 +271,7 @@ where
                         "unstarted request canceled, trying again (reason={:?})",
                         error
                     );
-                    *req.uri_mut() = uri.clone();
+                    restore_request(&mut req, &uri, host.as_ref());
                     req
                 }
             }
@@ -315,27 +320,19 @@ where
             if req.method() == Method::CONNECT {
                 authority_form(req.uri_mut());
             } else if pooled.conn_info.is_proxied {
-                if self.config.proxy_target_from_host {
-                    let authority = req
-                        .headers()
-                        .get(HOST)
-                        .and_then(|host| host.to_str().ok())
-                        .filter(|host| !host.contains('@'))
-                        .and_then(|host| host.parse::<http::uri::Authority>().ok());
-                    let Some(authority) = authority else {
-                        return Err(TrySendError::Nope(e!(UserInvalidProxyHost)));
-                    };
-                    let mut parts = req.uri().clone().into_parts();
-                    parts.authority = Some(authority);
-                    let Ok(uri) = Uri::from_parts(parts) else {
-                        return Err(TrySendError::Nope(e!(UserInvalidProxyHost)));
-                    };
-                    *req.uri_mut() = uri;
+                if self.config.request_target_from_host {
+                    uri_from_host(&mut req).map_err(TrySendError::Nope)?;
                 }
                 absolute_form(req.uri_mut());
             } else {
                 origin_form(req.uri_mut());
             }
+        } else if pooled.is_http2()
+            && req.method() != Method::CONNECT
+            && self.config.request_target_from_host
+        {
+            uri_from_host(&mut req).map_err(TrySendError::Nope)?;
+            req.headers_mut().remove(HOST);
         } else if req.method() == Method::CONNECT && !pooled.is_http2() {
             authority_form(req.uri_mut());
         }
@@ -921,6 +918,51 @@ fn origin_form(uri: &mut Uri) {
     *uri = path
 }
 
+fn uri_from_host<B>(req: &mut Request<B>) -> Result<(), Error> {
+    let authority = req
+        .headers()
+        .get(HOST)
+        .and_then(|host| host.to_str().ok())
+        .filter(|host| !host.contains('@'))
+        .and_then(|host| host.parse::<http::uri::Authority>().ok())
+        .ok_or_else(|| e!(UserInvalidRequestHost))?;
+    let mut parts = req.uri().clone().into_parts();
+    parts.authority = Some(authority);
+    *req.uri_mut() = Uri::from_parts(parts).map_err(|_| e!(UserInvalidRequestHost))?;
+    Ok(())
+}
+
+fn restore_request<B>(req: &mut Request<B>, uri: &Uri, host: Option<&HeaderValue>) {
+    *req.uri_mut() = uri.clone();
+    if let Some(host) = host {
+        req.headers_mut().insert(HOST, host.clone());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn retry_restores_physical_uri_and_effective_host() {
+    let physical: Uri = "https://physical.invalid:443/raw?x=%ff".parse().unwrap();
+    let mut request = Request::builder()
+        .uri(physical.clone())
+        .header(HOST, "effective.invalid:080")
+        .body(())
+        .unwrap();
+    let pool_key = extract_domain(request.uri_mut(), false).unwrap();
+    let host = request.headers()[HOST].clone();
+    for _ in 0..2 {
+        uri_from_host(&mut request).unwrap();
+        assert_eq!(request.uri().authority().unwrap(), "effective.invalid:080");
+        request.headers_mut().remove(HOST);
+        restore_request(&mut request, &physical, Some(&host));
+        assert_eq!(request.uri(), &physical);
+        assert_eq!(request.headers()[HOST], "effective.invalid:080");
+        assert_eq!(extract_domain(request.uri_mut(), false).unwrap(), pool_key);
+    }
+    restore_request(&mut request, &physical, None);
+    assert_eq!(request.headers()[HOST], host);
+}
+
 fn absolute_form(uri: &mut Uri) {
     debug_assert!(uri.scheme().is_some(), "absolute_form needs a scheme");
     debug_assert!(
@@ -1052,7 +1094,7 @@ impl Builder {
             client_config: Config {
                 retry_canceled_requests: true,
                 set_host: true,
-                proxy_target_from_host: false,
+                request_target_from_host: false,
                 ver: Ver::Auto,
             },
             exec: exec.clone(),
@@ -1617,12 +1659,12 @@ impl Builder {
         self
     }
 
-    /// Use the Host header for proxied HTTP/1 absolute-form request targets.
+    /// Use the Host header for proxied HTTP/1 targets and HTTP/2 authority.
     ///
     /// Route selection and connection-pool keys still use the original URI.
     /// Invalid Host authorities fail without sending the request. Disabled by default.
-    pub fn proxy_target_from_host(&mut self, val: bool) -> &mut Self {
-        self.client_config.proxy_target_from_host = val;
+    pub fn request_target_from_host(&mut self, val: bool) -> &mut Self {
+        self.client_config.request_target_from_host = val;
         self
     }
 

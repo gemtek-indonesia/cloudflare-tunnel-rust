@@ -27,10 +27,14 @@ pub(crate) fn direct_http_client() -> Result<DirectHttpClient> {
     Ok(Client::builder(TokioExecutor::new()).build(crate::administration::verified_connector()?))
 }
 
-pub(crate) async fn bounded_body(
-    response: &mut http::Response<hyper::body::Incoming>,
+pub(crate) async fn bounded_body<B>(
+    response: &mut http::Response<B>,
     limit: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut body = Vec::new();
     while let Some(frame) = response.body_mut().frame().await {
         if let Ok(data) = frame.context("HTTP response body failed")?.into_data() {

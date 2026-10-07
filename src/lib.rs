@@ -3,6 +3,7 @@ pub mod administration;
 pub mod cli;
 pub mod config;
 pub mod crypto;
+pub mod http_body;
 pub(crate) mod network;
 pub mod observability;
 pub mod protocol;

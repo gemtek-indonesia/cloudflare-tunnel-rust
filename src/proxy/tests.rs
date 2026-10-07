@@ -501,9 +501,10 @@ async fn verified_tls_custom_ca_sni_host_override_and_http2_origin() {
                 hyper::service::service_fn(
                     |request: http::Request<hyper::body::Incoming>| async move {
                         assert_eq!(
-                            request.headers()[http::header::HOST],
+                            request.uri().authority().unwrap().as_str(),
                             "internal.example.invalid"
                         );
+                        assert!(!request.headers().contains_key(http::header::HOST));
                         assert_eq!(request.headers()["x-forwarded-host"], "app.example.invalid");
                         Ok::<_, io::Error>(http::Response::new(Full::new(Bytes::from_static(
                             b"verified-h2-origin",
@@ -751,4 +752,38 @@ async fn public_tcp_websocket_frames_reach_origin() {
         .unwrap()
         .unwrap();
     origin.await.unwrap();
+}
+
+#[tokio::test]
+async fn origin_automatic_gzip_decodes_before_streaming_to_edge() {
+    let value = b"owned-origin-compressed-body";
+    let mut encoder = async_compression::tokio::write::GzipEncoder::new(Vec::new());
+    encoder.write_all(value).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    let payload = encoder.into_inner();
+    let size = payload.len();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("gzip"),
+    );
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&size.to_string()).unwrap(),
+    );
+    let mut peer = crate::proxy_environment::fixtures::HttpPeer::start_with_headers(
+        http::StatusCode::OK,
+        Bytes::from(payload),
+        headers,
+    )
+    .await;
+    let (response, body) = one_request(state(&format!("http://{}", peer.address))).await;
+    assert_eq!(body, value);
+    assert!(response.error.is_empty());
+    let request = peer.requests.recv().await.unwrap();
+    assert_eq!(request.headers[http::header::ACCEPT_ENCODING], "gzip");
+    assert!(!response.metadata.iter().any(|(key, _)| {
+        key.eq_ignore_ascii_case("HttpHeader:Content-Encoding")
+            || key.eq_ignore_ascii_case("HttpHeader:Content-Length")
+    }));
 }
