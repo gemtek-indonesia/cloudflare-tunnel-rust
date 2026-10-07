@@ -24,6 +24,7 @@ type RustAdministrationInput struct {
 	Args       []string          `json:"args"`
 	ParentArgs []string          `json:"parent_args"`
 	Pages      []json.RawMessage `json:"pages"`
+	Statuses   []int             `json:"statuses"`
 }
 
 type RustAdministrationOutput struct {
@@ -67,14 +68,26 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 		command = []string{"tunnel", "vnet", "list"}
 	case "info":
 		command = []string{"tunnel", "info"}
+	case "delete":
+		command = []string{"tunnel", "delete"}
+	case "cleanup":
+		command = []string{"tunnel", "cleanup"}
 	default:
-		return RustAdministrationOutput{}, errors.New("unsupported synthetic read-only command")
+		return RustAdministrationOutput{}, errors.New("unsupported synthetic command")
 	}
 	for _, arg := range append(append([]string{}, input.ParentArgs...), input.Args...) {
-		name := strings.SplitN(arg, "=", 2)[0]
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
 		switch name {
-		case "--api-url", "--origincert", "--config", "--logfile", "--log-directory":
+		case "api-url", "origincert", "config", "logfile", "log-directory", "credentials-file", "cred-file":
 			return RustAdministrationOutput{}, errors.New("synthetic fixture cannot override its endpoint or files")
+		}
+	}
+	for _, status := range input.Statuses {
+		if status < 200 || status > 599 {
+			return RustAdministrationOutput{}, errors.New("unsupported synthetic HTTP status")
 		}
 	}
 	directory, err := os.MkdirTemp("", "admin-source-")
@@ -99,7 +112,7 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		if request.Method != http.MethodGet || !strings.HasPrefix(request.URL.Path, "/client/v4/accounts/synthetic-account/") {
+		if (request.Method != http.MethodGet && request.Method != http.MethodDelete) || !strings.HasPrefix(request.URL.Path, "/client/v4/accounts/synthetic-account/") {
 			http.Error(w, "unexpected synthetic request", http.StatusBadRequest)
 			return
 		}
@@ -111,6 +124,9 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if index < len(input.Statuses) {
+			w.WriteHeader(input.Statuses[index])
+		}
 		_, _ = w.Write(input.Pages[index])
 	}))
 	defer server.Close()
@@ -124,6 +140,9 @@ func RustInteropAdministration(input RustAdministrationInput) (RustAdministratio
 	args = append(args, command[0])
 	args = append(args, input.ParentArgs...)
 	args = append(args, command[1:]...)
+	if input.Command == "delete" {
+		args = append(args, "--credentials-file", filepath.Join(directory, "credentials.json"))
+	}
 	args = append(args, input.Args...)
 	reader, writer, err := os.Pipe()
 	if err != nil {

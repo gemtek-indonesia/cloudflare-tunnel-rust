@@ -131,8 +131,7 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             if invocation.args.is_empty() {
                 bail!("at least one tunnel ID or name required");
             }
-            for name in &invocation.args {
-                let id = client.resolve_tunnel(name).await?;
+            for id in client.resolve_tunnels(&invocation.args).await? {
                 let tunnel = client.tunnel(id).await?;
                 if tunnel["deleted_at"]
                     .as_str()
@@ -152,18 +151,31 @@ pub async fn execute(invocation: Invocation) -> Result<()> {
             }
         }
         "tunnel cleanup" => {
+            if invocation.args.is_empty() {
+                bail!("at least one tunnel ID or name required");
+            }
+            let ids = client.resolve_tunnels(&invocation.args).await?;
             let connector = if invocation.string("connector-id").is_empty() {
                 None
             } else {
                 Some(invocation.string("connector-id").parse()?)
             };
-            if invocation.args.is_empty() {
-                bail!("at least one tunnel ID or name required");
-            }
-            for name in &invocation.args {
-                let id = client.resolve_tunnel(name).await?;
+            for id in ids {
+                let extra =
+                    connector.map_or_else(String::new, |id| format!(" for connector-id {id}"));
+                let _ = logger.log(
+                    crate::observability::logging::Level::Info,
+                    crate::observability::logging::Event::Cloudflared,
+                    &format!("Cleanup connection for tunnel {id}{extra}"),
+                    Value::Null,
+                );
                 if let Err(error) = client.cleanup(id, connector).await {
-                    eprintln!("Error cleaning up connections for tunnel {id}: {error}");
+                    let _ = logger.log(
+                        crate::observability::logging::Level::Error,
+                        crate::observability::logging::Event::Cloudflared,
+                        &format!("Error cleaning up connections for tunnel {id}, error :{error}"),
+                        Value::Null,
+                    );
                 }
             }
         }

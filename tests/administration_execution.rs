@@ -47,23 +47,27 @@ async fn execute(
     command: &str,
     args: &[String],
     pages: Vec<Value>,
+    statuses: &[u16],
 ) -> (std::process::Output, Vec<String>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     let pages = Arc::new(pages);
+    let statuses = Arc::new(statuses.to_vec());
     let server = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             let captured = captured.clone();
             let pages = pages.clone();
+            let statuses = statuses.clone();
             connections.spawn(async move {
                 let service = hyper::service::service_fn(
                     move |request: http::Request<hyper::body::Incoming>| {
                         let captured = captured.clone();
                         let pages = pages.clone();
+                        let statuses = statuses.clone();
                         async move {
                             assert_eq!(
                                 request.headers()[http::header::AUTHORIZATION],
@@ -76,9 +80,14 @@ async fn execute(
                                 .get(index)
                                 .cloned()
                                 .unwrap_or(json!({"success":false}));
-                            Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
-                                Bytes::from(serde_json::to_vec(&page).unwrap()),
-                            )))
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(statuses.get(index).copied().unwrap_or(200))
+                                    .body(Full::new(Bytes::from(
+                                        serde_json::to_vec(&page).unwrap(),
+                                    )))
+                                    .unwrap(),
+                            )
                         }
                     },
                 );
@@ -93,20 +102,25 @@ async fn execute(
         "info" => vec!["tunnel", "info"],
         "vnets" => vec!["tunnel", "vnet", "list"],
         "routes" => vec!["tunnel", "route", "ip", "show"],
+        "delete" => vec!["tunnel", "delete"],
+        "cleanup" => vec!["tunnel", "cleanup"],
         _ => unreachable!(),
     };
-    let output = directory
-        .command(env!("CARGO_BIN_EXE_cloudflared"))
+    let mut native = directory.command(env!("CARGO_BIN_EXE_cloudflared"));
+    native
         .arg("--config")
         .arg(directory.0.join("config.yml"))
         .arg("--origincert")
         .arg(directory.0.join("cert.pem"))
         .arg("--api-url")
         .arg(format!("http://{address}/client/v4"))
-        .args(words)
-        .args(args)
-        .output()
-        .unwrap();
+        .args(words);
+    if command == "delete" {
+        native
+            .arg("--credentials-file")
+            .arg(directory.0.join("credentials.json"));
+    }
+    let output = native.args(args).output().unwrap();
     server.abort();
     let _ = server.await;
     let requests = requests.lock().unwrap().clone();
@@ -131,6 +145,202 @@ fn sort_logs(stderr: &str) -> Vec<&str> {
         .collect()
 }
 
+struct BulkCase {
+    args: Vec<String>,
+    pages: Vec<Value>,
+    statuses: Vec<u16>,
+}
+
+fn bulk_cases(command: &str) -> Vec<BulkCase> {
+    let a = "11111111-1111-1111-1111-111111111111";
+    let b = "22222222-2222-2222-2222-222222222222";
+    let c = "33333333-3333-3333-3333-333333333333";
+    let row = |id| json!({"id":id,"name":"fixture","deleted_at":"0001-01-01T00:00:00Z"});
+    let success = || json!({"success":true});
+    let error = || json!({"success":false,"errors":[{"code":1000,"message":"synthetic failure"}]});
+    let mut cases = Vec::new();
+    for (args, lookups, ids) in [
+        (vec![a, b], vec![], vec![a, b]),
+        (
+            vec!["name-a", b, "name-c"],
+            vec![page(json!([row(a)])), page(json!([row(c)]))],
+            vec![b, a, c],
+        ),
+        (vec![a, a], vec![], vec![a, a]),
+        (
+            vec!["name-a", "name-a"],
+            vec![page(json!([row(a)])), page(json!([row(a)]))],
+            vec![a, a],
+        ),
+    ] {
+        let mut pages = lookups;
+        for id in ids {
+            if command == "delete" {
+                pages.push(json!({"success":true,"result":row(id)}));
+            }
+            pages.push(success());
+        }
+        cases.push(BulkCase {
+            args: args.into_iter().map(str::to_owned).collect(),
+            pages,
+            statuses: vec![],
+        });
+    }
+    for pages in [
+        vec![page(json!([]))],
+        vec![page(json!([row(a), row(c)]))],
+        vec![page(json!([{"id":"invalid"}]))],
+    ] {
+        cases.push(BulkCase {
+            args: vec![b.into(), "missing".into()],
+            pages,
+            statuses: vec![],
+        });
+    }
+    cases.push(BulkCase {
+        args: vec!["name-a".into(), b.into(), "missing".into()],
+        pages: vec![page(json!([row(a)])), page(json!([]))],
+        statuses: vec![],
+    });
+    cases.push(BulkCase {
+        args: vec![b.into(), "name-a".into()],
+        pages: vec![error()],
+        statuses: vec![500],
+    });
+    let mut flagged = vec![page(json!([row(a)]))];
+    for id in [b, a] {
+        if command == "delete" {
+            flagged.push(json!({"success":true,"result":row(id)}));
+        }
+        flagged.push(success());
+    }
+    let mut args = if command == "delete" {
+        vec!["--force".into()]
+    } else {
+        vec!["--connector-id".into(), c.into()]
+    };
+    args.extend(["name-a".into(), b.into()]);
+    cases.push(BulkCase {
+        args,
+        pages: flagged,
+        statuses: vec![],
+    });
+    if command == "cleanup" {
+        cases.push(BulkCase {
+            args: vec![a.into(), b.into()],
+            pages: vec![error(), success()],
+            statuses: vec![500, 200],
+        });
+        cases.push(BulkCase {
+            args: vec![
+                "--connector-id".into(),
+                "invalid".into(),
+                b.into(),
+                "name-a".into(),
+            ],
+            pages: vec![page(json!([row(a)]))],
+            statuses: vec![],
+        });
+    } else {
+        cases.push(BulkCase {
+            args: vec![a.into(), b.into()],
+            pages: vec![json!({"success":true,"result":row(a)}), error()],
+            statuses: vec![200, 500],
+        });
+        cases.push(BulkCase {
+            args: vec!["name-a".into(), b.into()],
+            pages: vec![
+                page(json!([row(a)])),
+                json!({"success":true,"result":{"id":b,"deleted_at":"2026-01-01T00:00:00Z"}}),
+            ],
+            statuses: vec![],
+        });
+    }
+    cases
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_resolution_errors_prevent_target_requests_and_mutations() {
+    let directory = Directory::new();
+    for command in ["delete", "cleanup"] {
+        for name in ["missing", "synthetic-token"] {
+            let args = [
+                "--loglevel",
+                "fatal",
+                "22222222-2222-2222-2222-222222222222",
+                name,
+            ]
+            .map(str::to_owned);
+            let (output, requests) =
+                execute(&directory, command, &args, vec![page(json!([]))], &[]).await;
+            assert!(!output.status.success());
+            assert_eq!(
+                requests,
+                [format!(
+                    "GET /client/v4/accounts/synthetic-account/cfd_tunnel?is_deleted=false&name={name}&page=1"
+                )]
+            );
+            assert!(output.stdout.is_empty());
+            assert!(
+                !String::from_utf8(output.stderr)
+                    .unwrap()
+                    .contains("synthetic-token")
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires pinned Go administration oracle; run scripts/test-interop.sh"]
+async fn go_administration_bulk_resolution_contract() {
+    let directory = Directory::new();
+    for command in ["delete", "cleanup"] {
+        for (index, case) in bulk_cases(command).into_iter().enumerate() {
+            let file = directory.0.join("input.json");
+            std::fs::write(&file, serde_json::to_vec(&json!({"command":command,"args":case.args,"parent_args":["--loglevel","fatal"],"pages":case.pages,"statuses":case.statuses})).unwrap()).unwrap();
+            let source = directory
+                .command(
+                    std::env::var_os("CLOUDFLARED_GO_ADMIN_ORACLE")
+                        .expect("run scripts/test-interop.sh"),
+                )
+                .arg(file)
+                .output()
+                .unwrap();
+            assert!(source.status.success(), "oracle {command} case{index}");
+            let source: Value = serde_json::from_slice(&source.stdout).unwrap();
+            let mut args = vec!["--loglevel".into(), "fatal".into()];
+            args.extend(case.args);
+            let (native, requests) =
+                execute(&directory, command, &args, case.pages, &case.statuses).await;
+            assert_eq!(
+                json!(requests),
+                source["requests"],
+                "API order {command} case{index}"
+            );
+            assert_eq!(
+                !native.status.success(),
+                source["failure"].as_bool().unwrap(),
+                "exit {command} case{index}"
+            );
+            assert_eq!(
+                String::from_utf8(native.stdout).unwrap(),
+                source["output"].as_str().unwrap(),
+                "stdout {command} case{index}"
+            );
+            if native.status.success() {
+                assert!(
+                    native.stderr.is_empty(),
+                    "fatal logger {command} case{index}"
+                );
+                assert_eq!(
+                    source["stderr"], "",
+                    "source fatal logger {command} case{index}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_sort_logs_only_after_comparison_and_redacts_credentials() {
     let directory = Directory::new();
@@ -139,7 +349,8 @@ async fn invalid_sort_logs_only_after_comparison_and_redacts_credentials() {
             .map(|index| json!({"name":format!("fixture-{index}")}))
             .collect();
         let args = ["--sort-by", "synthetic-token", "--output", "json"].map(str::to_owned);
-        let (output, requests) = execute(&directory, "list", &args, vec![page(json!(rows))]).await;
+        let (output, requests) =
+            execute(&directory, "list", &args, vec![page(json!(rows))], &[]).await;
         assert!(output.status.success());
         assert_eq!(requests.len(), 1);
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -159,7 +370,8 @@ async fn collection_rows_require_objects_before_followup_requests() {
         if command == "info" {
             args.push("11111111-1111-1111-1111-111111111111".into());
         }
-        let (output, requests) = execute(&directory, command, &args, vec![page(json!([[]]))]).await;
+        let (output, requests) =
+            execute(&directory, command, &args, vec![page(json!([[]]))], &[]).await;
         assert!(!output.status.success());
         assert_eq!(requests.len(), 1);
         assert!(output.stdout.is_empty());
@@ -263,7 +475,7 @@ async fn go_administration_execution_contract() {
             .unwrap();
         assert!(source.status.success(), "oracle case{index}");
         let source: Value = serde_json::from_slice(&source.stdout).unwrap();
-        let (native, requests) = execute(&directory, command, &args, pages).await;
+        let (native, requests) = execute(&directory, command, &args, pages, &[]).await;
         assert_eq!(json!(requests), source["requests"], "requests case{index}");
         assert_eq!(
             !native.status.success(),

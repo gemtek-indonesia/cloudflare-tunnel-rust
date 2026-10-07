@@ -234,6 +234,35 @@ impl AccountClient {
         .parse()
         .context("invalid tunnel ID in API response")
     }
+    pub(super) async fn resolve_tunnels(&self, inputs: &[String]) -> Result<Vec<Uuid>> {
+        let mut ids = Vec::new();
+        let mut names = Vec::new();
+        for input in inputs {
+            match input.parse::<Uuid>() {
+                Ok(id) => ids.push(id),
+                Err(_) => names.push(input),
+            }
+        }
+        for name in names {
+            let tunnels = self
+                .tunnels(vec![("name", name.clone()), ("is_deleted", "false".into())])
+                .await?;
+            if tunnels.len() != 1 {
+                bail!(
+                    "there should only be 1 non-deleted Tunnel named {}",
+                    name.replace(&self.credentials.api_token, "[redacted]")
+                );
+            }
+            ids.push(
+                tunnels[0]["id"]
+                    .as_str()
+                    .context("API returned no tunnel ID")?
+                    .parse()
+                    .context("invalid tunnel ID in API response")?,
+            );
+        }
+        Ok(ids)
+    }
     pub async fn create(&self, name: &str, secret: &[u8]) -> Result<Value> {
         use base64::Engine;
         if name.is_empty() || Uuid::parse_str(name).is_ok() {
