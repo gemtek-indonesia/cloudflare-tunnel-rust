@@ -465,3 +465,43 @@ async fn http_trace_ttfb_ends_at_headers_before_streamed_body_eof() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn public_stream_failed_ack_closes_opened_origin() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = state(&format!("tcp://{}", listener.local_addr().unwrap()));
+    let mut request = request("GET", true);
+    request
+        .metadata
+        .push(("HttpHeader:Cf-Trace-Id".into(), SAMPLED.into()));
+    let mut head = RequestHead::from_quic(&request).unwrap();
+    head.trace = tracing::HttpTrace::extract(&mut head.headers, &state.observability.logger);
+    let (origin, _) = state.select(&head).await.unwrap();
+    let (client, stream) = tokio::io::duplex(1024);
+    drop(client);
+    let mut sink = EdgeSink::Quic {
+        writer: Box::new(stream),
+        started: false,
+        protected: false,
+    };
+    assert!(
+        tcp::proxy(
+            origin,
+            head,
+            Box::new(tokio::io::empty()),
+            &mut sink,
+            &state
+        )
+        .await
+        .is_err()
+    );
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut bytes = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), socket.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}

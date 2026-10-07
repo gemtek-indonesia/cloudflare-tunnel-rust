@@ -1,6 +1,7 @@
 use super::{BoxReader, EdgeSink, Origin, ProxyState, RequestHead, Service};
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderValue};
+use opentelemetry::trace::Span as _;
 use serde::Deserialize;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -76,6 +77,20 @@ async fn dial(destination: &str, settings: &crate::config::OriginRequest) -> Res
         .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(keepalive))?;
     Ok(socket)
 }
+async fn traced_dial(
+    trace: &super::tracing::HttpTrace,
+    destination: &str,
+    settings: &crate::config::OriginRequest,
+) -> Result<TcpStream> {
+    let mut span = trace.start("stream-connect");
+    let result = dial(destination, settings).await;
+    if result.is_err() {
+        super::tracing::end_error(span, "Unable to establish TCP origin connection");
+    } else if let Some(span) = &mut span {
+        span.end();
+    }
+    result
+}
 pub(super) async fn proxy(
     origin: Arc<Origin>,
     head: RequestHead,
@@ -86,7 +101,7 @@ pub(super) async fn proxy(
     let started = Instant::now();
     let (socket, socks, policy) = match &origin.service {
         Service::Tcp { destination, socks } => (
-            Some(dial(destination, &origin.settings).await?),
+            Some(traced_dial(&head.trace, destination, &origin.settings).await?),
             *socks,
             None,
         ),
@@ -105,12 +120,17 @@ pub(super) async fn proxy(
                 bail!("invalid bastion destination");
             }
             (
-                Some(dial(&destination, &origin.settings).await?),
+                Some(traced_dial(&head.trace, &destination, &origin.settings).await?),
                 *socks,
                 None,
             )
         }
-        Service::Socks(rules) => (None, true, Some(rules.clone())),
+        Service::Socks(rules) => {
+            if let Some(mut span) = head.trace.start("stream-connect") {
+                span.end();
+            }
+            (None, true, Some(rules.clone()))
+        }
         _ => bail!("origin is not a TCP stream"),
     };
     let mut headers = HeaderMap::new();
@@ -130,6 +150,7 @@ pub(super) async fn proxy(
             HeaderValue::from_str(&derive_accept_key(key.as_bytes()))?,
         );
     }
+    head.trace.response(&mut headers);
     sink.head(101, &headers).await?;
     state.observability.metrics.response(101);
     state

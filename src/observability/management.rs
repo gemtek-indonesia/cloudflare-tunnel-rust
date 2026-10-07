@@ -600,6 +600,41 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[tokio::test]
+    async fn management_routes_do_not_export_http_traces() {
+        let service = Service::new(
+            Context::quiet().unwrap(),
+            uuid::Uuid::nil(),
+            "synthetic",
+            None,
+            false,
+        );
+        let receipt =
+            crate::runtime::scope::fixture_receipt(uuid::Uuid::nil(), "synthetic-account");
+        let valid = token(uuid::Uuid::nil(), "synthetic-account", "synthetic-actor");
+        for path in ["/ping", "/host_details", "/logs", "/unknown"] {
+            for query in [format!("access_token={valid}"), String::new()] {
+                let request = Request::builder()
+                    .uri(format!("https://management.argotunnel.com{path}?{query}"))
+                    .header(
+                        "cf-trace-id",
+                        "11111111111111111111111111111111:2222222222222222:0:1",
+                    )
+                    .body(())
+                    .unwrap();
+                let response = service.handle_http(&receipt, &request).await.unwrap();
+                assert!(
+                    !response
+                        .headers()
+                        .contains_key("cf-int-cloudflared-tracing")
+                );
+                if path == "/ping" {
+                    assert_eq!(response.status(), if query.is_empty() { 400 } else { 200 });
+                }
+            }
+        }
+    }
+
     fn token(id: uuid::Uuid, account: &str, actor: &str) -> String {
         format!(
             "{}.{}.{}",
