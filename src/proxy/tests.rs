@@ -11,6 +11,9 @@ use tokio::{
     net::TcpListener,
 };
 
+#[path = "tracing_tests.rs"]
+mod http_tracing;
+
 fn state(service: &str) -> Arc<ProxyState> {
     state_with_settings(service, config::OriginRequest::default())
 }

@@ -22,6 +22,9 @@ mod v3_metrics;
 #[path = "icmp_tests.rs"]
 mod icmp_lifecycle;
 
+#[path = "../proxy/tracing_wire_tests.rs"]
+mod http_tracing;
+
 struct Pair {
     client: QuicConnection,
     peer: QuicConnection,

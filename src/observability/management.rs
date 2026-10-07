@@ -477,7 +477,7 @@ fn websocket_origin_allowed(request: &Request<()>) -> bool {
         && (host.eq_ignore_ascii_case(request_host)
             || host.to_ascii_lowercase().ends_with(".cloudflare.com"))
 }
-fn system_hostname() -> String {
+pub(crate) fn system_hostname() -> String {
     let mut buffer = [0u8; 256]; /* SAFETY: buffer is valid for its supplied length. */
     if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
         return "unknown".into();

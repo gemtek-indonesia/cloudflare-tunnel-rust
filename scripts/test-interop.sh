@@ -59,6 +59,8 @@ cp "${repo_dir}/tests/interop/udp_v2_cadence_test.go" "${scratch}/datagramsessio
 cp "${repo_dir}/tests/interop/udp_v3_ack_test.go" "${scratch}/connection/udp_v3_ack_test.go"
 cp "${repo_dir}/tests/interop/udp_v3_duplex_test.go" "${scratch}/connection/udp_v3_duplex_test.go"
 cp "${repo_dir}/tests/interop/udp_v3_metrics_test.go" "${scratch}/connection/udp_v3_metrics_test.go"
+cp "${repo_dir}/tests/interop/source_bridge/http_trace_carrier_test.go" "${scratch}/connection/rust_http_trace_carrier_test.go"
+cp "${repo_dir}/tests/interop/source_bridge/http_tracing_test.go" "${scratch}/proxy/rust_http_tracing_test.go"
 cp "${repo_dir}/tests/interop/udp_v3_clock_test.go" "${scratch}/quic/v3/udp_v3_clock_test.go"
 cp "${repo_dir}/tests/interop/icmp_v3_test.go" "${scratch}/quic/v3/rust_icmp_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/icmp_startup_test.go" "${scratch}/ingress/rust_icmp_test.go"
@@ -74,6 +76,7 @@ cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV2' -count=1 -timeout=20s -v ./datagramsession
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV3' -count=1 -timeout=20s -v ./quic/v3
+GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoHTTPTrace' -count=1 -timeout=20s -v ./proxy
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^(TestRustOriginProxyEnvironmentContract|TestPinnedGoICMP.*)$' -timeout=20s -v ./ingress
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRustRedirectDecodedSSOPathContract$' -timeout=10s -v ./token

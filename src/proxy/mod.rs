@@ -8,6 +8,7 @@ pub(crate) mod tag_test_origin;
 mod tcp;
 #[cfg(test)]
 mod tests;
+mod tracing;
 
 use crate::{
     config::{IngressRule, LoadedConfig, RunConfig, validate_ingress_paths},
@@ -22,6 +23,7 @@ use body::{ChannelBody, H2Reader};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use http_body_util::BodyExt;
+use opentelemetry::{KeyValue, trace::Span as _};
 use origin::{Origin, Service};
 use std::{io, sync::Arc};
 use tokio::{
@@ -121,7 +123,7 @@ impl ProxyState {
         self.snapshot.read().await.configuration.clone()
     }
 
-    async fn select(&self, head: &RequestHead) -> Result<Arc<Origin>> {
+    async fn select(&self, head: &RequestHead) -> Result<(Arc<Origin>, usize)> {
         let snapshot = self.snapshot.read().await;
         let path = if self.normalize && snapshot.normalize {
             crate::config::canonical_path(&head.path)
@@ -134,7 +136,7 @@ impl ProxyState {
                     .as_ref()
                     .is_none_or(|expression| expression.is_match(&path))
             {
-                return Ok(snapshot.origins[index].clone());
+                return Ok((snapshot.origins[index].clone(), index));
             }
         }
         bail!("No matching ingress rule")
@@ -150,6 +152,7 @@ pub(super) struct RequestHead {
     headers: HeaderMap,
     websocket: bool,
     body: BodyMode,
+    trace: tracing::HttpTrace,
 }
 
 #[derive(Clone, Copy)]
@@ -267,6 +270,7 @@ impl RequestHead {
             headers,
             websocket,
             body,
+            trace: Default::default(),
         })
     }
 }
@@ -373,11 +377,12 @@ type BoxReader = Box<dyn AsyncRead + Unpin + Send>;
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send>;
 
 async fn proxy(
-    head: RequestHead,
+    mut head: RequestHead,
     reader: BoxReader,
     sink: &mut EdgeSink,
     state: &ProxyState,
 ) -> Result<()> {
+    head.trace = tracing::HttpTrace::extract(&mut head.headers, &state.observability.logger);
     let mut request = state.observability.metrics.begin_request(false);
     let result = proxy_inner(head, reader, sink, state).await;
     if result.is_err() {
@@ -419,7 +424,15 @@ async fn proxy_inner(
     for (name, value) in &state.tags {
         head.headers.append(name, value.clone());
     }
-    let origin = state.select(&head).await?;
+    let mut matching = head.trace.start("ingress_match");
+    if let Some(span) = &mut matching {
+        span.set_attribute(KeyValue::new("req-host", head.authority.clone()));
+    }
+    let (origin, rule_index) = state.select(&head).await?;
+    if let Some(span) = &mut matching {
+        span.set_attribute(KeyValue::new("rule-num", rule_index as i64));
+        span.end();
+    }
     if origin
         .settings
         .access
@@ -474,12 +487,13 @@ async fn proxy_inner(
         bail!("no-chunked-encoding requires Content-Length for streamed requests");
     }
     if head.websocket {
-        let mut origin_response = origin.request(&head, ChannelBody::empty()).await?;
+        let mut origin_response = traced_request(&origin, &head, ChannelBody::empty()).await?;
         let status = origin_response.response.status();
-        let response_headers = state.quick_authorizer.as_ref().map_or_else(
+        let mut response_headers = state.quick_authorizer.as_ref().map_or_else(
             || origin_response.response.headers().clone(),
             |authorizer| authorizer.response_headers(origin_response.response.headers()),
         );
+        head.trace.response(&mut response_headers);
         sink.head(status.as_u16(), &response_headers).await?;
         state.observability.metrics.response(status.as_u16());
         if status == StatusCode::SWITCHING_PROTOCOLS {
@@ -508,13 +522,15 @@ async fn proxy_inner(
                 (body, Some(upload))
             }
         };
-        let mut origin_response = origin.request(&head, body).await?;
+        let mut origin_response = traced_request(&origin, &head, body).await?;
+        let mut response_headers = state.quick_authorizer.as_ref().map_or_else(
+            || origin_response.response.headers().clone(),
+            |authorizer| authorizer.response_headers(origin_response.response.headers()),
+        );
+        head.trace.response(&mut response_headers);
         sink.head(
             origin_response.response.status().as_u16(),
-            &state.quick_authorizer.as_ref().map_or_else(
-                || origin_response.response.headers().clone(),
-                |authorizer| authorizer.response_headers(origin_response.response.headers()),
-            ),
+            &response_headers,
         )
         .await?;
         state
@@ -524,6 +540,23 @@ async fn proxy_inner(
         stream_response(&mut origin_response.response, sink).await?;
     }
     Ok(())
+}
+
+async fn traced_request(
+    origin: &Origin,
+    head: &RequestHead,
+    body: ChannelBody,
+) -> Result<origin::OriginResponse> {
+    let span = head.trace.start("ttfb_origin");
+    let result = origin.request(head, body).await;
+    match &result {
+        Ok(response) => tracing::end_response(span, response.response.status().as_u16()),
+        Err(_) => tracing::end_error(
+            span,
+            "Unable to reach the origin service or complete its HTTP/TLS request",
+        ),
+    }
+    result
 }
 
 type TokioIoAdapter<T> = hyper_util::rt::TokioIo<T>;
@@ -649,6 +682,11 @@ impl EdgeSink {
                     response
                         .headers_mut()
                         .insert(http::header::CONTENT_LENGTH, length.clone());
+                }
+                for value in headers.get_all(tracing::RESPONSE_HEADER) {
+                    response
+                        .headers_mut()
+                        .append(tracing::RESPONSE_HEADER, value.clone());
                 }
                 *stream = Some(
                     responder
