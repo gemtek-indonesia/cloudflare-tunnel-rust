@@ -25,7 +25,7 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$cc"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-cpu=$cpu -C target-feature=+crt-static -C link-arg=-static --remap-path-prefix=$root=. --remap-path-prefix=$cache=build-tools --remap-path-prefix=$cargo_sources=cargo"
 export CARGO_TARGET_DIR="$root/target/musl-$cpu"
 cd "$root"
-cargo build --locked --release --target x86_64-unknown-linux-musl --bin cloudflared
+cargo rustc --locked --release --target x86_64-unknown-linux-musl --bin cloudflared -- -C "link-arg=-Wl,-Map=$CARGO_TARGET_DIR/link-map.txt"
 mkdir -p dist
 artifact="dist/cloudflared-linux-$cpu"
 cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/cloudflared" "$artifact"

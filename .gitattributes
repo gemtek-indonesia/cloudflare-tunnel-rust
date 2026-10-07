@@ -2,3 +2,4 @@
 schemas/tunnelrpc.capnp whitespace=-blank-at-eol
 # Preserve the verbatim upstream foundations snapshot.
 src/transport/vendor/foundations/** whitespace=-blank-at-eof,-blank-at-eol
+licenses/RUST-STANDARD-LIBRARY.html whitespace=-blank-at-eol,-blank-at-eof

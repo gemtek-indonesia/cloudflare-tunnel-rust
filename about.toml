@@ -1,0 +1,27 @@
+accepted = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "Unicode-3.0"]
+targets = ["x86_64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+[foundations-macros.clarify]
+license = "BSD-3-Clause"
+[[foundations-macros.clarify.git]]
+path = "LICENSE"
+checksum = "1a29bcc8ebcb5c5d95d6046abd667d09578cd1192d4796910903e974d929d942"
+
+[tonic-prost.clarify]
+license = "MIT"
+[[tonic-prost.clarify.git]]
+path = "LICENSE"
+checksum = "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
