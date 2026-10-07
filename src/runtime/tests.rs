@@ -416,20 +416,96 @@ async fn acknowledged_quic_transport_close_retries_same_connector_and_index() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn failed_first_rpc_stops_without_ready_notification_pid_or_second_dial() {
-    tokio::task::LocalSet::new().run_until(async{
-        let (cert,key)=certificate();let mut acceptor=boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();acceptor.set_certificate(&cert).unwrap();acceptor.set_private_key(&key).unwrap();let acceptor=acceptor.build();
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();let tls=EdgeTls::new(TlsPolicy::PreferPostQuantum,Some(&cert.to_pem().unwrap())).unwrap();
-        let notify_path=std::env::temp_dir().join(format!("cloudflared-notify-{}",Uuid::new_v4()));let receiver=std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();receiver.set_nonblocking(true).unwrap();let pid_path=std::env::temp_dir().join(format!("cloudflared-pid-{}",Uuid::new_v4()));
-        let mut config=config();config.pidfile=Some(pid_path.clone());config.ha_connections=1;config.retries=0;let mut runtime=runtime(config);let (events,event_rx)=mpsc::unbounded_channel();let state=Arc::get_mut(&mut runtime).unwrap();state.events=events;state.notify_socket=Some(notify_path.clone().into_os_string());
-        let attempts=Arc::new(std::sync::atomic::AtomicUsize::new(0));let dial_count=attempts.clone();let edge=tokio::task::spawn_local(async move{
-            let (socket,_)=listener.accept().await.unwrap();dial_count.fetch_add(1,Ordering::SeqCst);let tls=tokio_boring::accept(&acceptor,socket).await.unwrap();let (mut client,connection)=h2::client::handshake(tls).await.unwrap();let mut driver=AbortTask(tokio::task::spawn_local(connection));
-            let (answer,mut send)=client.send_request(http::Request::builder().method("POST").uri("https://example.invalid/control").header("cf-cloudflared-proxy-connection-upgrade","control-stream").body(()).unwrap(),false).unwrap();let _=answer.await.unwrap();send.send_reset(h2::Reason::CANCEL);
-            tokio::select!{second=listener.accept()=>{second.unwrap();dial_count.fetch_add(1,Ordering::SeqCst);},_=(&mut driver.0)=>{}}
-        });
-        let pool=Arc::new(Mutex::new(discovery::EdgePool::new(vec![vec![address]]).unwrap()));let result=tokio::time::timeout(Duration::from_secs(5),supervise(runtime.clone(),pool,tls,1,event_rx)).await.unwrap();
-        assert!(result.unwrap_err().downcast_ref::<RegistrationFailure>().is_some());edge.await.unwrap();assert_eq!(attempts.load(Ordering::SeqCst),1);assert_eq!(runtime.readiness.count(),0);assert!(!runtime.startup_announced.load(Ordering::Acquire));assert!(!pid_path.exists());let mut bytes=[0;32];assert!(receiver.recv(&mut bytes).is_err());std::fs::remove_file(notify_path).unwrap();
-    }).await;
+async fn rejected_first_rpc_waits_for_peer_close_then_stops_without_ready_or_second_dial() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (cert, key) = certificate();
+            let mut acceptor =
+                boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                    .unwrap();
+            acceptor.set_certificate(&cert).unwrap();
+            acceptor.set_private_key(&key).unwrap();
+            let acceptor = acceptor.build();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let tls =
+                EdgeTls::new(TlsPolicy::PreferPostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+            let notify_path =
+                std::env::temp_dir().join(format!("cloudflared-notify-{}", Uuid::new_v4()));
+            let receiver = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            let pid_path = std::env::temp_dir().join(format!("cloudflared-pid-{}", Uuid::new_v4()));
+            let mut config = config();
+            config.pidfile = Some(pid_path.clone());
+            config.ha_connections = 1;
+            config.retries = 0;
+            let mut runtime = runtime(config);
+            let (events, event_rx) = mpsc::unbounded_channel();
+            let state = Arc::get_mut(&mut runtime).unwrap();
+            state.events = events;
+            state.notify_socket = Some(notify_path.clone().into_os_string());
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dial_count = attempts.clone();
+            let edge = tokio::task::spawn_local(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                dial_count.fetch_add(1, Ordering::SeqCst);
+                let tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                let (mut client, connection) = h2::client::handshake(tls).await.unwrap();
+                let driver = AbortTask(tokio::task::spawn_local(connection));
+                let mut rejected = control_lifetime::peer_control(
+                    &mut client,
+                    control_lifetime::Reply::Reject { retry: false },
+                )
+                .await;
+                (&mut rejected.ended).await.unwrap().unwrap();
+                let (answer, _) = client
+                    .send_request(
+                        http::Request::builder()
+                            .uri("https://example.invalid/after-rejection")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    answer.await.unwrap().status(),
+                    203,
+                    "failed control must preserve outer forwarding until peer closes"
+                );
+                drop(rejected);
+                drop(driver);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "permanent failure must not redial after actual outer closure"
+                );
+            });
+            let pool = Arc::new(Mutex::new(
+                discovery::EdgePool::new(vec![vec![address]]).unwrap(),
+            ));
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                supervise(runtime.clone(), pool, tls, 1, event_rx),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<RegistrationFailure>()
+                    .is_some()
+            );
+            edge.await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.readiness.count(), 0);
+            assert!(!runtime.startup_announced.load(Ordering::Acquire));
+            assert!(!pid_path.exists());
+            let mut bytes = [0; 32];
+            assert!(receiver.recv(&mut bytes).is_err());
+            std::fs::remove_file(notify_path).unwrap();
+        })
+        .await;
 }
 
 #[tokio::test]

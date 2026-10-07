@@ -1,6 +1,7 @@
 mod discovery;
 mod features;
 pub(crate) mod h2_control;
+mod h2_sessions;
 pub(crate) mod prechecks;
 pub(crate) mod scope;
 mod service;
@@ -1115,93 +1116,37 @@ async fn serve_h2(
         runtime.config.management_hostname.clone(),
     );
     let requests = pending.requests();
-    let control_scope = pending.cancellation().child_token();
-    let mut registered = None::<RegisteredConnection>;
-    let mut control_pending = false;
     let mut tasks = JoinSet::new();
-    let (tx, mut rx) =
-        mpsc::unbounded_channel::<std::result::Result<RegisteredConnection, RegistrationError>>();
-    let mut _lease = None;
-    let mut control_pump = None::<AbortTask<std::io::Result<h2_control::Completion>>>;
+    let mut controls = h2_sessions::Controls::new(address, retries);
     loop {
         tokio::select! {
             _ = runtime.shutdown.cancelled() => {
-                if let Some(registered) = registered {
-                    conn.graceful_shutdown();
-                    let draining = drain_registered(&runtime, registered, &mut tasks);
-                    tokio::pin!(draining);
-                    tokio::select! {
-                        result = &mut draining => result?,
-                        _ = futures::future::poll_fn(|cx| conn.poll_closed(cx)) => { draining.await?; }
-                    }
-                }
+                controls.drain(&runtime, &mut conn, &mut tasks).await;
                 return Ok(());
             }
-            result = async {
-                if let Some(pump) = control_pump.as_mut() {
-                    (&mut pump.0).await
-                } else {
-                    futures::future::pending().await
+            completion = controls.next(), if controls.has_completions() => {
+                if let Some(completion) = completion {
+                    controls.complete(completion?, &runtime, &pending, &mut tasks, reset_after).await?;
                 }
-            } => {
-                control_pump = None;
-                let reset = match &result {
-                    Ok(Ok(h2_control::Completion::Reset)) => true,
-                    Ok(Err(error)) => error.get_ref()
-                        .and_then(|cause| cause.downcast_ref::<h2::Error>())
-                        .is_some_and(h2::Error::is_reset),
-                    _ => false,
-                };
-                if reset {
-                    control_scope.cancel();
-                    _lease = None;
-                } else {
-                    match result {
-                        Ok(Err(error)) => runtime.warn(&format!("H2 control stream: {error}")),
-                        Err(error) => runtime.warn(&format!("H2 control task: {error}")),
-                        Ok(Ok(_)) => {}
-                    }
-                }
-            }
-            result = rx.recv(), if control_pending => {
-                let value = result.context("control registration task closed")?
-                    .map_err(|error| runtime.registration_failure(error))?;
-                let liveness = SessionLiveness::Http2 {
-                    control: control_scope.clone(),
-                };
-                _lease = Some(runtime.registered(
-                    index, EdgeProtocol::Http2, address, &value, &pending, liveness,
-                ).await?);
-                if control_scope.is_cancelled() {
-                    _lease = None;
-                }
-                push_local_configuration(&runtime, index, &value, &mut tasks).await?;
-                registered = Some(value);
-                control_pending = false;
-                *reset_after = Some(Instant::now() + Duration::from_secs(4 * (1u64 << retries.min(31))));
             }
             incoming = conn.accept() => {
-                let (request, mut response) = incoming.context("connection with edge closed")??;
+                let (request, mut response) = match incoming {
+                    Some(Ok(incoming)) => incoming,
+                    outcome => {
+                        let error = match outcome {
+                            Some(Err(error)) => anyhow::Error::new(error),
+                            None => anyhow::anyhow!("connection with edge closed"),
+                            Some(Ok(_)) => unreachable!(),
+                        };
+                        return controls.closed(&runtime, &pending, &mut tasks, reset_after, error).await;
+                    }
+                };
                 let upgrade = request.headers().get("cf-cloudflared-proxy-connection-upgrade")
                     .and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
                 match upgrade.as_str() {
                     "control-stream" => {
-                        if control_pending || registered.is_some() {
-                            response.send_response(http::Response::builder().status(409).body(())?, true)?;
-                            continue;
-                        }
-                        control_pending = true;
                         let send = response.send_response(http::Response::builder().status(200).body(())?, false)?;
-                        let (control, pump) = h2_control::registration_bridge(request.into_body(), send);
-                        control_pump = Some(AbortTask(pump));
-                        let tx = tx.clone();
-                        let shared = runtime.clone();
-                        let snapshot = snapshot.clone();
-                        tasks.spawn_local(async move {
-                            let result = registration::register_connection(control, shared.request(index, local_address, retries, &snapshot), shared.config.rpc_timeout,shared.context.metrics.clone()).await;
-                            let _ = tx.send(result);
-                            Ok(())
-                        });
+                        controls.start(&runtime, &pending, local_address, request.into_body(), send);
                     }
                     "update-configuration" => { tasks.spawn_local(configuration_request(request, response, runtime.clone())); }
                     _ => {

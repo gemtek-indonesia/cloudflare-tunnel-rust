@@ -50,6 +50,7 @@ cp "${repo_dir}/tests/interop/oracle.go" "${scratch}/tests/rust-interop-oracle/m
 cp "${repo_dir}/tests/interop/origins.go" "${scratch}/tests/rust-interop-oracle/origins.go"
 cp "${repo_dir}/tests/interop/source_bridge/access_url.go" "${scratch}/cmd/cloudflared/access/rust_interop_exports.go"
 cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/control_lifetime_test.go"
+cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_test.go" "${scratch}/cmd/cloudflared/rust_watcher_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_config.go" "${scratch}/config/rust_watcher_config.go"
 for schema in tunnelrpc.capnp quic_metadata_protocol.capnp go.capnp; do

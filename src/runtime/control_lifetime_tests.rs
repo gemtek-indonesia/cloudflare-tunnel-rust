@@ -10,6 +10,362 @@ enum EndControl {
     Fin,
     Reset,
 }
+
+pub(super) enum Reply {
+    Accept,
+    Reject { retry: bool },
+    Pending,
+}
+struct ReadmissionOracle {
+    reply: Reply,
+    entered: Arc<tokio::sync::Notify>,
+    unregisters: Arc<std::sync::atomic::AtomicUsize>,
+    unregistered: Arc<tokio::sync::Notify>,
+}
+impl wire::registration_server::Server for ReadmissionOracle {
+    async fn register_connection(
+        self: Rc<Self>,
+        params: wire::registration_server::RegisterConnectionParams,
+        mut results: wire::registration_server::RegisterConnectionResults,
+    ) -> capnp::Result<()> {
+        let params = params.get()?;
+        assert_eq!(params.get_conn_index(), 0);
+        assert_eq!(
+            params.get_auth()?.get_account_tag()?.to_str()?,
+            "synthetic-account"
+        );
+        self.entered.notify_one();
+        if matches!(self.reply, Reply::Pending) {
+            futures::future::pending::<()>().await;
+        }
+        if let Reply::Reject { retry } = self.reply {
+            let mut error = results.get().init_result().init_result().init_error();
+            error.set_cause("synthetic rejection");
+            error.set_should_retry(retry);
+            error.set_retry_after(99_000_000_000);
+        } else {
+            let mut details = results
+                .get()
+                .init_result()
+                .init_result()
+                .init_connection_details();
+            details.set_uuid(&[3; 16]);
+            details.set_location_name("TST");
+            details.set_tunnel_is_remotely_managed(true);
+        }
+        Ok(())
+    }
+    async fn unregister_connection(
+        self: Rc<Self>,
+        _: wire::registration_server::UnregisterConnectionParams,
+        _: wire::registration_server::UnregisterConnectionResults,
+    ) -> capnp::Result<()> {
+        self.unregisters.fetch_add(1, Ordering::AcqRel);
+        self.unregistered.notify_one();
+        Ok(())
+    }
+    async fn update_local_configuration(
+        self: Rc<Self>,
+        _: wire::registration_server::UpdateLocalConfigurationParams,
+        _: wire::registration_server::UpdateLocalConfigurationResults,
+    ) -> capnp::Result<()> {
+        Ok(())
+    }
+}
+
+pub(super) struct PeerControl {
+    command: mpsc::UnboundedSender<EndControl>,
+    pub(super) ended: oneshot::Receiver<std::result::Result<(), String>>,
+    entered: Arc<tokio::sync::Notify>,
+    unregisters: Arc<std::sync::atomic::AtomicUsize>,
+    unregistered: Arc<tokio::sync::Notify>,
+    _rpc: AbortTask<capnp::Result<()>>,
+    _pump: AbortTask<std::io::Result<((), ())>>,
+}
+
+pub(super) async fn peer_control(
+    client: &mut h2::client::SendRequest<Bytes>,
+    reply: Reply,
+) -> PeerControl {
+    let (answer, mut send) = client
+        .send_request(
+            http::Request::builder()
+                .method("POST")
+                .uri("https://synthetic.invalid/control")
+                .header("cf-cloudflared-proxy-connection-upgrade", "control-stream")
+                .body(())
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    let answer = answer.await.unwrap();
+    assert_eq!(
+        answer.status(),
+        200,
+        "every actual control request must receive initial200, not a local409 barrier"
+    );
+    let mut receive = answer.into_body();
+    let (control, transport) = tokio::io::duplex(65536);
+    let (mut read, mut write) = tokio::io::split(transport);
+    let (command, mut commands) = mpsc::unbounded_channel();
+    let (ended, ending) = oneshot::channel();
+    let pump = AbortTask(tokio::task::spawn_local(async move {
+        let incoming = async {
+            while let Some(bytes) = receive.data().await {
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = ended.send(Err(error.to_string()));
+                        return Err(std::io::Error::other(error));
+                    }
+                };
+                write.write_all(&bytes).await?;
+                receive
+                    .flow_control()
+                    .release_capacity(bytes.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            let _ = ended.send(Ok(()));
+            write.shutdown().await
+        };
+        let outgoing = async {
+            let mut bytes = [0; 16384];
+            loop {
+                tokio::select! {
+                    command=commands.recv()=>{
+                        match command {
+                            Some(EndControl::Reset)=>send.send_reset(h2::Reason::CANCEL),
+                            Some(EndControl::Fin)=>send.send_data(Bytes::new(),true).map_err(std::io::Error::other)?,
+                            None=>{}
+                        }
+                        return Ok::<_,std::io::Error>(());
+                    }
+                    count=read.read(&mut bytes)=>{
+                        let count=count?;
+                        if count==0{return Ok(());}
+                        h2_control::send_data(&mut send,Bytes::copy_from_slice(&bytes[..count])).await?;
+                    }
+                }
+            }
+        };
+        tokio::try_join!(incoming, outgoing)
+    }));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let unregisters = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unregistered = Arc::new(tokio::sync::Notify::new());
+    let server: wire::registration_server::Client = capnp_rpc::new_client(ReadmissionOracle {
+        reply,
+        entered: entered.clone(),
+        unregisters: unregisters.clone(),
+        unregistered: unregistered.clone(),
+    });
+    let (read, write) = tokio::io::split(control);
+    let network = capnp_rpc::twoparty::VatNetwork::new(
+        read.compat(),
+        write.compat_write(),
+        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+        crate::protocol::reader_options(),
+    );
+    let rpc = AbortTask(tokio::task::spawn_local(capnp_rpc::RpcSystem::new(
+        Box::new(network),
+        Some(server.client),
+    )));
+    PeerControl {
+        command,
+        ended: ending,
+        entered,
+        unregisters,
+        unregistered,
+        _rpc: rpc,
+        _pump: pump,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Readmission {
+    Reject { retry: bool },
+    CancelBeforeAck,
+    ResetOlder,
+    Graceful,
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn h2_failed_control_readmission_parallel_reset_and_all_unregister() {
+    for scenario in [
+        Readmission::Reject { retry: false },
+        Readmission::Reject { retry: true },
+        Readmission::CancelBeforeAck,
+        Readmission::ResetOlder,
+        Readmission::Graceful,
+    ] {
+        tokio::task::LocalSet::new()
+            .run_until(h2_readmission_case(scenario))
+            .await;
+    }
+}
+
+async fn h2_readmission_case(scenario: Readmission) {
+    let (cert, key) = certificate();
+    let mut acceptor =
+        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();
+    acceptor.set_certificate(&cert).unwrap();
+    acceptor.set_private_key(&key).unwrap();
+    let acceptor = acceptor.build();
+    let tls = EdgeTls::new(TlsPolicy::PreferPostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut runtime = runtime(config());
+    let (events, mut received) = mpsc::unbounded_channel();
+    Arc::get_mut(&mut runtime).unwrap().events = events;
+    let shared = runtime.clone();
+    let edge = tokio::task::spawn_local(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+        let (mut client, driver) = h2::client::handshake(tls).await.unwrap();
+        let driver = AbortTask(tokio::task::spawn_local(driver));
+        let reply = match scenario {
+            Readmission::Reject { retry } => Reply::Reject { retry },
+            Readmission::CancelBeforeAck => Reply::Pending,
+            _ => Reply::Accept,
+        };
+        let mut first = peer_control(&mut client, reply).await;
+        first.entered.notified().await;
+        match scenario {
+            Readmission::Reject { .. } => {
+                (&mut first.ended)
+                    .await
+                    .unwrap()
+                    .expect("structured rejection must finish200 response with FIN, not reset");
+                assert_eq!(shared.readiness.count(), 0);
+                assert!(!shared.startup_announced.load(Ordering::Acquire));
+            }
+            Readmission::CancelBeforeAck => {
+                first.command.send(EndControl::Reset).unwrap();
+                assert!((&mut first.ended).await.unwrap().is_err());
+                assert_eq!(shared.readiness.count(), 0);
+                assert!(!shared.startup_announced.load(Ordering::Acquire));
+            }
+            _ => connected(&mut received, EdgeProtocol::Http2).await,
+        }
+        let second = peer_control(&mut client, Reply::Accept).await;
+        connected(&mut received, EdgeProtocol::Http2).await;
+        assert_eq!(shared.readiness.count(), 1);
+        let current_scope = {
+            let slots = shared.readiness.slots.lock().unwrap();
+            match &slots[&0].liveness {
+                SessionLiveness::Http2 { control } => control.clone(),
+                _ => unreachable!(),
+            }
+        };
+        if matches!(scenario, Readmission::ResetOlder) {
+            first.command.send(EndControl::Reset).unwrap();
+            assert!((&mut first.ended).await.unwrap().is_err());
+            let updated = update_request(
+                &mut client,
+                9,
+                serde_json::json!({"ingress":[{"service":"http_status:204"}]}),
+            )
+            .await;
+            assert_eq!(updated["lastAppliedVersion"], 9);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), current_scope.cancelled())
+                    .await
+                    .is_err(),
+                "older reset must not cancel newer RPC/control scope"
+            );
+            assert_eq!(
+                shared.readiness.count(),
+                0,
+                "real old-live reset must clear indexed observer admission"
+            );
+        } else if matches!(
+            scenario,
+            Readmission::Reject { .. } | Readmission::CancelBeforeAck
+        ) {
+            assert_eq!(
+                shared
+                    .context
+                    .metrics
+                    .register_fail
+                    .with_label_values(&["server_error", "registerConnection"])
+                    .get(),
+                1
+            );
+        }
+        let (answer, _) = client
+            .send_request(
+                http::Request::builder()
+                    .uri("https://synthetic.invalid/after-controls")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            answer.await.unwrap().status(),
+            if matches!(scenario, Readmission::ResetOlder) {
+                204
+            } else {
+                203
+            }
+        );
+        let updated = update_request(
+            &mut client,
+            10,
+            serde_json::json!({"ingress":[{"service":"http_status:205"}]}),
+        )
+        .await;
+        assert_eq!(updated["lastAppliedVersion"], 10);
+        if matches!(scenario, Readmission::Graceful) {
+            shared.shutdown.cancel();
+            first.unregistered.notified().await;
+            second.unregistered.notified().await;
+            assert_eq!(first.unregisters.load(Ordering::Acquire), 1);
+            assert_eq!(second.unregisters.load(Ordering::Acquire), 1);
+        }
+        drop(second);
+        drop(first);
+        drop(driver);
+    });
+    let mut retry = None;
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let (result, peer) = tokio::join!(
+            serve_h2(runtime.clone(), &tls, 0, address, 0, &mut retry),
+            edge
+        );
+        peer.unwrap();
+        result
+    })
+    .await
+    .unwrap();
+    match scenario {
+        Readmission::Reject { retry } => {
+            let error = result.unwrap_err();
+            let failure = error
+                .downcast_ref::<RegistrationFailure>()
+                .expect("pump FIN/implicit NO_ERROR cleanup must retain real registration failure");
+            if retry {
+                assert!(matches!(failure.0, RegistrationError::RetryAfter { .. }));
+            } else {
+                assert!(matches!(failure.0, RegistrationError::Rejected { .. }));
+            }
+        }
+        Readmission::CancelBeforeAck => {
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<RegistrationFailure>()
+                    .is_some()
+            );
+        }
+        Readmission::Graceful => result.unwrap(),
+        Readmission::ResetOlder => {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(runtime.readiness.count(), 0);
+    assert_eq!(runtime.context.metrics.ha_connections.get(), 0);
+}
 impl wire::registration_server::Server for LifetimeOracle {
     async fn register_connection(
         self: Rc<Self>,

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::{io, task::Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub(crate) enum Completion {
@@ -34,24 +35,31 @@ pub(crate) fn bridge(
     receive: h2::RecvStream,
     send: h2::SendStream<Bytes>,
 ) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
-    bridge_inner(receive, send, false)
+    bridge_inner(receive, send, None)
 }
 
 pub(crate) fn registration_bridge(
     receive: h2::RecvStream,
     send: h2::SendStream<Bytes>,
-) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
-    bridge_inner(receive, send, true)
+) -> (
+    DuplexStream,
+    JoinHandle<io::Result<Completion>>,
+    oneshot::Sender<()>,
+) {
+    let (finish, finished) = oneshot::channel();
+    let (stream, pump) = bridge_inner(receive, send, Some(finished));
+    (stream, pump, finish)
 }
 
 fn bridge_inner(
     mut receive: h2::RecvStream,
     mut send: h2::SendStream<Bytes>,
-    keep_response_open: bool,
+    mut finish: Option<oneshot::Receiver<()>>,
 ) -> (DuplexStream, JoinHandle<io::Result<Completion>>) {
     let (application, transport) = tokio::io::duplex(64 * 1024);
     let (mut read, mut write) = tokio::io::split(transport);
     let task = tokio::task::spawn_local(async move {
+        let registration = finish.is_some();
         let incoming = async {
             while let Some(bytes) = receive.data().await {
                 let bytes = bytes.map_err(io::Error::other)?;
@@ -68,11 +76,14 @@ fn bridge_inner(
             loop {
                 let n = read.read(&mut buf).await?;
                 if n == 0 {
-                    if keep_response_open {
-                        futures::future::poll_fn(|cx| send.poll_reset(cx))
-                            .await
-                            .map_err(io::Error::other)?;
-                        return Ok(Completion::Reset);
+                    if let Some(finished) = finish.take() {
+                        tokio::select! {
+                            result = futures::future::poll_fn(|cx| send.poll_reset(cx)) => {
+                                result.map_err(io::Error::other)?;
+                                return Ok(Completion::Reset);
+                            }
+                            _ = finished => {}
+                        }
                     }
                     send.send_data(Bytes::new(), true)
                         .map_err(io::Error::other)?;
@@ -82,8 +93,23 @@ fn bridge_inner(
             }
             Ok::<_, io::Error>(Completion::End)
         };
-        let (_, completion) = tokio::try_join!(incoming, outgoing)?;
-        Ok(completion)
+        if registration {
+            tokio::pin!(incoming, outgoing);
+            tokio::select! {
+                result = &mut outgoing => result,
+                result = &mut incoming => {
+                    if let Err(error) = result
+                        && error.kind() != io::ErrorKind::BrokenPipe
+                    {
+                        return Err(error);
+                    }
+                    outgoing.await
+                }
+            }
+        } else {
+            let (_, completion) = tokio::try_join!(incoming, outgoing)?;
+            Ok(completion)
+        }
     });
     (application, task)
 }
