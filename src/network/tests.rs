@@ -7,6 +7,9 @@ use crate::{
 };
 use tokio::time::timeout;
 
+#[path = "v2_lifecycle_tests.rs"]
+mod v2_lifecycle;
+
 struct Pair {
     client: QuicConnection,
     peer: QuicConnection,
@@ -14,6 +17,7 @@ struct Pair {
     received: QuicIncoming,
     scope: scope::PendingSessionContext,
     connection: Arc<Connection>,
+    _control: quic::QuicStream,
 }
 impl Pair {
     async fn send(&mut self, bytes: Vec<u8>) {
@@ -60,6 +64,15 @@ async fn pair(
     index: u8,
     version: DatagramVersion,
 ) -> Pair {
+    pair_with_packet_limit(state, config, index, version, None).await
+}
+async fn pair_with_packet_limit(
+    state: Arc<NetworkState>,
+    config: &RunConfig,
+    index: u8,
+    version: DatagramVersion,
+    packet_limit: Option<usize>,
+) -> Pair {
     let (cert, key) = crate::runtime::tests::certificate();
     let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
     ssl.set_certificate(&cert).unwrap();
@@ -71,6 +84,9 @@ async fn pair(
         .set_application_protos(&[b"argotunnel"])
         .unwrap();
     peer_config.set_max_idle_timeout(5000);
+    if let Some(limit) = packet_limit {
+        peer_config.set_max_recv_udp_payload_size(limit);
+    }
     peer_config.set_initial_max_data(1024 * 1024);
     peer_config.set_initial_max_stream_data_bidi_local(64 * 1024);
     peer_config.set_initial_max_stream_data_bidi_remote(64 * 1024);
@@ -98,6 +114,7 @@ async fn pair(
     let tls = EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
     let options = crate::transport::EdgeDialOptions {
         bind_ip: Some("127.0.0.1".parse().unwrap()),
+        quic_disable_pmtu_discovery: packet_limit.is_some(),
         ..Default::default()
     };
     let (client, peer) = tokio::join!(
@@ -106,6 +123,8 @@ async fn pair(
     );
     let mut client = client.unwrap();
     let mut peer = peer;
+    let control = client.open_bi().await.unwrap();
+    assert_eq!(control.id(), 0);
     let incoming = peer.take_incoming().unwrap();
     let received = client.take_incoming().unwrap();
     let scope = scope::fixture_scope(config, index, version);
@@ -123,6 +142,7 @@ async fn pair(
         received,
         scope,
         connection,
+        _control: control,
     }
 }
 async fn drained(state: &NetworkState) {

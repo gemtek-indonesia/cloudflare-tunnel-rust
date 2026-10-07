@@ -428,7 +428,16 @@ impl Connection {
             let mut call = client.unregister_udp_session_request();
             call.get().set_session_id(&id);
             call.get().set_message(&message);
-            tokio::time::timeout(self.rpc_timeout, call.send().promise).await??;
+            let mut observed = self
+                .state
+                .context
+                .metrics
+                .rpc_client("session", "unregister_udp_session");
+            let result = tokio::time::timeout(self.rpc_timeout, call.send().promise).await;
+            if !matches!(&result, Ok(Ok(_))) {
+                observed.failed();
+            }
+            result??;
             Ok::<_, anyhow::Error>(())
         }
         .await;

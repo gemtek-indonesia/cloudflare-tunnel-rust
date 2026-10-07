@@ -17,6 +17,9 @@ pub struct Metrics {
     pub user_hostnames: IntCounterVec,
     pub tcp_active: IntGauge,
     pub tcp_total: IntCounter,
+    pub udp_active_sessions: IntGauge,
+    pub udp_total_sessions: IntCounter,
+    pub packet_too_big_dropped: IntCounter,
     pub connect_latency: Histogram,
     pub connect_errors: IntCounter,
     pub rpc_client_operations: IntCounterVec,
@@ -184,6 +187,18 @@ impl Metrics {
         registry.register(Box::new(
             prometheus::process_collector::ProcessCollector::for_self(),
         ))?;
+        let udp_active_sessions = gauge!(
+            "cloudflared_udp_active_sessions",
+            "Concurrent count of UDP sessions that are being proxied to any origin"
+        );
+        let udp_total_sessions = counter!(
+            "cloudflared_udp_total_sessions",
+            "Total count of UDP sessions that have been proxied to any origin"
+        );
+        let packet_too_big_dropped = counter!(
+            "quic_client_packet_too_big_dropped",
+            "Count of packets received from origin that are too big to send to the edge and are dropped as a result"
+        );
         Ok(Arc::new(Self {
             registry,
             ha_connections,
@@ -196,6 +211,9 @@ impl Metrics {
             user_hostnames,
             tcp_active,
             tcp_total,
+            udp_active_sessions,
+            udp_total_sessions,
+            packet_too_big_dropped,
             connect_latency,
             connect_errors,
             rpc_client_operations,

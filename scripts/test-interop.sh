@@ -51,6 +51,8 @@ cp "${repo_dir}/tests/interop/origins.go" "${scratch}/tests/rust-interop-oracle/
 cp "${repo_dir}/tests/interop/source_bridge/access_url.go" "${scratch}/cmd/cloudflared/access/rust_interop_exports.go"
 cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/control_lifetime_test.go"
 cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
+cp "${repo_dir}/tests/interop/udp_v2_lifecycle_test.go" "${scratch}/connection/udp_v2_lifecycle_test.go"
+cp "${repo_dir}/tests/interop/udp_v2_cadence_test.go" "${scratch}/datagramsession/udp_v2_cadence_test.go"
 cp "${repo_dir}/tests/interop/global_shutdown_test.go" "${scratch}/connection/global_shutdown_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/shutdown.go" "${scratch}/cmd/cloudflared/tunnel/rust_shutdown_exports.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_test.go" "${scratch}/cmd/cloudflared/rust_watcher_test.go"
@@ -61,6 +63,7 @@ for schema in tunnelrpc.capnp quic_metadata_protocol.capnp go.capnp; do
 done
 cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
+GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV2' -count=1 -timeout=20s -v ./datagramsession
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/oracle" ./tests/rust-interop-oracle
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/trust-oracle" "${repo_dir}/tests/interop/trust.go"

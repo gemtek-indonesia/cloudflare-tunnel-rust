@@ -25,6 +25,8 @@ The reference is Cloudflare `cloudflared` release 2026.10.0, commit [`18cdfe0a6f
 
 Offline unit/component checks, [six pinned Go interoperability tests](../tests/interop/protocol.rs) and a [34-case Go management-origin corpus](../tests/interop/origins.go) pass. These checks cover specific behaviors; they do not establish complete operator parity. Live Cloudflare edge acceptance remains incomplete. See [testing](testing.md) for runnable checks.
 
+Repeated UDPv2 UUID registrations retire the prior session; stale cleanup cannot remove its replacement. Negative idle hints use the 210 s default, and positive hints below 8 ns use a nonzero check interval; these inputs panic in the pinned Go implementation. [UDPv2 lifecycle tests](../src/network/v2_lifecycle_tests.rs) cover replacement and malformed hints.
+
 ## Deliberate exclusions
 
 * Linux x86_64 CPU v2/v3 only; other architectures and operating systems are out of scope.
