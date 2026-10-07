@@ -126,12 +126,9 @@ impl AccountClient {
         } else {
             Vec::new()
         };
-        let mut request = request.body(Full::new(Bytes::from(bytes)))?;
-        let method = request.method().clone();
-        let gzip = crate::http_body::prepare_gzip(&method, request.headers_mut());
+        let request = request.body(Full::new(Bytes::from(bytes)))?;
         let response = tokio::time::timeout(Duration::from_secs(15), async {
-            let response = self.client.request(request).await?;
-            let response = crate::http_body::response(response, gzip);
+            let response = crate::http_redirect::direct(&self.client, request).await?;
             let status = response.status();
             let body = response.into_body().collect().await?.to_bytes();
             Ok::<_, anyhow::Error>((status, body))
@@ -473,6 +470,18 @@ mod tests {
                             log.lock()
                                 .unwrap()
                                 .push((method.clone(), uri.clone(), body));
+                            if method == http::Method::POST && uri.ends_with("/cfd_tunnel") {
+                                return Ok::<_, Infallible>(
+                                    http::Response::builder()
+                                        .status(308)
+                                        .header(
+                                            http::header::LOCATION,
+                                            "/client/v4/redirected-create",
+                                        )
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                );
+                            }
                             let result = if uri.contains("page=1") {
                                 json!({"success":true,"result":[{"name":"one"},{"name":"two"}],"result_info":{"count":2,"per_page":2,"total_count":3}})
                             } else if uri.contains("page=2") {
@@ -557,6 +566,12 @@ mod tests {
         assert!(error.contains("1000"));
         assert!(!error.contains("synthetic-token"));
         let log = seen.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|(method, path, body)| method == http::Method::POST
+                    && path == "/client/v4/redirected-create"
+                    && body["tunnel_secret"] == "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=")
+        );
         assert!(
             log.iter()
                 .any(|(method, path, body)| method == http::Method::POST

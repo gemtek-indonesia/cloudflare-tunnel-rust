@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +35,10 @@ func gzipMember(value string) []byte {
 	return buffer.Bytes()
 }
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "redirect" {
+		redirectCorpus()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "resolve" {
 		resolveCorpus()
 		return
@@ -81,6 +86,90 @@ func main() {
 		result := map[string]any{"wire_encoding": <-encoding, "wire_body": base64.StdEncoding.EncodeToString(payload), "content_encoding": response.Header.Get("Content-Encoding"), "length": response.ContentLength, "body": base64.StdEncoding.EncodeToString(body), "read_error": readError != nil, "uncompressed": response.Uncompressed}
 		results = append(results, result)
 		server.Close()
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(results); err != nil {
+		panic(err)
+	}
+}
+
+type redirectCase struct {
+	Base      string              `json:"base"`
+	Method    string              `json:"method"`
+	Body      string              `json:"body"`
+	Host      string              `json:"host"`
+	Headers   map[string][]string `json:"headers"`
+	Statuses  []int               `json:"statuses"`
+	Locations [][]string          `json:"locations"`
+}
+
+type redirectTransport struct {
+	item     redirectCase
+	requests []map[string]any
+}
+
+func (transport *redirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	var body []byte
+	if request.Body != nil {
+		body, _ = io.ReadAll(request.Body)
+		_ = request.Body.Close()
+	}
+	headers := make(map[string][]string)
+	for name, values := range request.Header {
+		headers[strings.ToLower(name)] = values
+	}
+	host := request.Host
+	if host == "" {
+		host = request.URL.Host
+	}
+	target := *request.URL
+	target.User = nil
+	target.Fragment = ""
+	if target.Path == "" {
+		target.Path = "/"
+	}
+	authority := (&url.URL{Host: host}).String()
+	transport.requests = append(transport.requests, map[string]any{
+		"method": request.Method, "target": target.String(),
+		"raw_host": host, "serialized_host": strings.TrimPrefix(authority, "//"), "body": string(body), "headers": headers,
+	})
+	hop := len(transport.requests) - 1
+	status := http.StatusOK
+	if hop < len(transport.item.Statuses) {
+		status = transport.item.Statuses[hop]
+	}
+	response := &http.Response{StatusCode: status, Request: request, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), ContentLength: 0}
+	if hop < len(transport.item.Locations) {
+		response.Header["Location"] = transport.item.Locations[hop]
+	}
+	return response, nil
+}
+
+func redirectCorpus() {
+	var cases []redirectCase
+	if err := json.NewDecoder(os.Stdin).Decode(&cases); err != nil {
+		panic(err)
+	}
+	var results []map[string]any
+	for _, item := range cases {
+		request, err := http.NewRequest(item.Method, item.Base, bytes.NewReader([]byte(item.Body)))
+		transport := &redirectTransport{item: item}
+		status := 0
+		if err == nil {
+			if item.Host != "" {
+				request.Host = item.Host
+			}
+			for name, values := range item.Headers {
+				request.Header[http.CanonicalHeaderKey(name)] = values
+			}
+			client := &http.Client{Transport: transport}
+			response, requestError := client.Do(request)
+			err = requestError
+			if response != nil {
+				status = response.StatusCode
+				_ = response.Body.Close()
+			}
+		}
+		results = append(results, map[string]any{"requests": transport.requests, "error": err != nil, "status": status})
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(results); err != nil {
 		panic(err)

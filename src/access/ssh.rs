@@ -182,29 +182,13 @@ pub(super) async fn generate(
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))?;
     let fetch = async {
-        let mut response = http_client()?
-            .request(request)
-            .await
-            .context("Access SSH signing request failed")?;
-        if response.status() != 200 {
-            bail!("Access SSH signing request was rejected");
-        }
-        let bytes = bounded_body(&mut response, 1 << 20).await?;
-        #[derive(serde::Deserialize)]
-        struct Certificate {
-            certificate: String,
-        }
-        let certificate: Certificate = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("invalid Access SSH signing response"))?;
-        if certificate.certificate.is_empty() {
-            bail!("Access SSH signing returned an empty certificate");
-        }
+        let certificate = signing_response(request).await?;
         crate::administration::credentials::atomic_replace(
             &path.with_file_name(format!(
                 "{}-cert.pub",
                 path.file_name().unwrap().to_string_lossy()
             )),
-            certificate.certificate.as_bytes(),
+            certificate.as_bytes(),
             0o600,
         )?;
         Ok(())
@@ -213,9 +197,84 @@ pub(super) async fn generate(
         .await
         .context("Access SSH signing timeout")?
 }
+
+async fn signing_response(request: http::Request<Full<Bytes>>) -> Result<String> {
+    let mut response = http_client()?
+        .request_following(request)
+        .await
+        .context("Access SSH signing request failed")?;
+    if response.status() != 200 {
+        bail!("Access SSH signing request was rejected");
+    }
+    let bytes = bounded_body(&mut response, 1 << 20).await?;
+    #[derive(serde::Deserialize)]
+    struct Certificate {
+        certificate: String,
+    }
+    let certificate: Certificate = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Access SSH signing response"))?;
+    if certificate.certificate.is_empty() {
+        bail!("Access SSH signing returned an empty certificate");
+    }
+    Ok(certificate.certificate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn signing_request_follows_and_replays_owned_body() {
+        use http_body_util::BodyExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = crate::runtime::AbortTask(tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |request: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(request.method(), "POST");
+                    assert_eq!(
+                        request.headers()[http::header::CONTENT_TYPE],
+                        "application/json"
+                    );
+                    let path = request.uri().path().to_owned();
+                    assert_eq!(
+                        request.into_body().collect().await.unwrap().to_bytes(),
+                        "owned-signing-body"
+                    );
+                    let result = if path == "/sign" {
+                        http::Response::builder()
+                            .status(308)
+                            .header(http::header::LOCATION, "/signed")
+                            .body(Full::new(Bytes::new()))
+                            .unwrap()
+                    } else {
+                        assert_eq!(path, "/signed");
+                        http::Response::new(Full::new(Bytes::from_static(
+                            br#"{"certificate":"synthetic-certificate"}"#,
+                        )))
+                    };
+                    Ok::<_, std::io::Error>(result)
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                .await;
+        }));
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/sign"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(b"owned-signing-body")))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), signing_response(request))
+                .await
+                .unwrap()
+                .unwrap(),
+            "synthetic-certificate"
+        );
+        drop(server);
+    }
     #[tokio::test]
     async fn generated_p256_key_is_reused_and_private() {
         use std::os::unix::fs::PermissionsExt;

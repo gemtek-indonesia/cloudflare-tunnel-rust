@@ -353,7 +353,7 @@ impl TokenClient {
             let poll = async {
                 let mut response = self
                     .client
-                    .request(request)
+                    .request_following(request)
                     .await
                     .context("Access transfer request failed")?;
                 if response.status().as_u16() >= 500 {
@@ -1072,6 +1072,8 @@ printf '%s\n' "$@" > "$0.called"
                             let response=if request.uri().path()=="/certs" {
                                 http::Response::new(Full::new(jwks))
                             } else if let Some(public)=request.uri().path().strip_prefix("/transfer/") {
+                                http::Response::builder().status(302).header(http::header::LOCATION,format!("/transfer-result/{public}")).body(Full::new(Bytes::new())).unwrap()
+                            } else if let Some(public)=request.uri().path().strip_prefix("/transfer-result/") {
                                 counter.fetch_add(1,Ordering::SeqCst);
                                 let public:[u8;32]=URL_SAFE.decode(public).unwrap().try_into().unwrap();
                                 let payload=serde_json::to_vec(&serde_json::json!({"app_token":token,"org_token":""})).unwrap();

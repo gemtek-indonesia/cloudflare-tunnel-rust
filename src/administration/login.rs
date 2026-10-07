@@ -101,7 +101,7 @@ async fn fetch_certificate(request_url: &str) -> Result<Vec<u8>> {
             .header(http::header::USER_AGENT, "cloudflared")
             .body(Empty::<Bytes>::new())?;
         let (status, body) = tokio::time::timeout(Duration::from_secs(60), async {
-            let response = client.request(request).await?;
+            let response = client.request_following(request).await?;
             let status = response.status();
             let body = response.into_body().collect().await?.to_bytes();
             Ok::<_, anyhow::Error>((status, body))
@@ -170,17 +170,24 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let service =
                 hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
-                    assert_eq!(request.uri().path(), "/synthetic-capability");
+                    if request.uri().path() == "/synthetic-capability" {
+                        return std::future::ready(Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .status(302)
+                                .header(http::header::LOCATION, "/certificate")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        ));
+                    }
+                    assert_eq!(request.uri().path(), "/certificate");
                     let poll = counts.fetch_add(1, Ordering::Relaxed);
                     let body = if poll < 2 { Vec::new() } else { cert.clone() };
-                    async move {
-                        Ok::<_, Infallible>(
-                            http::Response::builder()
-                                .status(if poll < 2 { 404 } else { 200 })
-                                .body(Full::new(Bytes::from(body)))
-                                .unwrap(),
-                        )
-                    }
+                    std::future::ready(Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .status(if poll < 2 { 404 } else { 200 })
+                            .body(Full::new(Bytes::from(body)))
+                            .unwrap(),
+                    ))
                 });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(socket), service)

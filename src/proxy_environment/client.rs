@@ -571,6 +571,15 @@ where
             .context("HTTP request failed")?;
         Ok(crate::http_body::response(response, gzip))
     }
+    pub async fn request_following(
+        &self,
+        request: http::Request<B>,
+    ) -> Result<http::Response<crate::http_body::ResponseBody>>
+    where
+        B: Clone + Default,
+    {
+        crate::http_redirect::follow(request, |request| self.request(request)).await
+    }
 }
 
 #[cfg(test)]

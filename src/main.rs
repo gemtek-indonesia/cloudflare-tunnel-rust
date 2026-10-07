@@ -114,7 +114,13 @@ async fn ready(metrics: &str) -> Result<()> {
         cloudflare_tunnel_rust::proxy_environment::client::HttpClient::<
             http_body_util::Empty<bytes::Bytes>,
         >::new(cloudflare_tunnel_rust::proxy_environment::client::Connector::platform()?);
-    let response = client.get(endpoint).await?;
+    let response = client
+        .request_following(
+            http::Request::builder()
+                .uri(endpoint)
+                .body(http_body_util::Empty::new())?,
+        )
+        .await?;
     if response.status() != http::StatusCode::OK {
         let status = response.status().as_u16();
         let body = response.into_body().collect().await?.to_bytes();
@@ -141,17 +147,22 @@ mod proxy_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            for (path, reply) in [
+                ("/ready", b"HTTP/1.1 302 Found\r\nLocation: /ready-next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()),
+                ("/ready-next", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()),
+            ] {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut head = Vec::new();
             while !head.ends_with(b"\r\n\r\n") {
                 head.push(socket.read_u8().await.unwrap());
                 assert!(head.len() < 16 * 1024);
             }
-            assert!(head.starts_with(b"GET http://synthetic.invalid:080/ready HTTP/1.1\r\n"));
+            assert!(head.starts_with(format!("GET http://synthetic.invalid:080{path} HTTP/1.1\r\n").as_bytes()));
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(reply)
                 .await
                 .unwrap();
+            }
         });
         let output=tokio::time::timeout(std::time::Duration::from_secs(3),tokio::process::Command::new(std::env::current_exe().unwrap())
             .env_clear().env(CHILD,"1").env("HTTP_PROXY",format!("http://{address}"))

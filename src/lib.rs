@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod http_body;
+mod http_redirect;
 pub(crate) mod network;
 pub mod observability;
 pub mod protocol;

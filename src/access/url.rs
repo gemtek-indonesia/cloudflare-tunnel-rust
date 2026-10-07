@@ -365,6 +365,9 @@ impl ApplicationUrl {
         }
         Ok(())
     }
+    pub(crate) fn has_userinfo(&self) -> bool {
+        self.userinfo.is_some()
+    }
     pub(crate) fn set_path(&mut self, path: &str) {
         self.path = path.into();
         self.rebuild();

@@ -43,7 +43,7 @@ impl Collector {
                 .uri(url.as_str())
                 .header(http::header::ACCEPT, "application/json;version=1")
                 .body(Empty::<Bytes>::new())?;
-            let mut response = self.client.request(request).await?;
+            let mut response = crate::http_redirect::direct(&self.client, request).await?;
             if !response.status().is_success() {
                 bail!(
                     "diagnostic endpoint {path} returned HTTP {}",
@@ -377,6 +377,11 @@ mod tests {
         tokio_util::sync::CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
+        use tokio::io::AsyncWriteExt;
+        let mut encoder = async_compression::tokio::write::GzipEncoder::new(Vec::new());
+        encoder.write_all(&body).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        let body = encoder.into_inner();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}/", listener.local_addr().unwrap());
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -390,12 +395,18 @@ mod tests {
                         let (socket, _) = incoming.unwrap();
                         let body = body.clone();
                         tasks.spawn(async move {
-                            let service = hyper::service::service_fn(move |_: http::Request<hyper::body::Incoming>| {
+                            let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
                                 let body = body.clone();
                                 async move {
-                                    Ok::<_, std::convert::Infallible>(http::Response::new(
-                                        http_body_util::Full::new(Bytes::from(body)),
-                                    ))
+                                    assert_eq!(request.headers()[http::header::ACCEPT_ENCODING], "gzip");
+                                    if !request.uri().path().starts_with("/redirected/") {
+                                        return Ok::<_, std::convert::Infallible>(http::Response::builder()
+                                            .status(302).header(http::header::LOCATION, format!("/redirected{}", request.uri().path()))
+                                            .body(http_body_util::Full::new(Bytes::new())).unwrap());
+                                    }
+                                    Ok::<_, std::convert::Infallible>(http::Response::builder()
+                                        .header(http::header::CONTENT_ENCODING, "gzip")
+                                        .body(http_body_util::Full::new(Bytes::from(body))).unwrap())
                                 }
                             });
                             let _ = hyper::server::conn::http1::Builder::new()
