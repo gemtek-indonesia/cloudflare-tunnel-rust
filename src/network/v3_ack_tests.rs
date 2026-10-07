@@ -205,7 +205,9 @@ async fn saturated_registration_tasks_drop_only_new_requests_and_cancel_owned_at
             let mut config = crate::runtime::tests::config();
             config.icmpv4_src = Some("127.0.0.1".parse().unwrap());
             config.icmpv6_src = Some("::1".into());
-            let state = NetworkState::new(&config).unwrap();
+            let mut state = NetworkState::new(&config).unwrap();
+            // TTL conversion uses no ping socket and must not depend on host permissions.
+            Arc::get_mut(&mut state).unwrap().icmp = icmp::IcmpRouter::fixture(&config, [true; 2]);
             let mut pair = pair(state.clone(), &config, 0, DatagramVersion::V3).await;
             let (_, empty) = tokio::sync::mpsc::channel(1);
             let incoming = std::mem::replace(&mut pair.received.datagrams, empty);
