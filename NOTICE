@@ -26,3 +26,8 @@ The Rust implementation is modified/new work. It is an independent project,
 not an official Cloudflare distribution. Cloudflare trademarks remain with
 their owners. Refer to schema/source notices and dependency licenses for
 additional attribution.
+
+src/transport/vendor/hyper-util contains modified hyper-util 0.1.21 source.
+Copyright (c) 2023-2025 Sean McArthur; MIT license retained in that directory.
+PATCHES.md identifies the original package checksum and proxy compatibility
+changes. The remaining packaged source is unchanged.

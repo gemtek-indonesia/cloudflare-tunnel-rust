@@ -21,17 +21,15 @@ use std::{
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::UnixStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower_service::Service as ConnectorService;
 
 #[cfg(test)]
 mod ca_tests;
+#[cfg(test)]
+mod proxy_name_tests;
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
+use crate::proxy_environment::client::{Connector as EnvironmentConnector, Profile, Socket};
 
 #[derive(Clone)]
 pub enum Service {
@@ -50,6 +48,8 @@ pub struct Origin {
     client: Option<Client<OriginConnector, ChannelBody>>,
     websocket_client: Option<Client<OriginConnector, ChannelBody>>,
     _hello: Option<super::hello::Server>,
+    physical_uri: Option<http::Uri>,
+    routed: Option<EnvironmentConnector>,
 }
 
 pub struct OriginResponse {
@@ -62,6 +62,7 @@ impl Origin {
         settings: OriginRequest,
         observability: &crate::observability::Context,
     ) -> Result<Self> {
+        let raw_service = service.to_owned();
         let verifier = settings
             .access
             .as_ref()
@@ -110,10 +111,35 @@ impl Origin {
                 Service::Http(url)
             }
         };
+        let physical_uri = match &service {
+            Service::Http(url) => {
+                let address = if ["hello_world", "hello-world"].contains(&raw_service.as_str()) {
+                    url.as_str()
+                } else {
+                    raw_service.as_str()
+                };
+                let mut parts = crate::access::ApplicationUrl::remote(address)?
+                    .request_uri()?
+                    .into_parts();
+                parts.scheme = Some(if ["https", "wss"].contains(&url.scheme()) {
+                    http::uri::Scheme::HTTPS
+                } else {
+                    http::uri::Scheme::HTTP
+                });
+                Some(http::Uri::from_parts(parts)?)
+            }
+            _ => None,
+        };
+        let mut routed = None;
         let (client, websocket_client) =
             if matches!(service, Service::Http(_) | Service::Unix { .. }) {
-                let connector =
-                    OriginConnector::new(service.clone(), settings.clone(), observability)?;
+                let connector = OriginConnector::new(
+                    service.clone(),
+                    settings.clone(),
+                    physical_uri.clone(),
+                    observability,
+                )?;
+                routed = Some(connector.routed.clone());
                 let mut websocket = connector.clone();
                 websocket.force_http1 = true;
                 (
@@ -130,6 +156,8 @@ impl Origin {
             client,
             websocket_client,
             _hello: hello,
+            physical_uri,
+            routed,
         })
     }
 
@@ -137,24 +165,34 @@ impl Origin {
         let secure = matches!(&self.service, Service::Unix { tls: true, .. })
             || matches!(&self.service, Service::Http(url) if ["https", "wss"].contains(&url.scheme()));
         let physical_authority = match &self.service {
-            Service::Http(url) => {
-                url[url::Position::BeforeHost..url::Position::AfterPort].to_owned()
-            }
+            Service::Http(_) => self
+                .physical_uri
+                .as_ref()
+                .unwrap()
+                .authority()
+                .unwrap()
+                .as_str()
+                .to_owned(),
             _ => head.authority.clone(),
         };
-        let host = self
-            .settings
-            .http_host_header
-            .as_deref()
-            .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| {
-                if head.authority.is_empty() {
-                    &physical_authority
-                } else {
-                    &head.authority
-                }
-            });
-        let authority = if self.settings.match_sni_to_host == Some(true) {
+        let host_override = if matches!(&self.service, Service::Http(_)) {
+            self.settings
+                .http_host_header
+                .as_deref()
+                .filter(|host| !host.is_empty())
+        } else {
+            None
+        };
+        let host = host_override.unwrap_or_else(|| {
+            if head.authority.is_empty() {
+                &physical_authority
+            } else {
+                &head.authority
+            }
+        });
+        let authority = if matches!(&self.service, Service::Http(_))
+            && self.settings.match_sni_to_host == Some(true)
+        {
             host
         } else {
             &physical_authority
@@ -175,12 +213,7 @@ impl Origin {
             http::header::HOST,
             http::HeaderValue::from_str(host).context("invalid origin Host header")?,
         );
-        if self
-            .settings
-            .http_host_header
-            .as_ref()
-            .is_some_and(|host| !host.is_empty())
-        {
+        if host_override.is_some() {
             request.headers_mut().insert(
                 "x-forwarded-host",
                 http::HeaderValue::from_str(&head.authority)
@@ -223,6 +256,14 @@ impl Origin {
             self.client.as_ref()
         }
         .context("origin has no HTTP transport")?;
+        if let Some(routed) = &self.routed {
+            let physical = self
+                .physical_uri
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| request.uri().clone());
+            routed.prepare_headers_for(&physical, request.headers_mut())?;
+        }
         let response = client.request(request).await.map_err(|_| {
             anyhow::anyhow!("Unable to reach the origin service or complete its HTTP/TLS request")
         })?;
@@ -230,11 +271,17 @@ impl Origin {
     }
 }
 
+fn origin_host_flags(ssl: &mut boring::ssl::SslRef) -> Result<(), boring::error::ErrorStack> {
+    crate::crypto::enforce_hostname_policy(ssl);
+    Ok(())
+}
+
 fn build_client(
     connector: OriginConnector,
     settings: &OriginRequest,
 ) -> Client<OriginConnector, ChannelBody> {
     let mut builder = Client::builder(TokioExecutor::new());
+    builder.proxy_target_from_host(true);
     let idle = settings
         .keep_alive_timeout
         .map_or(Duration::from_secs(90), |value| value.0);
@@ -249,7 +296,8 @@ fn build_client(
 
 #[derive(Clone)]
 struct OriginConnector {
-    http: HttpConnector,
+    routed: EnvironmentConnector,
+    physical_uri: Option<http::Uri>,
     service: Service,
     settings: OriginRequest,
     tls: Option<SslConnector>,
@@ -303,6 +351,7 @@ impl OriginConnector {
     fn new(
         service: Service,
         settings: OriginRequest,
+        physical_uri: Option<http::Uri>,
         observability: &crate::observability::Context,
     ) -> Result<Self> {
         let roots_certificates =
@@ -329,9 +378,7 @@ impl OriginConnector {
         if settings.no_happy_eyeballs == Some(true) {
             http.set_happy_eyeballs_timeout(None);
         }
-        let secure = matches!(&service, Service::Unix { tls: true, .. })
-            || matches!(&service, Service::Http(url) if ["https", "wss"].contains(&url.scheme()));
-        let tls = if secure {
+        let tls = {
             let mut builder = SslConnector::builder(SslMethod::tls())?;
             let mut roots = X509StoreBuilder::new()?;
             for certificate in roots_certificates {
@@ -344,11 +391,38 @@ impl OriginConnector {
                 SslVerifyMode::PEER
             });
             Some(builder.build())
-        } else {
-            None
         };
+        let mut routed = EnvironmentConnector::platform()?
+            .with_transport(http, tls.as_ref().unwrap().clone(), origin_host_flags)
+            .with_tls_timeout(
+                match settings
+                    .tls_timeout
+                    .map_or(Duration::from_secs(10), |timeout| timeout.0)
+                {
+                    timeout if timeout.is_zero() => None,
+                    timeout => Some(timeout),
+                },
+            )
+            .with_proxy_reference(
+                settings
+                    .origin_server_name
+                    .clone()
+                    .filter(|name| !name.is_empty()),
+            );
+        if let Service::Unix { path, .. } = &service {
+            routed = routed.with_unix(
+                path.clone(),
+                if connect_timeout.is_zero() {
+                    None
+                } else {
+                    Some(connect_timeout)
+                },
+            );
+        }
+
         Ok(Self {
-            http,
+            routed,
+            physical_uri,
             service,
             settings,
             tls,
@@ -358,8 +432,9 @@ impl OriginConnector {
 }
 
 struct OriginConnection {
-    io: Box<dyn Io>,
+    io: Socket,
     h2: bool,
+    proxied: bool,
 }
 impl std::fmt::Debug for OriginConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -373,7 +448,7 @@ impl Connection for OriginConnection {
         if self.h2 {
             Connected::new().negotiated_h2()
         } else {
-            Connected::new()
+            Connected::new().proxy(self.proxied)
         }
     }
 }
@@ -410,69 +485,72 @@ impl ConnectorService<http::Uri> for OriginConnector {
         Poll::Ready(Ok(()))
     }
     fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let mut connector = self.clone();
+        let connector = self.clone();
         Box::pin(async move {
-            let socket: Box<dyn Io> = match &connector.service {
-                Service::Http(url) => {
-                    let scheme = if ["https", "wss"].contains(&url.scheme()) {
-                        "https"
-                    } else {
-                        "http"
-                    };
-                    let dial_uri: http::Uri = format!(
-                        "{scheme}://{}/",
-                        &url[url::Position::BeforeHost..url::Position::AfterPort]
+            let destination = connector
+                .physical_uri
+                .clone()
+                .unwrap_or_else(|| uri.clone());
+            let uses_proxy = connector
+                .routed
+                .proxy_scheme(&destination)
+                .map_err(io::Error::other)?
+                .is_some();
+            let match_sni = matches!(&connector.service, Service::Http(_))
+                && connector.settings.match_sni_to_host == Some(true);
+            let routed = if match_sni {
+                connector
+                    .routed
+                    .clone()
+                    .with_proxy_reference(
+                        uri.authority()
+                            .map(|authority| authority.as_str().to_owned()),
                     )
-                    .parse()
-                    .map_err(io::Error::other)?;
-                    Box::new(
-                        connector
-                            .http
-                            .call(dial_uri)
-                            .await
-                            .map_err(io::Error::other)?
-                            .into_inner(),
-                    )
-                }
-                Service::Unix { path, .. } => {
-                    let connect = UnixStream::connect(path);
-                    let timeout = connector
-                        .settings
-                        .connect_timeout
-                        .map_or(Duration::from_secs(30), |value| value.0);
-                    Box::new(if timeout.is_zero() {
-                        connect.await?
-                    } else {
-                        tokio::time::timeout(timeout, connect).await??
-                    })
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "origin has no socket",
-                    ));
-                }
+                    .with_tls_timeout(None)
+            } else {
+                connector.routed.clone()
             };
-            let (io, h2): (Box<dyn Io>, bool) = if let Some(tls) = &connector.tls {
-                let name = if connector.settings.match_sni_to_host == Some(true) {
-                    uri.host().unwrap_or("")
+            let connection = routed
+                .dial_transport(
+                    destination.clone(),
+                    if connector.settings.http2_origin == Some(true)
+                        && !connector.force_http1
+                        && !match_sni
+                    {
+                        Profile::Http
+                    } else {
+                        Profile::Http1
+                    },
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let proxied = connection.is_proxied();
+            let transport_h2 = connection.is_h2();
+            let socket = connection.into_socket();
+            let secure = matches!(&connector.service, Service::Unix { tls: true, .. })
+                || destination.scheme_str() == Some("https");
+            let (io, h2): (Socket, bool) = if secure {
+                let tls = connector.tls.as_ref().unwrap();
+                let name = if match_sni && !uses_proxy {
+                    uri.authority().map_or("", |authority| authority.as_str())
                 } else {
                     connector
                         .settings
                         .origin_server_name
                         .as_deref()
                         .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| match &connector.service {
-                            Service::Http(url) => url.host_str().unwrap_or(""),
-                            _ => uri.host().unwrap_or(""),
+                        .unwrap_or_else(|| {
+                            crate::proxy_environment::client::socket_hostname(
+                                destination.host().unwrap_or(""),
+                            )
                         })
                 };
                 let mut ssl = crate::crypto::ssl_for_name(tls, name).map_err(io::Error::other)?;
-                if connector.settings.http2_origin == Some(true) && !connector.force_http1 {
+                if connector.settings.http2_origin == Some(true)
+                    && !connector.force_http1
+                    && (!match_sni || uses_proxy)
+                {
                     ssl.set_alpn_protos(b"\x02h2\x08http/1.1")
-                        .map_err(io::Error::other)?;
-                } else {
-                    ssl.set_alpn_protos(b"\x08http/1.1")
                         .map_err(io::Error::other)?;
                 }
                 let handshake = tokio_boring::SslStreamBuilder::new(ssl, socket).connect();
@@ -480,7 +558,7 @@ impl ConnectorService<http::Uri> for OriginConnector {
                     .settings
                     .tls_timeout
                     .map_or(Duration::from_secs(10), |value| value.0);
-                let stream = if timeout.is_zero() {
+                let stream = if timeout.is_zero() || match_sni && !uses_proxy {
                     handshake.await
                 } else {
                     tokio::time::timeout(timeout, handshake).await?
@@ -489,9 +567,9 @@ impl ConnectorService<http::Uri> for OriginConnector {
                 let h2 = stream.ssl().selected_alpn_protocol() == Some(b"h2".as_slice());
                 (Box::new(stream), h2)
             } else {
-                (socket, false)
+                (socket, transport_h2)
             };
-            Ok(TokioIo::new(OriginConnection { io, h2 }))
+            Ok(TokioIo::new(OriginConnection { io, h2, proxied }))
         })
     }
 }

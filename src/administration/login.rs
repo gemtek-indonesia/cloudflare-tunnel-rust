@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
-use hyper_util::rt::TokioExecutor;
 use std::{os::unix::fs::DirBuilderExt, path::PathBuf, time::Duration};
 
 pub async fn execute(invocation: &Invocation) -> Result<()> {
@@ -94,9 +93,8 @@ fn save_certificate(path: &std::path::Path, body: &[u8]) -> Result<()> {
 }
 
 async fn fetch_certificate(request_url: &str) -> Result<Vec<u8>> {
-    let connector = super::verified_connector()?;
-    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-        .build::<_, Empty<Bytes>>(connector);
+    let connector = crate::proxy_environment::client::Connector::platform()?;
+    let client = crate::proxy_environment::client::HttpClient::<Empty<Bytes>>::new(connector);
     for _ in 0..10 {
         let request = http::Request::builder()
             .uri(request_url)

@@ -49,6 +49,7 @@ mkdir -p "${scratch}/tests/rust-interop-oracle"
 cp "${repo_dir}/tests/interop/oracle.go" "${scratch}/tests/rust-interop-oracle/main.go"
 cp "${repo_dir}/tests/interop/origins.go" "${scratch}/tests/rust-interop-oracle/origins.go"
 cp "${repo_dir}/tests/interop/source_bridge/access_url.go" "${scratch}/cmd/cloudflared/access/rust_interop_exports.go"
+cp "${repo_dir}/tests/interop/source_bridge/origin_proxy_environment_test.go" "${scratch}/ingress/rust_proxy_environment_test.go"
 cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/control_lifetime_test.go"
 cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
 cp "${repo_dir}/tests/interop/udp_v2_lifecycle_test.go" "${scratch}/connection/udp_v2_lifecycle_test.go"
@@ -67,9 +68,11 @@ cd "${scratch}"
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGo' -count=1 -timeout=35s -v ./connection
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV2' -count=1 -timeout=20s -v ./datagramsession
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -run '^TestPinnedGoV3' -count=1 -timeout=20s -v ./quic/v3
+GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRustOriginProxyEnvironmentContract$' -timeout=20s -v ./ingress
 GOTOOLCHAIN=local "${go_bin}" test -mod=readonly -count=1 -run '^TestRust(WatcherInvocation|TagsAndSocks)Contract$' ./cmd/cloudflared
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/oracle" ./tests/rust-interop-oracle
 GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/trust-oracle" "${repo_dir}/tests/interop/trust.go"
+GOTOOLCHAIN=local "${go_bin}" build -mod=readonly -o "${scratch}/proxy-oracle" "${repo_dir}/tests/interop/proxy_environment.go"
 cd "${repo_dir}"
 CLOUDFLARED_GO_ORACLE="${scratch}/oracle" cargo test --locked --test interop -- --ignored --nocapture
-CLOUDFLARED_GO_ORACLE="${scratch}/oracle" CLOUDFLARED_GO_TRUST_ORACLE="${scratch}/trust-oracle" cargo test --locked --lib go_ -- --ignored --nocapture
+CLOUDFLARED_GO_ORACLE="${scratch}/oracle" CLOUDFLARED_GO_TRUST_ORACLE="${scratch}/trust-oracle" CLOUDFLARED_GO_PROXY_ORACLE="${scratch}/proxy-oracle" cargo test --locked --lib go_ -- --ignored --nocapture

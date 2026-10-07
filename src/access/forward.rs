@@ -212,32 +212,35 @@ pub(crate) async fn dial_socket(
     endpoint: &ApplicationUrl,
     insecure_sni: Option<&str>,
 ) -> Result<Socket> {
-    let host = endpoint.hostname();
-    let port = endpoint.port()?;
+    endpoint.port()?;
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(Duration::from_secs(30)));
+    http.set_nodelay(true);
+    let mut tls = crate::administration::verified_tls_connector()?;
+    if insecure_sni.is_some() {
+        tls.set_verify(boring::ssl::SslVerifyMode::NONE);
+    }
+    let connector = crate::proxy_environment::client::Connector::platform()?
+        .with_tls_timeout(None)
+        .with_transport(http, tls.build(), crate::crypto::configure_platform_trust);
+    let mut parts = endpoint.request_uri()?.into_parts();
+    parts.scheme = Some(if ["https", "wss"].contains(&endpoint.scheme()) {
+        http::uri::Scheme::HTTPS
+    } else {
+        http::uri::Scheme::HTTP
+    });
+    let target = http::Uri::from_parts(parts)?;
     let socket = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::net::TcpStream::connect((host, port)),
+        connector.dial_with_reference(
+            target,
+            crate::proxy_environment::client::Profile::Carrier,
+            insecure_sni,
+        ),
     )
     .await
     .context("Access connection timeout")??;
-    socket.set_nodelay(true)?;
-    if endpoint.scheme() == "http" || endpoint.scheme() == "ws" {
-        return Ok(Box::pin(socket));
-    }
-    let mut connector = crate::administration::verified_tls_connector()?;
-    if insecure_sni.is_some() {
-        connector.set_verify(boring::ssl::SslVerifyMode::NONE);
-    }
-    let connector = connector.build();
-    let mut ssl = crate::crypto::ssl_for_name(&connector, insecure_sni.unwrap_or(host))?;
-    crate::crypto::configure_platform_trust(&mut ssl)?;
-    let socket = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio_boring::SslStreamBuilder::new(ssl, socket).connect(),
-    )
-    .await
-    .context("Access TLS handshake timeout")?
-    .map_err(|_| anyhow::anyhow!("Access TLS verification or handshake failed"))?;
     Ok(Box::pin(socket))
 }
 

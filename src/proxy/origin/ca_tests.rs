@@ -52,8 +52,13 @@ async fn origin_reference_names_sni_and_explicit_insecure_policy() {
             no_tls_verify: Some(insecure),
             ..Default::default()
         };
-        let mut connector =
-            OriginConnector::new(Service::Http(url.clone()), settings, &context).unwrap();
+        let mut connector = OriginConnector::new(
+            Service::Http(url.clone()),
+            settings,
+            Some(url.as_str().parse().unwrap()),
+            &context,
+        )
+        .unwrap();
         let client = connector.call(url.as_str().parse().unwrap()).await;
         assert_eq!(
             client.is_ok(),
@@ -137,8 +142,13 @@ async fn origin_ca_env_child() {
             ca_pool: Some(custom.to_str().unwrap().to_owned()),
             ..Default::default()
         };
-        let mut connector =
-            OriginConnector::new(Service::Http(url.clone()), settings, &context).unwrap();
+        let mut connector = OriginConnector::new(
+            Service::Http(url.clone()),
+            settings,
+            Some(url.as_str().parse().unwrap()),
+            &context,
+        )
+        .unwrap();
         let client = connector.call(url.as_str().parse().unwrap()).await;
         assert_eq!(client.is_ok(), succeeds);
         assert_eq!(server.await.unwrap(), succeeds);

@@ -56,7 +56,7 @@ pub async fn prepare(invocation: &Invocation) -> Result<RunConfig> {
             br#"{"auth_mode":"otp"}"#
         })))?;
     let fetch = async {
-        let mut response = crate::access::http_client()?
+        let mut response = crate::access::direct_http_client()?
             .request(request)
             .await
             .context("Quick Tunnel provisioning request failed")?;

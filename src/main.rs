@@ -5,7 +5,7 @@ use cloudflare_tunnel_rust::{
     cli::{self, Action, Invocation},
     config,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use http_body_util::BodyExt;
 
 #[tokio::main]
 async fn main() {
@@ -69,37 +69,7 @@ async fn dispatch() -> Result<()> {
             }
             println!("\tservice: {}", rule.service);
         }
-        Action::Ready { metrics } => {
-            let endpoint = url::Url::parse(&format!("http://{metrics}/ready"))
-                .context("invalid metrics server address")?;
-            if !endpoint.username().is_empty() || endpoint.password().is_some() {
-                anyhow::bail!("metrics address must not include credentials");
-            }
-            let hostname = config::socket_host(&endpoint)?;
-            let port = endpoint
-                .port_or_known_default()
-                .context("metrics address requires a port")?;
-            let mut connection = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::net::TcpStream::connect((hostname.as_str(), port)),
-            )
-            .await??;
-            connection
-                .write_all(
-                    format!("GET /ready HTTP/1.1\r\nHost: {metrics}\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )
-                .await?;
-            let mut response = Vec::new();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                (&mut connection).take(65_536).read_to_end(&mut response),
-            )
-            .await??;
-            if !response.starts_with(b"HTTP/1.1 200 ") && !response.starts_with(b"HTTP/1.0 200 ") {
-                anyhow::bail!("/ready endpoint did not return HTTP 200");
-            }
-        }
+        Action::Ready { metrics } => ready(&metrics).await?,
         Action::Run(configuration) => tunnel_runner::run(*configuration).await?,
         Action::RunNamed(invocation) => {
             tunnel_runner::run(invocation.named_config(home.as_deref()).await?).await?
@@ -134,4 +104,62 @@ async fn dispatch() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn ready(metrics: &str) -> Result<()> {
+    let endpoint: http::Uri = format!("http://{metrics}/ready")
+        .parse()
+        .context("invalid metrics server address")?;
+    let client =
+        cloudflare_tunnel_rust::proxy_environment::client::HttpClient::<
+            http_body_util::Empty<bytes::Bytes>,
+        >::new(cloudflare_tunnel_rust::proxy_environment::client::Connector::platform()?);
+    let response = client.get(endpoint).await?;
+    if response.status() != http::StatusCode::OK {
+        let status = response.status().as_u16();
+        let body = response.into_body().collect().await?.to_bytes();
+        anyhow::bail!(
+            "http://{metrics}/ready endpoint returned status code {status}\n{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn ready_uses_environment_route_and_status_instead_of_direct_tcp_parser() {
+        const CHILD: &str = "CLOUDFLARED_READY_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            ready("synthetic.invalid:080").await.unwrap();
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 16 * 1024);
+            }
+            assert!(head.starts_with(b"GET http://synthetic.invalid:080/ready HTTP/1.1\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let output=tokio::time::timeout(std::time::Duration::from_secs(3),tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear().env(CHILD,"1").env("HTTP_PROXY",format!("http://{address}"))
+            .args(["--exact","proxy_tests::ready_uses_environment_route_and_status_instead_of_direct_tcp_parser","--nocapture"]).output()).await.unwrap().unwrap();
+        assert!(
+            output.status.success(),
+            "owned readiness proxy child failed"
+        );
+        server.await.unwrap();
+    }
 }

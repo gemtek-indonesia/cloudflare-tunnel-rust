@@ -15,9 +15,15 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 
-pub(crate) type HttpClient = Client<hyper_boring::HttpsConnector<HttpConnector>, Full<Bytes>>;
+pub(crate) type HttpClient = crate::proxy_environment::client::HttpClient<Full<Bytes>>;
+type DirectHttpClient = Client<hyper_boring::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 pub(crate) fn http_client() -> Result<HttpClient> {
+    Ok(HttpClient::new(
+        crate::proxy_environment::client::Connector::platform()?,
+    ))
+}
+pub(crate) fn direct_http_client() -> Result<DirectHttpClient> {
     Ok(Client::builder(TokioExecutor::new()).build(crate::administration::verified_connector()?))
 }
 

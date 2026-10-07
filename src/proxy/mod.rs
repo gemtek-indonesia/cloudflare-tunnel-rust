@@ -2,6 +2,8 @@ mod body;
 mod hello;
 mod origin;
 #[cfg(test)]
+mod proxy_environment_tests;
+#[cfg(test)]
 pub(crate) mod tag_test_origin;
 mod tcp;
 #[cfg(test)]

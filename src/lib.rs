@@ -7,6 +7,7 @@ pub(crate) mod network;
 pub mod observability;
 pub mod protocol;
 pub mod proxy;
+pub mod proxy_environment;
 pub mod quick_tunnel;
 pub mod runtime;
 pub mod service;

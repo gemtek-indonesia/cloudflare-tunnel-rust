@@ -38,7 +38,7 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 prost = "0.14"
 socket2 = "0.6"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "tokio"] }
 hyper-boring = "=5.2.0"
 quiche = "=0.30.0"
 regex = "1"
@@ -79,3 +79,4 @@ assets = []
 boring = { path = "src/crypto/vendor/boring" }
 datagram-socket = { path = "src/transport/vendor/datagram-socket" }
 foundations = { path = "src/transport/vendor/foundations" }
+hyper-util = { path = "src/transport/vendor/hyper-util" }
