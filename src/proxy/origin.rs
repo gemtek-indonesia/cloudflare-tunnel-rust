@@ -454,8 +454,6 @@ impl ConnectorService<http::Uri> for OriginConnector {
                 }
             };
             let (io, h2): (Box<dyn Io>, bool) = if let Some(tls) = &connector.tls {
-                let mut config = tls.configure().map_err(io::Error::other)?;
-                config.set_verify_hostname(connector.settings.no_tls_verify != Some(true));
                 let name = if connector.settings.match_sni_to_host == Some(true) {
                     uri.host().unwrap_or("")
                 } else {
@@ -469,10 +467,7 @@ impl ConnectorService<http::Uri> for OriginConnector {
                             _ => uri.host().unwrap_or(""),
                         })
                 };
-                let mut ssl = config
-                    .into_ssl(name.trim_matches(['[', ']']))
-                    .map_err(io::Error::other)?;
-                crate::crypto::enforce_hostname_policy(&mut ssl);
+                let mut ssl = crate::crypto::ssl_for_name(tls, name).map_err(io::Error::other)?;
                 if connector.settings.http2_origin == Some(true) && !connector.force_http1 {
                     ssl.set_alpn_protos(b"\x02h2\x08http/1.1")
                         .map_err(io::Error::other)?;

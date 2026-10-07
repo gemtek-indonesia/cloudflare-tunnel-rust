@@ -122,8 +122,7 @@ async fn run(invocation: &Invocation) -> Result<()> {
     let url = url(invocation, &token)?;
     let host = crate::config::socket_host(&url)?;
     let connector = crate::administration::verified_tls_connector()?.build();
-    let config = connector.configure()?;
-    let mut ssl = config.into_ssl(&host)?;
+    let mut ssl = crate::crypto::ssl_for_name(&connector, &host)?;
     let socket = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::net::TcpStream::connect((host.as_str(), url.port_or_known_default().unwrap_or(443))),

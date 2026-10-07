@@ -368,14 +368,14 @@ pub async fn dial_with_options(
     let mut cid = [0; 20];
     boring::rand::rand_bytes(&mut cid).map_err(io::Error::other)?;
     let mut conn: QuicheConnection = quiche::connect_with_buffer_factory(
-        Some(server_name),
+        crate::crypto::tls_server_name(server_name).map_err(io::Error::other)?,
         &quiche::ConnectionId::from_ref(&cid),
         local_addr,
         address,
         &mut config,
     )
     .map_err(io::Error::other)?;
-    crate::crypto::enforce_hostname_policy(conn.as_mut());
+    crate::crypto::set_tls_name(conn.as_mut(), server_name).map_err(io::Error::other)?;
     attach_connection(conn, socket, address, local_addr, None).await
 }
 
@@ -801,9 +801,26 @@ mod tests {
         cert: &boring::x509::X509,
         key: &boring::pkey::PKey<boring::pkey::Private>,
     ) -> quiche::Config {
+        peer_config_with_sni(cert, key, None)
+    }
+
+    fn peer_config_with_sni(
+        cert: &boring::x509::X509,
+        key: &boring::pkey::PKey<boring::pkey::Private>,
+        sni: Option<Arc<std::sync::Mutex<String>>>,
+    ) -> quiche::Config {
         let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
         ssl.set_certificate(cert).unwrap();
         ssl.set_private_key(key).unwrap();
+        if let Some(sni) = sni {
+            ssl.set_servername_callback(move |ssl, _| {
+                *sni.lock().unwrap() = ssl
+                    .servername(boring::ssl::NameType::HOST_NAME)
+                    .unwrap_or("")
+                    .into();
+                Ok(())
+            });
+        }
         ssl.set_curves_list("X25519MLKEM768").unwrap();
         let mut config =
             quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
@@ -815,6 +832,49 @@ mod tests {
         config.set_initial_max_streams_bidi(128);
         config.enable_dgram(true, 32, 32);
         config
+    }
+
+    #[tokio::test]
+    async fn quic_reference_names_sni_and_ip_sans() {
+        let (cert, key) = crate::crypto::tests::certificate_for_sans(
+            "localhost",
+            &["localhost"],
+            &["127.0.0.1", "::1"],
+        );
+        for (name, succeeds, expected_sni, ipv6) in [
+            ("localhost.", true, "localhost", false),
+            ("[localhost]", false, "[localhost]", false),
+            ("[127.0.0.1]", true, "", false),
+            ("[[127.0.0.1]]", false, "[[127.0.0.1]]", false),
+            ("[::1]", true, "", true),
+            ("127.0.0.1.", false, "127.0.0.1", false),
+        ] {
+            let sni = Arc::new(std::sync::Mutex::new(String::new()));
+            let socket = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
+                .await
+                .unwrap();
+            let address = socket.local_addr().unwrap();
+            let peer = tokio::spawn(echo_peer(
+                socket,
+                peer_config_with_sni(&cert, &key, Some(sni.clone())),
+                0,
+                false,
+            ));
+            let tls =
+                EdgeTls::new(TlsPolicy::RequirePostQuantum, Some(&cert.to_pem().unwrap())).unwrap();
+            let client = tokio::time::timeout(Duration::from_secs(6), dial(address, name, &tls))
+                .await
+                .unwrap();
+            assert_eq!(client.is_ok(), succeeds, "{name:?}");
+            if let Ok(client) = client {
+                client.close();
+            }
+            tokio::time::timeout(Duration::from_secs(6), peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sni.lock().unwrap().as_str(), expected_sni, "{name:?}");
+        }
     }
 
     #[tokio::test]

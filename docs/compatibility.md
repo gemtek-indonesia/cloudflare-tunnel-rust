@@ -54,6 +54,7 @@ Origin CA pools combine native, Cloudflare, Hello and custom certificates. Malfo
 
 ## Known behavioral gaps
 
+* Certificates encoding IPv4-mapped addresses as 16-byte IP SANs are rejected, while Go treats them as IPv4 equivalents. Ordinary and mapped references verify against standard 4-byte IPv4 SANs. [TLS name tests](../src/crypto/name_tests.rs) preserve this fail-closed difference.
 * Environment proxy routing is absent for origins and consumers that use it upstream, including Access/JWKS/login/tail. Administration and Quick provisioning use direct transports upstream.
 * HTTP request spans and `Cf-Int-Cloudflared-Tracing` responses are absent. Private-network tracing has component coverage.
 * Access URLs preserve source HTTPS upgrades, explicit ports, userinfo, IDNA and raw path semantics. Raw spaces in query strings are rejected by the Rust HTTP URI carrier, while Go accepts them for Access and curl requests.

@@ -2,6 +2,71 @@ use super::*;
 use std::fs;
 
 #[tokio::test]
+async fn origin_reference_names_sni_and_explicit_insecure_policy() {
+    let (cert, key) = crate::crypto::tests::certificate_for_sans(
+        "localhost",
+        &["localhost"],
+        &["127.0.0.1", "::1"],
+    );
+    let dir = std::env::temp_dir().join(format!("origin-name-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let ca = dir.join("root.pem");
+    fs::write(&ca, cert.to_pem().unwrap()).unwrap();
+    let context = crate::observability::Context::quiet().unwrap();
+    for (name, insecure, succeeds, expected_sni, ipv6) in [
+        ("localhost.", false, true, "localhost", false),
+        ("[localhost]", false, false, "[localhost]", false),
+        ("[127.0.0.1]", false, true, "", false),
+        ("[[127.0.0.1]]", false, false, "[[127.0.0.1]]", false),
+        ("[::1]", false, true, "", true),
+        ("127.0.0.1.", false, false, "127.0.0.1", false),
+        ("wrong.test", true, true, "wrong.test", false),
+        ("localhost\0evil", true, false, "", false),
+    ] {
+        let sni = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = sni.clone();
+        let mut acceptor =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor.set_certificate(&cert).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        acceptor.set_servername_callback(move |ssl, _| {
+            *captured.lock().unwrap() = ssl
+                .servername(boring::ssl::NameType::HOST_NAME)
+                .unwrap_or("")
+                .into();
+            Ok(())
+        });
+        let acceptor = acceptor.build();
+        let listener = tokio::net::TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_boring::accept(&acceptor, socket).await.is_ok()
+        });
+        let url = url::Url::parse(&format!("https://{address}/")).unwrap();
+        let settings = OriginRequest {
+            ca_pool: Some(ca.to_str().unwrap().into()),
+            origin_server_name: Some(name.into()),
+            no_tls_verify: Some(insecure),
+            ..Default::default()
+        };
+        let mut connector =
+            OriginConnector::new(Service::Http(url.clone()), settings, &context).unwrap();
+        let client = connector.call(url.as_str().parse().unwrap()).await;
+        assert_eq!(
+            client.is_ok(),
+            succeeds,
+            "name={name:?} insecure={insecure}"
+        );
+        assert_eq!(server.await.unwrap(), succeeds);
+        assert_eq!(sni.lock().unwrap().as_str(), expected_sni);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn origin_ca_env_child() {
     let Ok(mode) = std::env::var("CLOUDFLARED_ORIGIN_CA_MODE") else {
         return;

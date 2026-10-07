@@ -11,3 +11,117 @@ condition = "AND"
 paths = ['''(^|/)Cargo\.lock$''']
 regexTarget = "match"
 regexes = ['''^crypto_secretbox",\r?\n[ \t]*"curve25519-dalek"$''']
+
+[[allowlists]]
+description = "Verbatim upstream PEM format documentation"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/pkey\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN PRIVATE KEY-----`\.
+        #\[corresponds\(PEM_write_bio_PKCS8PrivateKey\)\]
+        private_key_to_pem_pkcs8,
+        /// Serializes the private key to a PEM-encoded PKCS#8 EncryptedPrivateKeyInfo structure\.
+        ///
+        /// The output will have a header of `-----BEGIN ENCRYPTED PRIVATE KEY-----$''']
+
+[[allowlists]]
+description = "Verbatim upstream PEM format documentation"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/dsa\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN DSA PRIVATE KEY-----`\.
+        #\[corresponds\(PEM_write_bio_DSAPrivateKey\)\]
+        private_key_to_pem,
+        /// Serializes the private key to a PEM-encoded encrypted DSAPrivateKey structure\.
+        ///
+        /// The output will have a header of `-----BEGIN DSA PRIVATE KEY-----$''']
+
+[[allowlists]]
+description = "Verbatim upstream PEM format documentation"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/ec\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN EC PRIVATE KEY-----`\.
+        #\[corresponds\(PEM_write_bio_ECPrivateKey\)\]
+        private_key_to_pem,
+        /// Serializes the private key to a PEM-encoded encrypted ECPrivateKey structure\.
+        ///
+        /// The output will have a header of `-----BEGIN EC PRIVATE KEY-----$''']
+
+[[allowlists]]
+description = "Verbatim upstream PEM format documentation"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/ec\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN EC PRIVATE KEY-----`\.
+        #\[corresponds\(PEM_read_bio_ECPrivateKey\)\]
+        private_key_from_pem,
+
+        /// Deserializes a private key from a PEM-encoded encrypted ECPrivateKey structure\.
+        ///
+        /// The input should have a header of `-----BEGIN EC PRIVATE KEY-----$''']
+
+[[allowlists]]
+description = "Verbatim upstream PEM format documentation"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/rsa\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN RSA PRIVATE KEY-----`\.
+        #\[corresponds\(PEM_write_bio_RSAPrivateKey\)\]
+        private_key_to_pem,
+        /// Serializes the private key to a PEM-encoded encrypted PKCS#1 RSAPrivateKey structure\.
+        ///
+        /// The output will have a header of `-----BEGIN RSA PRIVATE KEY-----$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "97CD440324DA5FD1F7955C1C13B6B466"$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "2B7E151628AED2A6ABF7158809CF4F3C"$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "2b7e151628aed2a6abf7158809cf4f3c"$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b"$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4"$''']
+
+[[allowlists]]
+description = "Verbatim upstream symmetric cipher test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/crypto/vendor/boring/src/symm\.rs$''']
+regexTarget = "match"
+regexes = ['''^key = "0e00c76561d2bd9b40c3c15427e2b08f"$''']

@@ -1,0 +1,75 @@
+[package]
+name = "boring"
+version = { workspace = true }
+authors = ["Steven Fackler <sfackler@gmail.com>", "Ivan Nikulin <ifaaan@gmail.com>"]
+license = "Apache-2.0"
+description = "BoringSSL bindings"
+repository = { workspace = true }
+documentation = "https://docs.rs/boring"
+readme = "README.md"
+keywords = ["tls", "ssl", "dtls", "post-quantum", "fips"]
+categories = ["cryptography", "api-bindings"]
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+features = ["rpk", "underscore-wildcards", "mlkem", "mldsa"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+
+# Use a FIPS-validated version of BoringSSL.
+fips = ["boring-sys/fips"]
+
+# **DO NOT USE** This will be removed without warning in future releases.
+legacy-compat-deprecated = []
+
+# **DO NOT USE** This will be removed without warning in future releases.
+# PQ is always enabled. This feature is a no-op, only for backwards compatibility.
+pq-experimental = []
+
+# Interface for ML-KEM (FIPS 203) post-quantum key encapsulation. Does not affect ciphers used in TLS.
+mlkem = []
+# ML-DSA (FIPS 204) post-quantum digital signature.
+mldsa = []
+
+# Expose internal `tls1_prf`
+prf = []
+
+# SslCredential API
+credential = []
+
+# Enables Raw public key API (https://datatracker.ietf.org/doc/html/rfc7250)
+# This feature is necessary in order to compile the bindings for the
+# default branch of boringSSL. Alternatively, a version of boringSSL that
+# implements the same feature set can be provided by setting
+# `BORING_BSSL{,_FIPS}_SOURCE_PATH` and `BORING_BSSL{,_FIPS}_ASSUME_PATCHED`.
+rpk = ["credential", "boring-sys/rpk"]
+
+# Applies a patch to enable `ffi::X509_CHECK_FLAG_UNDERSCORE_WILDCARDS`. This
+# feature is necessary in order to compile the bindings for the default branch
+# of boringSSL. Alternatively, a version of boringSSL that implements the same
+# feature set can be provided by setting `BORING_BSSL{,_FIPS}_SOURCE_PATH` and
+# `BORING_BSSL{,_FIPS}_ASSUME_PATCHED`.
+underscore-wildcards = ["boring-sys/underscore-wildcards"]
+
+# Restores the historical BoringSSL default of not enforcing RSA keyUsage
+# during TLS handshakes.
+relax-cert-validation = ["boring-sys/relax-cert-validation"]
+
+# **DO NOT USE** This will be removed without warning in future releases.
+# Alias for 'fips', only for backwards compatibility.
+fips-precompiled = ["fips"]
+
+[dependencies]
+bitflags = { workspace = true }
+foreign-types = { workspace = true }
+openssl-macros = { workspace = true }
+libc = { workspace = true }
+boring-sys = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rusty-hook = { workspace = true }
+brotli = { workspace = true }

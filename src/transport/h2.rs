@@ -69,11 +69,7 @@ pub async fn dial_tls_with_options(
     let socket = tokio::time::timeout(options.dial_timeout, socket.connect(address)).await??;
     let local_addr = socket.local_addr()?;
     let mut ssl = boring::ssl::Ssl::new(tls.context()).map_err(io::Error::other)?;
-    ssl.set_hostname(server_name).map_err(io::Error::other)?;
-    ssl.param_mut()
-        .set_host(server_name)
-        .map_err(io::Error::other)?;
-    crate::crypto::enforce_hostname_policy(&mut ssl);
+    crate::crypto::set_tls_name(&mut ssl, server_name).map_err(io::Error::other)?;
     let stream = tokio::time::timeout(
         options.dial_timeout,
         tokio_boring::SslStreamBuilder::new(ssl, socket).connect(),

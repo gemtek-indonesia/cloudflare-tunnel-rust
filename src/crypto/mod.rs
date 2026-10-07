@@ -94,6 +94,75 @@ pub(crate) fn enforce_hostname_policy(ssl: &mut boring::ssl::SslRef) {
         .set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS | X509CheckFlags::NEVER_CHECK_SUBJECT);
 }
 
+pub(crate) fn ssl_for_name(
+    connector: &boring::ssl::SslConnector,
+    reference: &str,
+) -> Result<boring::ssl::Ssl> {
+    tls_server_name(reference)?;
+    let mut config = connector.configure()?;
+    config.set_use_server_name_indication(false);
+    let candidate = reference
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(reference);
+    let mut ssl = config.into_ssl(if candidate.parse::<std::net::IpAddr>().is_ok() {
+        candidate
+    } else {
+        reference
+    })?;
+    set_tls_name(&mut ssl, reference)?;
+    Ok(ssl)
+}
+
+pub(crate) fn tls_server_name(reference: &str) -> Result<Option<&str>> {
+    if reference.contains('\0') {
+        bail!("TLS peer name contains a NUL byte");
+    }
+    let candidate = reference
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(reference);
+    let candidate = candidate
+        .rsplit_once('%')
+        .filter(|(host, _)| !host.is_empty())
+        .map_or(candidate, |(host, _)| host);
+    Ok(if candidate.parse::<std::net::IpAddr>().is_ok() {
+        None
+    } else {
+        Some(reference.trim_end_matches('.')).filter(|name| !name.is_empty())
+    })
+}
+
+pub(crate) fn set_tls_name(ssl: &mut boring::ssl::SslRef, reference: &str) -> Result<()> {
+    let sni = tls_server_name(reference)?;
+    let candidate = reference
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(reference);
+    if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
+        ssl.param_mut().set_ip(ip.to_canonical())?;
+    } else {
+        let name = reference.strip_suffix('.').unwrap_or(reference);
+        let valid = !name.is_empty()
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.bytes().enumerate().all(|(index, byte)| {
+                        byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'-' && index != 0)
+                    })
+            });
+        ssl.param_mut()
+            .set_host(if valid { name } else { reference })?;
+        if valid && name != reference {
+            ssl.param_mut().add_host(reference)?;
+        }
+    }
+    enforce_hostname_policy(ssl);
+    if let Some(name) = sni {
+        ssl.set_hostname(name)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn pem_certificates(pem: &[u8]) -> Vec<X509> {
     let mut output = Vec::new();
     let mut offset = 0;
@@ -231,6 +300,8 @@ fn linux_roots(files: &[PathBuf], dirs: &[PathBuf]) -> Result<Vec<X509>> {
 #[cfg(test)]
 mod go_tests;
 #[cfg(test)]
+mod name_tests;
+#[cfg(test)]
 mod trust_tests;
 
 #[cfg(test)]
@@ -254,6 +325,14 @@ pub(crate) mod tests {
     }
 
     pub fn certificate_for_names(common_name: &str, names: &[&str]) -> (X509, PKey<Private>) {
+        certificate_for_sans(common_name, names, &[])
+    }
+
+    pub fn certificate_for_sans(
+        common_name: &str,
+        names: &[&str],
+        ips: &[&str],
+    ) -> (X509, PKey<Private>) {
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
         let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
         let mut name = X509NameBuilder::new().unwrap();
@@ -272,10 +351,13 @@ pub(crate) mod tests {
             .unwrap();
         cert.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
             .unwrap();
-        if !names.is_empty() {
+        if !names.is_empty() || !ips.is_empty() {
             let mut san = SubjectAlternativeName::new();
             for name in names {
                 san.dns(name);
+            }
+            for ip in ips {
+                san.ip(ip);
             }
             let san = san.build(&cert.x509v3_context(None, None)).unwrap();
             cert.append_extension(&san).unwrap();

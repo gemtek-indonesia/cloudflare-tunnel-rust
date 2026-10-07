@@ -76,5 +76,6 @@ strip = "debuginfo"
 assets = []
 
 [patch.crates-io]
+boring = { path = "src/crypto/vendor/boring" }
 datagram-socket = { path = "src/transport/vendor/datagram-socket" }
 foundations = { path = "src/transport/vendor/foundations" }

@@ -29,7 +29,15 @@ pub(crate) fn verified_connector() -> Result<hyper_boring::HttpsConnector<HttpCo
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(15)));
     let mut connector = hyper_boring::HttpsConnector::with_connector(http, ssl)?;
-    connector.set_ssl_callback(|ssl, _| crate::crypto::configure_platform_trust(ssl));
+    connector.set_callback(|config, _| {
+        config.set_use_server_name_indication(false);
+        Ok(())
+    });
+    connector.set_ssl_callback(|ssl, uri| {
+        crate::crypto::set_tls_name(ssl, uri.host().unwrap_or(""))
+            .map_err(|_| boring::error::ErrorStack::get())?;
+        crate::crypto::configure_platform_trust(ssl)
+    });
     Ok(connector)
 }
 

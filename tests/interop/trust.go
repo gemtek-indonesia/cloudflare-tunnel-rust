@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -23,6 +25,7 @@ type trustInput struct {
 	PEM  string `json:"pem"`
 	Name string `json:"name"`
 	Path string `json:"path"`
+	Key  string `json:"key"`
 }
 
 func main() {
@@ -56,6 +59,51 @@ func main() {
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		out["ok"] = err == nil && cert.VerifyHostname(input.Name) == nil
+	case "tls-name":
+		key, decodeErr := base64.StdEncoding.DecodeString(input.Key)
+		if decodeErr != nil {
+			panic(decodeErr)
+		}
+		pair, pairErr := tls.X509KeyPair(encoded, key)
+		if pairErr != nil {
+			panic(pairErr)
+		}
+		roots := x509.NewCertPool()
+		roots.AppendCertsFromPEM(encoded)
+		listener, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			panic(listenErr)
+		}
+		defer listener.Close()
+		name := make(chan string, 1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			serverSide, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			defer serverSide.Close()
+			serverSide.SetDeadline(time.Now().Add(2 * time.Second))
+			server := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{pair}, GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) { name <- hello.ServerName; return nil, nil }})
+			server.Handshake()
+		}()
+		clientSide, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+		if dialErr != nil {
+			panic(dialErr)
+		}
+		defer clientSide.Close()
+		clientSide.SetDeadline(time.Now().Add(2 * time.Second))
+		client := tls.Client(clientSide, &tls.Config{RootCAs: roots, ServerName: input.Name})
+		out["ok"] = client.Handshake() == nil
+		clientSide.Close()
+		<-done
+		select {
+		case sni := <-name:
+			out["sni"] = sni
+		default:
+			out["sni"] = ""
+		}
 	case "native":
 		pool, err = x509.SystemCertPool()
 		out["ok"] = err == nil

@@ -68,7 +68,7 @@ fn ordered_srv(mut records: Vec<SRV>) -> Result<Vec<SRV>> {
 async fn srv_over_tls(name: &str) -> Result<Vec<SRV>> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let connector = crate::administration::verified_tls_connector()?.build();
-        let mut ssl = connector.configure()?.into_ssl("cloudflare-dns.com")?;
+        let mut ssl = crate::crypto::ssl_for_name(&connector, "cloudflare-dns.com")?;
         let socket = tokio::net::TcpStream::connect("1.1.1.1:853").await?;
         crate::crypto::configure_platform_trust(&mut ssl)?;
         let mut stream = tokio_boring::SslStreamBuilder::new(ssl, socket)
