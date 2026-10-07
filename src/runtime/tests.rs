@@ -9,6 +9,9 @@ mod control_lifetime;
 #[path = "tag_tests.rs"]
 mod tags;
 
+#[path = "shutdown_tests.rs"]
+mod shutdown;
+
 pub(crate) fn config() -> RunConfig {
     let configuration =
         LoadedConfig::from_json(r#"{"ingress":[{"service":"http_status:203"}]}"#).unwrap();

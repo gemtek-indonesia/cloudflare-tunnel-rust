@@ -1,3 +1,5 @@
+mod tunnel_runner;
+
 use anyhow::{Context, Result};
 use cloudflare_tunnel_rust::{
     cli::{self, Action, Invocation},
@@ -98,10 +100,9 @@ async fn dispatch() -> Result<()> {
                 anyhow::bail!("/ready endpoint did not return HTTP 200");
             }
         }
-        Action::Run(configuration) => cloudflare_tunnel_rust::runtime::run(*configuration).await?,
+        Action::Run(configuration) => tunnel_runner::run(*configuration).await?,
         Action::RunNamed(invocation) => {
-            cloudflare_tunnel_rust::runtime::run(invocation.named_config(home.as_deref()).await?)
-                .await?
+            tunnel_runner::run(invocation.named_config(home.as_deref()).await?).await?
         }
         Action::Admin(invocation) => {
             cloudflare_tunnel_rust::administration::execute(invocation).await?
@@ -119,12 +120,12 @@ async fn dispatch() -> Result<()> {
         }
         Action::Quick(invocation) => {
             let config = cloudflare_tunnel_rust::quick_tunnel::prepare(&invocation).await?;
-            cloudflare_tunnel_rust::runtime::run(config).await?;
+            tunnel_runner::run(config).await?;
         }
         Action::Adhoc(invocation) => {
             let credentials =
                 cloudflare_tunnel_rust::administration::prepare_adhoc(&invocation).await?;
-            cloudflare_tunnel_rust::runtime::run(invocation.run_config_for_credentials(
+            tunnel_runner::run(invocation.run_config_for_credentials(
                 credentials,
                 false,
                 home.as_deref(),

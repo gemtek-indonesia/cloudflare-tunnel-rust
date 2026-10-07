@@ -51,6 +51,8 @@ cp "${repo_dir}/tests/interop/origins.go" "${scratch}/tests/rust-interop-oracle/
 cp "${repo_dir}/tests/interop/source_bridge/access_url.go" "${scratch}/cmd/cloudflared/access/rust_interop_exports.go"
 cp "${repo_dir}/tests/interop/control_lifetime_test.go" "${scratch}/connection/control_lifetime_test.go"
 cp "${repo_dir}/tests/interop/control_readmission_test.go" "${scratch}/connection/control_readmission_test.go"
+cp "${repo_dir}/tests/interop/global_shutdown_test.go" "${scratch}/connection/global_shutdown_test.go"
+cp "${repo_dir}/tests/interop/source_bridge/shutdown.go" "${scratch}/cmd/cloudflared/tunnel/rust_shutdown_exports.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_test.go" "${scratch}/cmd/cloudflared/rust_watcher_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/tags_socks_test.go" "${scratch}/cmd/cloudflared/rust_tags_socks_test.go"
 cp "${repo_dir}/tests/interop/source_bridge/watcher_config.go" "${scratch}/config/rust_watcher_config.go"

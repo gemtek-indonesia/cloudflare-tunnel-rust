@@ -13,14 +13,18 @@ enum EndControl {
 
 pub(super) enum Reply {
     Accept,
+    LocallyManaged,
+    BlockUnregister,
     Reject { retry: bool },
     Pending,
+    Gated(Arc<tokio::sync::Notify>),
 }
 struct ReadmissionOracle {
     reply: Reply,
     entered: Arc<tokio::sync::Notify>,
     unregisters: Arc<std::sync::atomic::AtomicUsize>,
     unregistered: Arc<tokio::sync::Notify>,
+    configured: Arc<tokio::sync::Notify>,
 }
 impl wire::registration_server::Server for ReadmissionOracle {
     async fn register_connection(
@@ -38,6 +42,9 @@ impl wire::registration_server::Server for ReadmissionOracle {
         if matches!(self.reply, Reply::Pending) {
             futures::future::pending::<()>().await;
         }
+        if let Reply::Gated(gate) = &self.reply {
+            gate.notified().await;
+        }
         if let Reply::Reject { retry } = self.reply {
             let mut error = results.get().init_result().init_result().init_error();
             error.set_cause("synthetic rejection");
@@ -51,7 +58,10 @@ impl wire::registration_server::Server for ReadmissionOracle {
                 .init_connection_details();
             details.set_uuid(&[3; 16]);
             details.set_location_name("TST");
-            details.set_tunnel_is_remotely_managed(true);
+            details.set_tunnel_is_remotely_managed(!matches!(
+                self.reply,
+                Reply::BlockUnregister | Reply::LocallyManaged
+            ));
         }
         Ok(())
     }
@@ -62,6 +72,9 @@ impl wire::registration_server::Server for ReadmissionOracle {
     ) -> capnp::Result<()> {
         self.unregisters.fetch_add(1, Ordering::AcqRel);
         self.unregistered.notify_one();
+        if matches!(self.reply, Reply::BlockUnregister) {
+            futures::future::pending::<()>().await;
+        }
         Ok(())
     }
     async fn update_local_configuration(
@@ -69,6 +82,7 @@ impl wire::registration_server::Server for ReadmissionOracle {
         _: wire::registration_server::UpdateLocalConfigurationParams,
         _: wire::registration_server::UpdateLocalConfigurationResults,
     ) -> capnp::Result<()> {
+        self.configured.notify_one();
         Ok(())
     }
 }
@@ -76,9 +90,10 @@ impl wire::registration_server::Server for ReadmissionOracle {
 pub(super) struct PeerControl {
     command: mpsc::UnboundedSender<EndControl>,
     pub(super) ended: oneshot::Receiver<std::result::Result<(), String>>,
-    entered: Arc<tokio::sync::Notify>,
-    unregisters: Arc<std::sync::atomic::AtomicUsize>,
-    unregistered: Arc<tokio::sync::Notify>,
+    pub(super) entered: Arc<tokio::sync::Notify>,
+    pub(super) unregisters: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) unregistered: Arc<tokio::sync::Notify>,
+    pub(super) configured: Arc<tokio::sync::Notify>,
     _rpc: AbortTask<capnp::Result<()>>,
     _pump: AbortTask<std::io::Result<((), ())>>,
 }
@@ -153,11 +168,13 @@ pub(super) async fn peer_control(
     let entered = Arc::new(tokio::sync::Notify::new());
     let unregisters = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let unregistered = Arc::new(tokio::sync::Notify::new());
+    let configured = Arc::new(tokio::sync::Notify::new());
     let server: wire::registration_server::Client = capnp_rpc::new_client(ReadmissionOracle {
         reply,
         entered: entered.clone(),
         unregisters: unregisters.clone(),
         unregistered: unregistered.clone(),
+        configured: configured.clone(),
     });
     let (read, write) = tokio::io::split(control);
     let network = capnp_rpc::twoparty::VatNetwork::new(
@@ -176,6 +193,7 @@ pub(super) async fn peer_control(
         entered,
         unregisters,
         unregistered,
+        configured,
         _rpc: rpc,
         _pump: pump,
     }

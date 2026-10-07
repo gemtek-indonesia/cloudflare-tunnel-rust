@@ -237,13 +237,7 @@ impl Controls {
         Err(self.last_error.take().unwrap_or(transport_error))
     }
 
-    pub(super) async fn drain(
-        &mut self,
-        runtime: &Arc<Runtime>,
-        conn: &mut transport::h2::H2Connection,
-        tasks: &mut JoinSet<Result<()>>,
-    ) {
-        let deadline = Instant::now() + runtime.config.grace_period;
+    pub(super) fn start_shutdown(&mut self, grace: Duration) {
         self.lease = None;
         let admitted = self
             .attempts
@@ -251,22 +245,7 @@ impl Controls {
             .filter_map(|(id, attempt)| matches!(attempt.phase, Phase::Admitted(_)).then_some(*id))
             .collect::<Vec<_>>();
         for id in admitted {
-            self.unregister(id, runtime.config.grace_period);
+            self.unregister(id, grace);
         }
-        conn.graceful_shutdown();
-        loop {
-            tokio::select! {
-                _ = runtime.force.cancelled() => break,
-                _ = tokio::time::sleep_until(deadline) => break,
-                _ = futures::future::poll_fn(|cx| conn.poll_closed(cx)) => break,
-                completion = self.completions.join_next(), if !self.completions.is_empty() => {
-                    if let Some(Ok(Completion::Unregister(_,Err(error))))=completion {
-                        runtime.warn(&format!("Error shutting down control stream: {error}"));
-                    }
-                }
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
-            }
-        }
-        tasks.abort_all();
     }
 }

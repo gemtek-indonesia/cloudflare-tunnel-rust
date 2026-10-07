@@ -464,28 +464,13 @@ fn tls(config: &RunConfig) -> Result<EdgeTls> {
     )
 }
 
-pub async fn run(config: RunConfig) -> Result<()> {
+pub async fn run_controlled(
+    config: RunConfig,
+    shutdown: CancellationToken,
+    force: CancellationToken,
+) -> Result<()> {
     tokio::task::LocalSet::new()
-        .run_until(async move {
-            let shutdown = CancellationToken::new();
-            let force = CancellationToken::new();
-            let stop = shutdown.clone();
-            let hard_stop = force.clone();
-            let signals = AbortTask(tokio::task::spawn_local(async move {
-                let mut interrupt =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-                tokio::select! {_=interrupt.recv()=>{},_=terminate.recv()=>{}}
-                stop.cancel();
-                tokio::select! {_=interrupt.recv()=>{},_=terminate.recv()=>{}}
-                hard_stop.cancel();
-                Ok::<_, std::io::Error>(())
-            }));
-            let result = run_with_shutdown(config, shutdown, force).await;
-            drop(signals);
-            result
-        })
+        .run_until(run_with_shutdown(config, shutdown, force))
         .await
 }
 
@@ -584,15 +569,27 @@ async fn run_with_shutdown(
             .refresh_dns(background.shutdown.clone())
             .await
     }));
+    let server_context = CancellationToken::new();
     let health = if runtime.config.metrics.is_empty() {
         None
     } else {
-        Some(health_server(&runtime.config.metrics, runtime.clone(), shutdown.clone()).await?)
+        Some(
+            health_server(
+                &runtime.config.metrics,
+                runtime.clone(),
+                server_context.clone(),
+            )
+            .await?,
+        )
     };
     let result = supervise(runtime.clone(), pool, edge_tls, count, event_rx).await;
     readiness.shutting_down.store(true, Ordering::Release);
     shutdown.cancel();
-    drop(health);
+    server_context.cancel();
+    if let Some(mut health) = health {
+        health.0.abort();
+        let _ = (&mut health.0).await;
+    }
     result
 }
 
@@ -692,6 +689,9 @@ async fn supervise(
     let mut global_reset_after = None;
     let mut terminal = None;
     loop {
+        if runtime.shutdown.is_cancelled() {
+            break;
+        }
         tokio::select! {
             _ = runtime.shutdown.cancelled() => break,
             event = events.recv() => match event {
@@ -745,13 +745,22 @@ async fn supervise(
             },
         }
     }
+    if !runtime.startup_announced.load(Ordering::Acquire) || terminal.is_some() {
+        runtime.force.cancel();
+    }
     runtime
         .readiness
         .shutting_down
         .store(true, Ordering::Release);
     runtime.shutdown.cancel();
     let deadline = Instant::now() + runtime.config.grace_period;
-    tokio::select! {_=runtime.force.cancelled()=>{},_=tokio::time::sleep_until(deadline)=>{},_=async{while tasks.join_next().await.is_some(){}}=>{}}
+    tokio::select! {
+        _ = runtime.force.cancelled() => {},
+        _ = tokio::time::sleep_until(deadline) => {},
+        _ = async {
+            while tasks.join_next().await.is_some() {}
+        } => {},
+    }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     if let Some(error) = terminal {
@@ -1122,21 +1131,38 @@ async fn serve_h2(
     let requests = pending.requests();
     let mut tasks = JoinSet::new();
     let mut controls = h2_sessions::Controls::new(address, retries);
+    let mut deadline = None;
     loop {
         tokio::select! {
-            _ = runtime.shutdown.cancelled() => {
-                controls.drain(&runtime, &mut conn, &mut tasks).await;
-                return Ok(());
+            _ = runtime.shutdown.cancelled(), if deadline.is_none() => {
+                deadline = Some(Instant::now() + runtime.config.grace_period);
+                controls.start_shutdown(runtime.config.grace_period);
             }
+            _ = runtime.force.cancelled(), if deadline.is_some() => return Ok(()),
+            _ = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    futures::future::pending().await
+                }
+            } => return Ok(()),
             completion = controls.next(), if controls.has_completions() => {
                 if let Some(completion) = completion {
-                    controls.complete(completion?, &runtime, &pending, &mut tasks, reset_after).await?;
+                    controls
+                        .complete(completion?, &runtime, &pending, &mut tasks, reset_after)
+                        .await?;
+                    if deadline.is_some() {
+                        controls.start_shutdown(runtime.config.grace_period);
+                    }
                 }
             }
             incoming = conn.accept() => {
                 let (request, mut response) = match incoming {
                     Some(Ok(incoming)) => incoming,
                     outcome => {
+                        if deadline.is_some() {
+                            return Ok(());
+                        }
                         let error = match outcome {
                             Some(Err(error)) => anyhow::Error::new(error),
                             None => anyhow::anyhow!("connection with edge closed"),
