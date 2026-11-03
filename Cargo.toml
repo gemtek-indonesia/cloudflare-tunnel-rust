@@ -60,7 +60,7 @@ tokio-util = { version = "0.7", features = ["compat", "io", "rt"] }
 tower-service = "0.3"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
 capnpc = "0.27"
